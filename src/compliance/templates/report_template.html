@@ -1,0 +1,430 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    h1 { font-size: 20px; margin-bottom: 8px; color: #2c3e50; }
+    h2 { font-size: 16px; margin-top: 24px; margin-bottom: 12px; color: #34495e; border-bottom: 2px solid #ecf0f1; padding-bottom: 4px; }
+    h3 { font-size: 14px; margin-top: 18px; margin-bottom: 8px; color: #7f8c8d; }
+    .meta { font-size: 12px; color: #7f8c8d; margin-bottom: 24px; }
+    .section { margin: 20px 0; padding: 16px; border: 1px solid #ecf0f1; border-radius: 8px; background: #f9f9f9; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 16px 0; }
+    .kpi-card { background: white; padding: 12px; border-radius: 6px; border: 1px solid #ddd; text-align: center; }
+    .kpi-value { font-size: 24px; font-weight: bold; color: #2c3e50; }
+    .kpi-label { font-size: 12px; color: #7f8c8d; margin-top: 4px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; margin: 16px 0; }
+    .card { border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: white; }
+    .card img { width: 100%; height: 150px; object-fit: cover; display: block; }
+    .card .cap { padding: 10px; font-size: 12px; }
+    .table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+    .table th, .table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    .table th { background: #f5f5f5; font-weight: bold; }
+    .small { font-size: 11px; color: #7f8c8d; }
+    .highlight { background: #fff3cd; padding: 2px 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>QUALYXUS Enterprise Production Audit Report</h1>
+  <div class="meta">
+    <b>Report ID:</b> {{ report_metadata.report_id }}<br/>
+    <b>Generated:</b> {{ report_metadata.generated_at_utc }} UTC<br/>
+    <b>Hostname:</b> {{ report_metadata.hostname }}<br/>
+    <b>System Version:</b> {{ report_metadata.system_version }}<br/>
+    <b>Report Window:</b> {{ report_metadata.data_window_start }} → {{ report_metadata.data_window_end }}<br/>
+    <b>Data Source:</b> Live Operational Events DB (Filtered: No Synthetic/Demo/Training Data)
+  </div>
+
+  <div class="section">
+    <h2>1. Executive Summary</h2>
+    <p>This report provides a comprehensive enterprise-grade audit of production operations during the specified time window. All metrics are computed from live operational data with strict traceability to source timestamps.</p>
+    <ul>
+      <li><b>Total Defects:</b> {{ kpis.total_defects }}</li>
+      <li><b>Defect Rate:</b> {{ kpis.defects_per_hour }}/hour</li>
+      <li><b>Data Quality:</b> {{ data_validation.missing_metadata_percent }}% missing metadata</li>
+      <li><b>RCA Confidence:</b> {{ "%.2f"|format(rca_insights.confidence) }} (Stability: {{ rca_stability.consistency_score }}/100)</li>
+      <li><b>Actions Generated:</b> {{ kpis.total_actions }}</li>
+      <li><b>SLA Compliance:</b> {{ action_performance.sla_compliance_percent }}%</li>
+      <li><b>Improvement Detected:</b> {{ kpis.action_closure_rate_percent }}% closure rate</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>2. Data Validation</h2>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-value">{{ data_validation.total_events_analyzed }}</div>
+        <div class="kpi-label">Total Events Analyzed</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ data_validation.invalid_rows_skipped }}</div>
+        <div class="kpi-label">Invalid Rows Skipped</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ data_validation.missing_metadata_percent }}%</div>
+        <div class="kpi-label">Missing Metadata</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>3. Operational KPIs</h2>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-value">{{ kpis.total_defects }}</div>
+        <div class="kpi-label">Total Defects</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ kpis.defects_per_hour }}</div>
+        <div class="kpi-label">Defects/Hour</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ kpis.avg_mttr_hours }}</div>
+        <div class="kpi-label">Avg MTTR (Hours)</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ kpis.action_closure_rate_percent }}%</div>
+        <div class="kpi-label">Action Closure Rate</div>
+      </div>
+    </div>
+
+    <h3>Severity Distribution</h3>
+    <table class="table">
+      <tr><th>Severity</th><th>Count</th><th>Percentage</th></tr>
+      {% for sev, count in kpis.severity_distribution.items() %}
+      <tr>
+        <td>{{ sev }}</td>
+        <td>{{ count }}</td>
+        <td>{{ "%.1f"|format(count / kpis.total_defects * 100) }}%</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>4. RCA Insights</h2>
+    <p><b>Overall Confidence:</b> {{ "%.2f"|format(rca_insights.confidence) }}</p>
+    <p><b>Anomaly Spikes Detected:</b> {{ rca_insights.spike_count }}</p>
+    <p><b>RCA Stability Score:</b> {{ rca_stability.consistency_score }}/100</p>
+
+    {% if rca_insights.top_machine %}
+    <p><b>Top Contributing Machine:</b> {{ rca_insights.top_machine.machine_id }} (Lift: {{ "%.2f"|format(rca_insights.top_machine.lift_ratio) }})</p>
+    {% endif %}
+
+    {% if rca_insights.top_defect_type %}
+    <p><b>Top Defect Type:</b> {{ rca_insights.top_defect_type.defect_type }} (Lift: {{ "%.2f"|format(rca_insights.top_defect_type.lift_ratio) }})</p>
+    {% endif %}
+
+    <h3>6M Classifications</h3>
+    <ul>
+      {% for finding in rca_insights.classification_6m %}
+      <li><span class="highlight">{{ finding.classification_6m }}</span>: {{ finding.basis }}</li>
+      {% endfor %}
+    </ul>
+
+    {% if rca_insights.top_causal_factors %}
+    <h3>Causal Confidence Scoring</h3>
+    <ul>
+      {% for factor in rca_insights.top_causal_factors %}
+      <li>{{ factor.statement }} — correlation {{ factor.components.correlation_strength }}, temporal {{ factor.components.temporal_alignment }}, repeatability {{ factor.components.repeatability }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>5. Temporal RCA Insights</h2>
+    {% if advanced_sections.temporal_rca_insights %}
+    <table class="table">
+      <tr><th>Signal</th><th>Lag</th><th>Correlation</th><th>Insight</th></tr>
+      {% for item in advanced_sections.temporal_rca_insights %}
+      <tr>
+        <td>{{ item.signal }}</td>
+        <td>{{ item.lag_seconds }} sec</td>
+        <td>{{ item.correlation }}</td>
+        <td>{{ item.statement }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="small">No temporal RCA precursor patterns detected for this window.</p>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>6. Control-Limit Violations</h2>
+    {% if advanced_sections.control_limit_violations %}
+    <table class="table">
+      <tr><th>Signal</th><th>% Outside Warning</th><th>% Outside Control</th><th>Trend Violations</th><th>Safe Range</th></tr>
+      {% for row in advanced_sections.control_limit_violations %}
+      <tr>
+        <td>{{ row.signal }}</td>
+        <td>{{ row.outside_warning_pct }}%</td>
+        <td>{{ row.outside_control_pct }}%</td>
+        <td>{{ row.trend_violations }}</td>
+        <td>{{ row.safe_range.min }} → {{ row.safe_range.max }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="small">No control-limit telemetry available for this window.</p>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>7. Predictive Risk Summary</h2>
+    <p><b>Risk Level:</b> {{ advanced_sections.predictive_risk_summary.risk_score|default('low')|upper }}</p>
+    <p><b>Numeric Risk:</b> {{ advanced_sections.predictive_risk_summary.numeric_risk|default(0) }}</p>
+    <p><b>Summary:</b> {{ advanced_sections.predictive_risk_summary.summary|default('No predictive maintenance signal available.') }}</p>
+    {% if advanced_sections.predictive_risk_summary.drivers %}
+    <ul>
+      <li>Rolling defect rate: {{ advanced_sections.predictive_risk_summary.drivers.rolling_defect_rate }}</li>
+      <li>Baseline defect rate: {{ advanced_sections.predictive_risk_summary.drivers.baseline_defect_rate }}</li>
+      <li>Anomaly frequency: {{ advanced_sections.predictive_risk_summary.drivers.anomaly_frequency }}</li>
+      <li>Equipment stress: {{ advanced_sections.predictive_risk_summary.drivers.equipment_stress }}</li>
+    </ul>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>8. Camera-Level Analysis</h2>
+    <h3>Defects by Camera</h3>
+    <table class="table">
+      <tr><th>Camera</th><th>Defect Count</th><th>Percentage</th></tr>
+      {% for camera, count in camera_analysis.defects_by_camera.items() %}
+      <tr>
+        <td>{{ camera }}</td>
+        <td>{{ count }}</td>
+        <td>{{ "%.1f"|format(count / kpis.total_defects * 100) }}%</td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <h3>Severity Distribution by Camera</h3>
+    {% for camera, severity_dist in camera_analysis.severity_by_camera.items() %}
+    <h4>{{ camera }}</h4>
+    <table class="table">
+      <tr><th>Severity</th><th>Count</th></tr>
+      {% for sev, count in severity_dist.items() %}
+      <tr><td>{{ sev }}</td><td>{{ count }}</td></tr>
+      {% endfor %}
+    </table>
+    {% endfor %}
+  </div>
+
+  <div class="section">
+    <h2>9. Time Distribution</h2>
+    <h3>Defects by Hour</h3>
+    <table class="table">
+      <tr><th>Hour</th><th>Defect Count</th></tr>
+      {% for hour, count in time_distribution.defects_by_hour.items() %}
+      <tr><td>{{ hour }}:00</td><td>{{ count }}</td></tr>
+      {% endfor %}
+    </table>
+
+    <h3>Defects by Shift</h3>
+    <table class="table">
+      <tr><th>Shift</th><th>Defect Count</th><th>Percentage</th></tr>
+      {% for shift, count in time_distribution.defects_by_shift.items() %}
+      <tr>
+        <td>{{ shift }}</td>
+        <td>{{ count }}</td>
+        <td>{{ "%.1f"|format(count / kpis.total_defects * 100) }}%</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>10. Actions & Compliance</h2>
+    <p><b>Total Actions:</b> {{ actions_summary.total }}</p>
+
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-value">{{ action_performance.avg_ack_time_minutes }}</div>
+        <div class="kpi-label">Avg Ack Time (Min)</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ action_performance.avg_resolution_time_minutes }}</div>
+        <div class="kpi-label">Avg Resolution Time (Min)</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ action_performance.sla_compliance_percent }}%</div>
+        <div class="kpi-label">SLA Compliance</div>
+      </div>
+    </div>
+
+    <h3>Actions by Status</h3>
+    <table class="table">
+      <tr><th>Status</th><th>Count</th></tr>
+      {% for status, count in actions_summary.by_status.items() %}
+      <tr><td>{{ status }}</td><td>{{ count }}</td></tr>
+      {% endfor %}
+    </table>
+
+    <h3>Recent Actions</h3>
+    <table class="table">
+      <tr><th>Action ID</th><th>Status</th><th>Assigned Role</th><th>Timestamp</th></tr>
+      {% for action in actions_summary.recent_actions %}
+      <tr>
+        <td>{{ action.action_id }}</td>
+        <td>{{ action.status }}</td>
+        <td>{{ action.assigned_role }}</td>
+        <td>{{ action.timestamp }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>11. Evidence Gallery</h2>
+    <p>Top severity defects from live operational data:</p>
+    <div class="grid">
+      {% for img in evidence_images %}
+      <div class="card">
+        <img src="file://{{ img.path }}" alt="Defect evidence" />
+        <div class="cap">
+          <b>Event:</b> {{ img.event_id }}<br/>
+          <b>Severity:</b> {{ img.severity }} | <b>Type:</b> {{ img.defect_type }}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>12. Key Takeaways</h2>
+    <ul>
+      {% for takeaway in key_takeaways %}
+      <li>{{ takeaway }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>13. Comparison Trends</h2>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-value">{{ comparison_trends.defects_change }}%</div>
+        <div class="kpi-label">Defects vs Previous Period</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ comparison_trends.mttr_change }}%</div>
+        <div class="kpi-label">MTTR vs Previous Period</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">{{ comparison_trends.closure_rate_change }}%</div>
+        <div class="kpi-label">Closure Rate vs Previous Period</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>14. Data Traceability</h2>
+    <ul>
+      <li><b>Report ID:</b> {{ report_metadata.report_id }}</li>
+      <li><b>Report Generated:</b> {{ report_metadata.generated_at_utc }} UTC</li>
+      <li><b>Hostname:</b> {{ report_metadata.hostname }}</li>
+      <li><b>System Version:</b> {{ report_metadata.system_version }}</li>
+      <li><b>Data Window:</b> {{ report_metadata.data_window_start }} → {{ report_metadata.data_window_end }}</li>
+      <li><b>Source Filtering:</b> Runtime operational data only (excluded synthetic/demo/training)</li>
+      <li><b>Data Validation:</b> {{ data_validation.total_events_analyzed }} events analyzed, {{ data_validation.missing_metadata_percent }}% missing metadata</li>
+      <li><b>RCA Computation:</b> Fresh analysis from events DB (Stability: {{ rca_stability.consistency_score }}/100)</li>
+      <li><b>Action Data:</b> Live ActionTracker database ({{ action_performance.sla_compliance_percent }}% SLA compliance)</li>
+      <li><b>Evidence Images:</b> From data/live/defects directory</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>15. Data Integrity &amp; Regulatory Traceability</h2>
+    <table class="table">
+      <tr>
+        <th>Event ID</th>
+        <th>Timestamp</th>
+        <th>Source</th>
+        <th>Defect</th>
+        <th>Severity</th>
+        <th>Verification Key</th>
+        <th>ISO 9001 Clause</th>
+      </tr>
+      {% for record in traceability_records %}
+      <tr>
+        <td>{{ record.event_id|default('N/A') }}</td>
+        <td>{{ record.timestamp|default('N/A') }}</td>
+        <td>{{ record.source|default('N/A') }}</td>
+        <td>{{ record.defect_type|default('N/A') }}</td>
+        <td>{{ record.severity|default('N/A') }}</td>
+        <td class="small">{{ record.audit_hash|default('N/A') }}</td>
+        <td>{{ record.iso_clause|default('N/A') }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>16. Sustainability &amp; Green Manufacturing Statement</h2>
+    <p>This audit period demonstrates quantified value realization through scrap reduction, economic recovery, and avoided carbon impact based on configured ESG conversion factors.</p>
+    <table class="table">
+      <tr><th>Metric</th><th>Value</th></tr>
+      <tr>
+        <td>Scrap Prevented</td>
+        <td>{{ esg_metrics.scrap_prevented_kg|default(0) }} kg</td>
+      </tr>
+      <tr>
+        <td>Revenue Recovered</td>
+        <td>{{ esg_metrics.currency_symbol|default('$') }}{{ esg_metrics.revenue_recovered_usd|default(0) }}</td>
+      </tr>
+      <tr>
+        <td>CO2 Emissions Offset</td>
+        <td>{{ esg_metrics.co2_emissions_offset_kg|default(0) }} kg</td>
+      </tr>
+      <tr>
+        <td>Units Counted</td>
+        <td>{{ esg_metrics.units_count|default(0) }}</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>17. Cognitive RCA Insights</h2>
+    {% if cognitive_rca_insights %}
+    <table class="table">
+      <tr><th>Event ID</th><th>Defect Type</th><th>Severity</th><th>AI Root-Cause Narrative</th></tr>
+      {% for item in cognitive_rca_insights %}
+      <tr>
+        <td>{{ item.event_id|default('N/A') }}</td>
+        <td>{{ item.defect_type|default('N/A') }}</td>
+        <td>{{ item.severity|default('N/A') }}</td>
+        <td>{{ item.vlm_narrative|default('N/A') }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="small">No AI cognitive RCA narratives were available for the selected reporting window.</p>
+    {% endif %}
+  </div>
+
+  <div class="section">
+    <h2>18. Systemic Anomaly Analysis</h2>
+    {% if systemic_anomaly_analysis and systemic_anomaly_analysis.insight %}
+    <p><b>Cluster ID:</b> {{ systemic_anomaly_analysis.cluster_id|default('N/A') }}</p>
+    <p>{{ systemic_anomaly_analysis.insight|default('N/A') }}</p>
+    {% else %}
+    <p class="small">No systemic anomaly batch insight was available for this reporting window.</p>
+    {% endif %}
+  </div>
+
+  <div style="margin-top: 40px; padding: 20px; border-top: 2px solid #ecf0f1; text-align: center; font-size: 12px; color: #7f8c8d;">
+    <p><strong>Change Log Disclaimer:</strong> This report reflects system state at generation time and is not retroactively updated.</p>
+    <p><strong>Regulatory Statement:</strong> Data lineage verified by Qualyxus Cryptographic Engine.</p>
+    <p><strong>This report quantifies the sustainable operational excellence of [Factory Name], verified by Qualyxus ESG Intelligence.</strong></p>
+  </div>
+
+  <div style="margin-top: 20px; padding: 20px; border-top: 1px solid #ddd; text-align: center;">
+    <p><strong>Generated by QUALYXUS</strong></p>
+    <p><em>Digitally Verified</em></p>
+    <p style="margin-top: 30px; border-bottom: 1px solid #000; width: 200px; margin-left: auto; margin-right: auto;"></p>
+    <p style="font-size: 12px; color: #7f8c8d;">Approved By: ___________________________</p>
+  </div>
+</body>
+</html>

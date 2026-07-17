@@ -1,0 +1,114 @@
+paths:
+  data_dir: "data"
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  events_dir: "data/events"
+  reports_dir: "data/reports"
+  models_dir: "models/checkpoints"
+  exported_dir: "models/exported"
+
+dataset:
+  name: "active_product_recipe"
+  format: "masks"
+  raw_path: "data/raw/active_dataset"
+  val_split: 0.20
+  seed: 42
+  min_contour_area: 25
+  classes:
+    0: "defect"
+
+inference:
+  model_path: "models/checkpoints/default/best.pt"
+  yolo_yaml: "data/processed/active_recipe.yaml"
+  conf: 0.35
+  iou: 0.5
+  save_overlay: true
+  save_crops: true
+  skip_frames: 2
+  device: cuda
+
+training:
+  model: "yolov8s-seg.pt"
+  epochs: 30
+  imgsz: 640
+  batch: 8
+  device: 0
+
+logging:
+  sqlite_path: "data/events/events.db"
+  csv_path: "data/events/events.csv"
+
+mqtt:
+  agentic_enabled: false
+  host: "127.0.0.1"
+  port: 1883
+  keepalive: 60
+  qos: 1
+  retain: false
+  topic_root: "qualyxus/agentic"
+  client_id: "qualyxus-agentic-gateway"
+  reconnect_backoff_seconds: 30
+  evaluation_queue_size: 128
+
+telemetry:
+  mode: "simulated"
+  protocol: "modbus"
+  endpoint: null
+  register_map: null
+
+hardware_acceleration:
+  use_triton: true
+  precision: "fp16"
+
+vlm_reasoning:
+  enabled: true
+  model: "moondream2"
+  local_api: "http://localhost:11434"
+  timeout_seconds: 10
+  backend: "ollama"
+
+esg_params:
+  material_density_kg_per_unit: 0.5
+  unit_cost_usd: 12.5
+  carbon_coefficient_kg_co2_per_kg: 2.5
+  currency_symbol: "$"
+  line_overrides: {}
+
+synthetic_generation:
+  model_type: "inpainting"
+  device: "cuda"
+  batch_size: 4
+  output_resolution: [640, 640]
+
+federated_learning:
+  enabled: true
+  privacy_level: "maximum"
+  sync_interval_hours: 24
+
+camera_settings:
+  use_gstreamer: true
+  hardware_platform: "nvidia"
+  buffer_size: 1
+
+resource_management:
+  monitoring_interval: 2.0
+  vram_thresholds:
+    warning: 85
+    critical: 95
+  temp_thresholds:
+    warning: 78
+    critical: 85
+  warning_hold_seconds: 5
+  critical_hold_seconds: 0
+  warning_cooldown_seconds: 15
+  critical_cooldown_seconds: 30
+  emergency_temp_c: 90
+
+camera:
+  fps: 30
+  width: 640
+  height: 480
+  reconnect: true
+
+storage:
+  retention_days: 30

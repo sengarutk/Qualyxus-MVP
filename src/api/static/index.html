@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qualyxus Pulse — Real-Time Forensics</title>
+    <!-- Chart.js for FFT visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-dark: #0f1115;
+            --bg-panel: #1a1d24;
+            --text-main: #e2e8f0;
+            --accent-blue: #00d2ff;
+            --zone-green: #00FF00;
+            --zone-yellow: #FFFF00;
+            --zone-red: #FF0000;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            display: grid;
+            grid-template-columns: 1fr 3fr;
+            grid-template-rows: auto 1fr;
+            gap: 20px;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+
+        header {
+            grid-column: 1 / -1;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #333;
+            padding-bottom: 10px;
+        }
+
+        h1 {
+            margin: 0;
+            font-weight: 600;
+            color: var(--accent-blue);
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .panel {
+            background: var(--bg-panel);
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* --- Health Gauge --- */
+        .gauge-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            flex: 1;
+        }
+
+        .gauge {
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            border: 10px solid #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            font-weight: bold;
+            transition: border-color 0.3s ease;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5) inset;
+        }
+        
+        .gauge[data-zone="ZONE_A_B"] { border-color: var(--zone-green); box-shadow: 0 0 15px var(--zone-green); }
+        .gauge[data-zone="ZONE_C"]   { border-color: var(--zone-yellow); box-shadow: 0 0 15px var(--zone-yellow); }
+        .gauge[data-zone="ZONE_D"]   { border-color: var(--zone-red); box-shadow: 0 0 15px var(--zone-red); }
+
+        .metric-label {
+            margin-top: 15px;
+            font-size: 14px;
+            color: #888;
+            text-transform: uppercase;
+        }
+        .metric-value {
+            font-size: 32px;
+            font-family: monospace;
+            color: var(--accent-blue);
+        }
+
+        /* --- Narrative Ticker --- */
+        .narrative {
+            flex: 1;
+            overflow-y: auto;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 10px;
+            background: #111317;
+            font-family: monospace;
+            font-size: 13px;
+        }
+
+        .log-entry {
+            margin-bottom: 8px;
+            border-bottom: 1px solid #222;
+            padding-bottom: 5px;
+        }
+        
+        .log-time { color: #888; margin-right: 10px; }
+        .log-zone-d { color: var(--zone-red); font-weight: bold; }
+        .log-zone-c { color: var(--zone-yellow); }
+
+        /* --- ROI Counter --- */
+        .roi-panel {
+            margin-top: 20px;
+            text-align: center;
+        }
+
+        .roi-value {
+            font-size: 36px;
+            color: #00FF55;
+            font-weight: 800;
+        }
+
+        /* --- Chart Area --- */
+        .chart-container {
+            position: relative;
+            flex: 1;
+            width: 100%;
+        }
+
+        /* --- Narrative Box Phase 5 --- */
+        .vlm-terminal {
+            background: #0a0a0a;
+            color: #00FF00;
+            font-family: 'Courier New', monospace;
+            border: 1px solid #333;
+            padding: 15px;
+            border-radius: 4px;
+            font-size: 14px;
+            min-height: 80px;
+            margin-top: 15px;
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.1) inset;
+        }
+
+        /* --- Phase 8 RUL Blinker --- */
+        @keyframes blinker {
+            50% { opacity: 0; }
+        }
+        .blink {
+            animation: blinker 1s linear infinite;
+        }
+
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>Qualyxus Pulse</h1>
+        <div style="color: #666; display: flex; align-items: center; gap: 15px;">
+            <span>Cam: test_cam | ISO 10816-3</span>
+            <span id="profileBadge" style="padding: 4px 8px; border-radius: 4px; background: #333; color: #00FF00; font-weight: bold;">...</span>
+        </div>
+    </header>
+
+    <!-- LEFT COLUMN -->
+    <div style="display: flex; flex-direction: column; gap: 20px;">
+        
+        <!-- Gauge Panel -->
+        <div class="panel">
+            <h3 style="margin-top:0;">Mechanical Health</h3>
+            <div class="gauge-container">
+                <div id="healthGauge" class="gauge" data-zone="UNKNOWN">N/A</div>
+                <div style="display:flex; justify-content:space-between; width:100%; margin-top: 20px">
+                    <div style="text-align:center;">
+                        <div class="metric-label">RMS Velocity</div>
+                        <div class="metric-value" id="rmsValue">0.00</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div class="metric-label">Dominant Hz</div>
+                        <div class="metric-value" id="freqValue">0.0</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ROI Panel -->
+        <div class="panel roi-panel">
+            <h3 style="margin-top:0;">Live ROI Tracker</h3>
+            <div class="metric-label">Estimated Savings</div>
+            <div class="roi-value" id="roiValue">$0</div>
+            <div style="font-size: 11px; margin-top: 5px; color:#555">
+                Crit Prevented: <span id="critCount">0</span> | Defects Caught: <span id="defectCount">0</span>
+            </div>
+        </div>
+        
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div style="display: flex; flex-direction: column; gap: 20px;">
+
+        <!-- Chart Area -->
+        <div class="panel">
+            <h3 style="margin-top:0;">Real-Time Spectrogram (FFT)</h3>
+            <div class="chart-container" style="height: 250px;">
+                <canvas id="fftChart"></canvas>
+            </div>
+        </div>
+        
+        <!-- Phase 8: 7-Day Health Trajectory -->
+        <div class="panel" style="margin-top: 20px;">
+            <h3 style="margin-top:0;">7-Day Health Trajectory</h3>
+            <div class="chart-container" style="height: 150px;">
+                <canvas id="trendChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Narrative Ticker -->
+        <div class="panel" style="flex: 1;">
+            <h3 style="margin-top:0;">System Events</h3>
+            <div class="narrative" id="narrativeLog">
+                <!-- Logs prepend here -->
+            </div>
+            
+            <!-- Phase 5: Forensic Commentary Terminal -->
+            <div class="vlm-terminal" id="vlmTerminal">
+                <span style="color:#555;">[VLM Module Standby...]</span>
+            </div>
+            
+            <!-- Phase 8: Predictive Maintenance -->
+            <div class="panel" style="text-align: center; margin-top: 15px; padding: 20px;">
+                <h2 style="margin: 0; color: #888;">Days to Maintenance</h2>
+                <div id="rulDisplay" style="font-size: 48px; font-weight: bold; margin-top: 10px;">--</div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- PHASE 7 FOOTER -->
+    <footer id="securityFooter" style="background: #111; border-top: 1px solid #333; padding: 10px; display: flex; justify-content: space-around; font-family: monospace; color: #888;">
+        <div>🔒 Vault: <span style="color:#00FF00">AES-Active</span></div>
+        <div>📡 MQTT Hub: <span style="color:#00FF00">Connected</span></div>
+        <div>⚙️ PLC Interlock: <span id="plcStatus" style="color:#00FF00">Standby</span></div>
+    </footer>
+
+    <script>
+        // State
+        let vibrationCriticalCount = 0;
+        let defectCount = 0;
+        let lastJustification = "";
+
+        // UI Elements
+        const elementGauge = document.getElementById("healthGauge");
+        const elementRms   = document.getElementById("rmsValue");
+        const elementFreq  = document.getElementById("freqValue");
+        const elementLog   = document.getElementById("narrativeLog");
+        const elementRoi   = document.getElementById("roiValue");
+        const elementCrit  = document.getElementById("critCount");
+        const elementDef   = document.getElementById("defectCount");
+
+        // Chart Setup
+        const fftOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 0 },
+            scales: {
+                x: {
+                    type: 'category',
+                    title: { display: true, text: 'Frequency (Hz)', color: '#888' },
+                    ticks: { color: '#aaa' },
+                    grid: { color: '#333' }
+                },
+                y: {
+                    beginAtZero: true,
+                    title: { display: true, text: 'Amplitude (mm/s)', color: '#999' },
+                    grid:  { color: '#333' },
+                    ticks: { color: '#ccc' }
+                }
+            },
+            plugins: { legend: { display: false } }
+        };
+
+        const fftData = {
+            labels: [],
+            datasets: [{
+                label: 'PSD Magnitude',
+                data: [],
+                backgroundColor: 'rgba(0, 210, 255, 0.5)',
+                borderColor: 'rgba(0, 210, 255, 1)',
+                borderWidth: 1,
+                barThickness: 20
+            }]
+        };
+
+        const ctx = document.getElementById('fftChart').getContext('2d');
+        const fftChart = new Chart(ctx, {
+            type: 'bar',
+            data: fftData,
+            options: fftOptions
+        });
+        
+        // Phase 8 Trend Chart Init
+        const ctxTrend = document.getElementById('trendChart').getContext('2d');
+        const trendChart = new Chart(ctxTrend, {
+            type: 'line',
+            data: {
+                labels: Array.from({length: 100}, (_, i) => i),
+                datasets: [{
+                    label: 'RMS Velocity (mm/s)',
+                    data: Array(100).fill(0),
+                    borderColor: '#00ff00',
+                    borderWidth: 2,
+                    fill: false,
+                    pointRadius: 0
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                scales: {
+                    x: { display: false },
+                    y: { 
+                        beginAtZero: true,
+                        grid: { color: '#333' },
+                        ticks: { color: '#ccc' }
+                    }
+                },
+                plugins: { legend: { display: false } }
+            }
+        });
+
+        function updateROI(data) {
+            if (data.status === 'OK') {
+                if (data.iso_zone === "ZONE_D") vibrationCriticalCount++;
+                else if (data.iso_zone === "ZONE_C") defectCount++;
+                
+                const savings = (vibrationCriticalCount * 50000) + (defectCount * 150);
+                
+                elementRoi.innerText = "$" + savings.toLocaleString();
+                elementCrit.innerText = vibrationCriticalCount;
+                elementDef.innerText = defectCount;
+            }
+        }
+
+        function prependLog(justification, zone) {
+            if (justification === lastJustification) return; // Deduplicate
+            lastJustification = justification;
+
+            const time = new Date().toLocaleTimeString();
+            const div = document.createElement("div");
+            div.className = "log-entry";
+            
+            let extraClass = "";
+            if (zone === "ZONE_D") extraClass = "log-zone-d";
+            else if (zone === "ZONE_C") extraClass = "log-zone-c";
+
+            div.innerHTML = `<span class="log-time">[${time}]</span><span class="${extraClass}">${justification}</span>`;
+            elementLog.prepend(div);
+            
+            // Limit log lines
+            if (elementLog.children.length > 50) {
+                elementLog.removeChild(elementLog.lastChild);
+            }
+        }
+
+        // Phase 5 VLM Logic
+        const elementVlm = document.getElementById("vlmTerminal");
+        let currentNarrativeStr = "";
+        let typewriterInterval = null;
+
+        function display_new_message(text) {
+            if (currentNarrativeStr === text) return;
+            currentNarrativeStr = text;
+            
+            if (typewriterInterval) clearInterval(typewriterInterval);
+            elementVlm.innerText = "";
+            let i = 0;
+            
+            typewriterInterval = setInterval(() => {
+                if (i < currentNarrativeStr.length) {
+                    elementVlm.innerText += currentNarrativeStr.charAt(i);
+                    i++;
+                } else {
+                    clearInterval(typewriterInterval);
+                }
+            }, 20); // 20ms per char
+        }
+
+        // Establish SSE
+        const source = new EventSource('/stream/test_cam');
+        source.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            
+            // 1. Update Gauge & Metrics
+            elementGauge.setAttribute("data-zone", data.iso_zone);
+            elementGauge.innerText = data.iso_zone.replace("ZONE_", "");
+            
+            elementRms.innerText = data.rms.toFixed(2);
+            elementFreq.innerText = data.dominant_freq.toFixed(2);
+            
+            // 2. Chart top_peaks
+            if (data.top_peaks) {
+                // Sort by frequency for X-axis layout
+                const peaks = [...data.top_peaks].sort((a,b) => a.freq - b.freq);
+                fftChart.data.labels = peaks.map(p => p.freq + " Hz");
+                fftChart.data.datasets[0].data = peaks.map(p => p.psd);
+                fftChart.update();
+            }
+
+            // 3. Ticker & ROI
+            if (data.justification && data.justification !== "PENDING_ANALYSIS") {
+                prependLog(data.justification, data.iso_zone);
+                updateROI(data);
+            }
+            
+            // 4. Phase 5 VLM Check
+            if (data.narrative_report) {
+                display_new_message(data.narrative_report);
+            }
+            
+            // 5. Phase 6 Mode Badge Check
+            if (data.active_profile) {
+                document.getElementById('profileBadge').innerText = data.active_profile;
+            }
+            
+            // 6. Phase 7 Modbus Interlock Trigger
+            if (data.plc_interlock_triggered) {
+                document.getElementById('plcStatus').innerText = "ENGAGED";
+                document.getElementById('plcStatus').style.color = "#FF0000";
+                
+                // Bold red log entry (prevent spamming via a simple check)
+                if (!window.hasLoggedModbus) {
+                    window.hasLoggedModbus = true;
+                    const logEl = document.getElementById("narrativeLog");
+                    const entry = document.createElement("div");
+                    entry.style.color = "#ff0000";
+                    entry.style.fontWeight = "bold";
+                    entry.style.marginBottom = "8px";
+                    entry.innerHTML = "[HARDWARE] Emergency Stop Sent via Modbus/TCP";
+                    logEl.insertBefore(entry, logEl.firstChild);
+                    
+                    // Reset the log after 5 seconds so it can fire again 
+                    setTimeout(() => { window.hasLoggedModbus = false; }, 5000);
+                }
+            }
+            
+            // 7. Phase 8 Predictive Historian Sync
+            if (data.estimated_rul_days !== undefined) {
+                const rulEl = document.getElementById("rulDisplay");
+                let rul = data.estimated_rul_days;
+                rulEl.classList.remove("blink"); // Reset
+                
+                if (rul > 990) {
+                    rulEl.innerText = "Stable";
+                    rulEl.style.color = "#00ff00";
+                    trendChart.data.datasets[0].borderColor = "#00ff00";
+                } else {
+                    rulEl.innerText = rul.toFixed(1);
+                    if (rul > 30) {
+                        rulEl.style.color = "#00ff00";
+                        trendChart.data.datasets[0].borderColor = "#00ff00";
+                    } else if (rul > 14) {
+                        rulEl.style.color = "#ffff00";
+                        trendChart.data.datasets[0].borderColor = "#ffff00";
+                    } else {
+                        rulEl.style.color = "#ff0000";
+                        trendChart.data.datasets[0].borderColor = "#ff0000";
+                        rulEl.classList.add("blink");
+                    }
+                }
+                
+                // Advance the visual UI trend array
+                trendChart.data.datasets[0].data.shift();
+                trendChart.data.datasets[0].data.push(data.rms);
+                trendChart.update();
+            }
+        };
+
+        source.onerror = function() {
+            console.error("SSE Connection lost. Retrying automatically...");
+        };
+    </script>
+</body>
+</html>

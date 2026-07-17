@@ -1,0 +1,59 @@
+services:
+  qualyxus-inference:
+    build: .
+    command: python src/inference/infer_live.py
+    network_mode: "host"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - HEALTHCHECK_MODE=inference
+      - CAMERA_STATUS_PATH=/app/data/live/camera_status.json
+      - MODEL_ASSET_PATH=${MODEL_ASSET_PATH:-/app/models/best.pt}
+      - PYTHONPATH=/app
+      - LOW_MEMORY_MODE=0
+      - LOW_MEMORY_MAX_CAMERAS=${LOW_MEMORY_MAX_CAMERAS:-1}
+      - MAX_CAMERA_WORKERS=${MAX_CAMERA_WORKERS:-0}
+      - TORCH_NUM_THREADS=1
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # Hardened Fix: Route the inline request to hit the dedicated /api/v1/health endpoint.
+      # Hitting the SSE stream endpoint creates persistent socket leaks because the stream never closes.
+      # Utilizing the newly added 'curl' from the base layer for strict validation.
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  qualyxus-dashboard:
+    build: .
+    command: streamlit run src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    network_mode: "host"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - HEALTHCHECK_MODE=dashboard
+      - PYTHONPATH=/app
+      - LOW_MEMORY_MODE=0
+      - TORCH_NUM_THREADS=1
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 30s

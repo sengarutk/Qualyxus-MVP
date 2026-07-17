@@ -1,0 +1,26 @@
+# Local Virtual Environments & Dependency Trees
+.venv/
+venv/
+ENV/
+
+# IDE Configuration Caches (Prevents workspace editor noise)
+.idea/
+.vscode/
+
+# Python Runtime Bytecode Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Core Machine Learning Binary Weights (Dynamic)
+models/checkpoints/
+runs/
+*.pt
+*.onnx
+
+# Metrology Storage, Simulation Artifacts, & CSV Telemetry Databases
+data/
+reports/
+*.db
+*.csv

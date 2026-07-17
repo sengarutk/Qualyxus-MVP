@@ -1,0 +1,30 @@
+.venv
+.git
+.idea
+
+# Runtime/generated data
+data/*
+models/*
+runs/*
+
+# Python cache/artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Large model/binary assets
+*.pt
+*.pth
+*.zip
+
+# Media/log/db artifacts
+*.mp4
+*.jpg
+*.png
+*.log
+*.db
+*.sqlite
+
+# Local env files
+.env
