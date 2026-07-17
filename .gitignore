@@ -23,4 +23,6 @@ runs/
 data/
 reports/
 *.db
-*.csv
+*.csvqualyxus.db
+*.pt
+Qualyxus.egg-info/
