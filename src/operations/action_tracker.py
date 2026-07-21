@@ -49,6 +49,32 @@ class ActionTracker:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _update_relations(self, conn, action_id: str, rca_reference: str, action_payload: Any) -> None:
+        resolved = []
+        if isinstance(action_payload, dict):
+            if "event_id" in action_payload:
+                resolved.append(str(action_payload["event_id"]))
+            if "event_ids" in action_payload:
+                ids = action_payload["event_ids"]
+                if isinstance(ids, list):
+                    resolved.extend(str(x) for x in ids)
+                else:
+                    resolved.append(str(ids))
+        if rca_reference:
+            if len(rca_reference) in (32, 36) or rca_reference.startswith("event_"):
+                resolved.append(rca_reference)
+            elif rca_reference.startswith("rca:"):
+                parts = rca_reference.split(":")
+                if len(parts) > 2 and (len(parts[-1]) in (32, 36) or parts[-1].startswith("event_")):
+                    resolved.append(parts[-1])
+
+        for eid in set(resolved):
+            if eid:
+                conn.execute(
+                    "INSERT OR IGNORE INTO action_event_relations (action_id, event_id) VALUES (?, ?)",
+                    (action_id, str(eid))
+                )
+
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -96,7 +122,18 @@ class ActionTracker:
                     verified_at TEXT,
                     action_payload TEXT NOT NULL,
                     change_reason TEXT,
+                    rca_reference TEXT,
                     UNIQUE(action_id, version)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS action_event_relations (
+                    action_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    PRIMARY KEY (action_id, event_id)
                 )
                 """
             )
@@ -107,6 +144,7 @@ class ActionTracker:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_role ON tracked_actions(assigned_role)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_timestamp ON tracked_actions(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_versions_action_id ON tracked_action_versions(action_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_event ON action_event_relations(event_id)")
             conn.commit()
 
     @staticmethod
@@ -145,6 +183,7 @@ class ActionTracker:
                 "verification_status": "TEXT",
                 "target_value": "REAL",
                 "verified_at": "TEXT",
+                "rca_reference": "TEXT",
             },
         )
 
@@ -168,6 +207,7 @@ class ActionTracker:
         action_payload: dict[str, Any],
         changed_by: str | None,
         change_reason: str | None,
+        rca_reference: str | None = None,
     ) -> None:
         conn.execute(
             """
@@ -176,8 +216,8 @@ class ActionTracker:
                 status, assigned_role, assigned_to, acknowledged_at,
                 resolved_by, approval_required, approved_by,
                 closure_notes, verification_status, target_value, verified_at,
-                action_payload, change_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                action_payload, change_reason, rca_reference
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 action_id,
@@ -197,6 +237,7 @@ class ActionTracker:
                 verified_at,
                 json.dumps(action_payload, ensure_ascii=False),
                 change_reason,
+                rca_reference,
             ),
         )
 
@@ -232,7 +273,7 @@ class ActionTracker:
                     status, acknowledged_at, resolved_by, approval_required, approved_by,
                     closure_notes, verification_status, target_value, verified_at,
                     version, action_payload, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     action_id,
@@ -255,6 +296,8 @@ class ActionTracker:
                 ),
             )
 
+            self._update_relations(conn, action_id, rca_reference, action_payload)
+
             self._insert_version(
                 conn,
                 action_id=action_id,
@@ -273,6 +316,7 @@ class ActionTracker:
                 action_payload=action_payload,
                 changed_by=changed_by,
                 change_reason="initial_issue",
+                rca_reference=rca_reference,
             )
             conn.commit()
 
@@ -296,6 +340,7 @@ class ActionTracker:
         action_payload: dict[str, Any] | None = None,
         changed_by: str | None = None,
         change_reason: str | None = None,
+        rca_reference: str | None = None,
     ) -> dict[str, Any]:
         """Update current action row and append a new version history record."""
         current = self.get_action(action_id)
@@ -331,6 +376,7 @@ class ActionTracker:
         new_verified_at = verified_at if verified_at is not None else current.get("verified_at")
         new_payload = action_payload if action_payload is not None else (current.get("action_payload") or {})
         new_version = int(current["version"]) + 1
+        new_rca_reference = rca_reference or current["rca_reference"]
         updated_at = _utc_now()
 
         with self._connect() as conn:
@@ -340,7 +386,7 @@ class ActionTracker:
                 SET assigned_role = ?, assigned_to = ?, status = ?, acknowledged_at = ?,
                     resolved_by = ?, approval_required = ?, approved_by = ?, closure_notes = ?,
                     verification_status = ?, target_value = ?, verified_at = ?,
-                    version = ?, action_payload = ?, updated_at = ?
+                    version = ?, action_payload = ?, rca_reference = ?, updated_at = ?
                 WHERE action_id = ?
                 """,
                 (
@@ -357,10 +403,13 @@ class ActionTracker:
                     new_verified_at,
                     new_version,
                     json.dumps(new_payload, ensure_ascii=False),
+                    new_rca_reference,
                     updated_at,
                     action_id,
                 ),
             )
+
+            self._update_relations(conn, action_id, new_rca_reference, new_payload)
 
             self._insert_version(
                 conn,
@@ -380,6 +429,7 @@ class ActionTracker:
                 action_payload=new_payload,
                 changed_by=changed_by,
                 change_reason=change_reason,
+                rca_reference=new_rca_reference,
             )
             conn.commit()
 
@@ -504,6 +554,7 @@ class ActionTracker:
                     "verified_at": r["verified_at"],
                     "action_payload": json.loads(r["action_payload"]),
                     "change_reason": r["change_reason"],
+                    "rca_reference": r["rca_reference"] if "rca_reference" in r.keys() else None,
                 }
             )
         return out

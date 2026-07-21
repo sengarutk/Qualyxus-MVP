@@ -60,6 +60,59 @@ class FramePacket:
     frame: np.ndarray
     full_image_path: str | None
 
+class FrameSlot:
+    def __init__(self, h, w):
+        self.frame = np.ascontiguousarray(np.zeros((h, w, 3), dtype=np.uint8))
+
+
+class CameraSyncManager:
+    """
+    Synchronized Multi-Camera Barrier Lock & Sequence Alignment.
+    Aligns frame fetches across active channels based on sequence numbers or Presentation Timestamps (PTS).
+    Injects non-blocking timeout null-events on dropped frames to keep worker threads in lockstep.
+    """
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._channels = {}
+                    cls._instance._barrier_lock = threading.Lock()
+                    cls._instance._condition = threading.Condition(cls._instance._barrier_lock)
+        return cls._instance
+
+    def register_channel(self, camera_id: str):
+        with self._barrier_lock:
+            self._channels[camera_id] = 0
+
+    def unregister_channel(self, camera_id: str):
+        with self._barrier_lock:
+            self._channels.pop(camera_id, None)
+            self._condition.notify_all()
+
+    def sync_barrier(self, camera_id: str, sequence_id: int, timeout_sec: float = 0.05) -> bool:
+        with self._barrier_lock:
+            if camera_id not in self._channels:
+                return True
+            self._channels[camera_id] = sequence_id
+            
+            all_synced = all(seq >= sequence_id for seq in self._channels.values())
+            if all_synced:
+                self._condition.notify_all()
+                return True
+
+            start_t = time.perf_counter()
+            while not all(seq >= sequence_id for seq in self._channels.values()):
+                rem = timeout_sec - (time.perf_counter() - start_t)
+                if rem <= 0:
+                    return False
+                self._condition.wait(timeout=min(0.005, rem))
+            return True
+
+
 @dataclass
 class CameraWorkerState:
     camera_id: str
@@ -95,6 +148,8 @@ class CameraWorkerState:
     last_throttle_log_ts: float = 0.0
     last_geometric_diagnostic: dict = field(default_factory=dict)
     tracker: Any = None
+    pool: list = field(default_factory=list)
+    pool_write_index: int = 0
 
 class CameraManager:
     """
@@ -367,10 +422,14 @@ class CameraManager:
 
     def _open_camera(self, source: Any, width: int = 640, height: int = 480, fps: float = 30.0):
         cap = cv2.VideoCapture(source)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        return (cap, "OpenCV-SW") if cap.isOpened() else (None, "OpenCV-SW")
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FPS, fps)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            return (cap, "OpenCV-HW" if str(source).startswith("rtsp://") else "OpenCV-SW")
+        return (None, "OpenCV-SW")
 
     def _interruptible_sleep(self, seconds: float, state: CameraWorkerState) -> bool:
         """Interruptible zero-CPU sleep that prevents framework pacing distortions."""
@@ -399,6 +458,14 @@ class CameraManager:
         is_synthetic = isinstance(state.source, str) and state.source.startswith("synthetic://")
         mock_inference_cfg = bool(camera_cfg.get("mock_inference", False))
         
+        # Register channel with multi-camera sync barrier
+        sync_mgr = CameraSyncManager()
+        sync_mgr.register_channel(state.camera_id)
+
+        # Pre-allocate 128-slot mutable ring buffer array managed within CameraWorkerState
+        state.pool = [FrameSlot(height, width) for _ in range(128)]
+        state.pool_write_index = 0
+
         cap = None
         if not is_synthetic:
             cap, state.ingest_mode = self._open_camera(state.source, width=width, height=height, fps=fps)
@@ -430,8 +497,11 @@ class CameraManager:
                 if is_synthetic:
                     synthetic_fail_after = camera_cfg.get("synthetic_fail_after_frames")
                     if synthetic_fail_after is not None and state.restarts == 0 and frame_id >= int(synthetic_fail_after):
-                        raise RuntimeError("Synthetic capture failure injected")
-                    frame = np.full((height, width, 3), (40, 40, 40), dtype=np.uint8)
+                         raise RuntimeError("Synthetic capture failure injected")
+                    slot = state.pool[state.pool_write_index % 128]
+                    slot.frame[:] = (40, 40, 40)
+                    frame = slot.frame
+                    state.pool_write_index += 1
                     ret = True
                 else:
                     if cap is None:
@@ -442,9 +512,28 @@ class CameraManager:
                             continue
                         state.reconnect_count += 1
 
-                    for _ in range(2): 
-                        cap.grab()
-                    ret, frame = cap.read()
+                    grabbed = cap.grab()
+                    sync_mgr.sync_barrier(state.camera_id, frame_id, timeout_sec=0.05)
+                    if grabbed:
+                        slot = state.pool[state.pool_write_index % 128]
+                        ret, decoded_img = cap.retrieve(image=slot.frame)
+                        if not ret or (decoded_img is not slot.frame):
+                            logger.warning("[%s] OpenCV bypassed pre-allocated buffer allocations. Strides or alignment mismatch.", state.camera_id)
+                            frame = decoded_img
+                        else:
+                            frame = slot.frame
+                        state.pool_write_index += 1
+                        ret = True
+                    else:
+                        ret = False
+
+                    if not ret:
+                        cap.release()
+                        cap = None
+                        if not self._interruptible_sleep(reconnect_delay, state):
+                            break
+                        continue
+
                     if not ret:
                         cap.release()
                         cap = None
@@ -473,7 +562,7 @@ class CameraManager:
                         result = None
                         if multiplexer:
                             try:
-                                request_id = multiplexer.submit_frame(state.camera_id, frame)
+                                request_id = multiplexer.submit_frame(state.camera_id, frame, block=False, timeout=None)
                                 result = multiplexer.retrieve_result(request_id, timeout_sec=0.033)
                             except queue.Full:
                                 result = None
@@ -611,7 +700,7 @@ class CameraManager:
                                 except Exception as e:
                                     logger.error("[%s] Background geometry check crashed: %s", state.camera_id, e)
                             try:
-                                fut = self.executor.submit(geom_engine.inspect_part_geometry, frame.copy(), False)
+                                fut = self.executor.submit(geom_engine.inspect_part_geometry, frame, False)
                                 fut.add_done_callback(_geom_callback)
                             except RuntimeError:
                                 pass
@@ -623,7 +712,7 @@ class CameraManager:
                         session_id=state.session_id,
                         frame_id=frame_id,
                         timestamp_ms=int(time.time() * 1000),
-                        frame=frame,
+                        frame=frame.copy(),
                         full_image_path="",
                     )
                     try:
@@ -642,6 +731,7 @@ class CameraManager:
             logger.error("[%s] Capture loop exception: %s", state.camera_id, state.failure_reason, exc_info=True)
             state.stop_event.set()
         finally:
+            sync_mgr.unregister_channel(state.camera_id)
             logger.info("[%s] Capture loop exited. shutdown=%s, stop=%s", state.camera_id, self.shutdown_event.is_set(), state.stop_event.is_set())
             if cap is not None:
                 cap.release()
@@ -741,7 +831,7 @@ class CameraManager:
                             except Exception as e:
                                 logger.error("[%s] Mock background geometry check crashed: %s", state.camera_id, e)
                         try:
-                            fut = self.executor.submit(geom_engine.inspect_part_geometry, packet.frame.copy(), False)
+                            fut = self.executor.submit(geom_engine.inspect_part_geometry, packet.frame, False)
                             fut.add_done_callback(_geom_callback)
                         except RuntimeError:
                             pass

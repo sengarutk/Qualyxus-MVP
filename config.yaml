@@ -20,7 +20,7 @@ dataset:
     0: "defect"
 
 inference:
-  model_path: "models/checkpoints/default/best.pt"
+  model_path: "yolov8s-seg.pt"
   yolo_yaml: "data/processed/active_recipe.yaml"
   conf: 0.35
   iou: 0.5

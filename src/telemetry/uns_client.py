@@ -79,6 +79,17 @@ class UNSClient:
                 client.disconnect()
             except Exception as exc:
                 LOGGER.warning("UNS disconnect warning: %s", exc)
+            try:
+                sock = client.socket()
+                if sock is not None:
+                    try:
+                        import socket
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    sock.close()
+            except Exception as exc:
+                LOGGER.warning("UNS socket close warning: %s", exc)
 
         for thread in (self._publisher_thread, self._network_thread):
             if thread is not None and thread.is_alive():

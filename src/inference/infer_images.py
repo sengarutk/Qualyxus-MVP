@@ -47,16 +47,32 @@ def resolve_default_weights(cfg: Config) -> Path:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=None)
-    parser.add_argument("--input_dir", type=str, required=True)
-    parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--input_dir", type=str, default="data/live/raw")
+    parser.add_argument("--save_dir", type=str, default="data/live/defects")
     parser.add_argument("--source", type=str, default="demo_cam_1")
     args = parser.parse_args()
 
     cfg = Config.load()
     cfg.ensure_dirs()
 
-    save_dir = Path("data/live/defects") / args.source
+    base_save = args.save_dir if args.save_dir else "data/live/defects"
+    save_dir = Path(base_save) / args.source
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    input_dir = Path(args.input_dir)
+    if not input_dir.exists():
+        import logging
+        logging.warning(f"[infer_images] Input directory does not exist: {input_dir}. Exiting gracefully.")
+        return
+
+    images = []
+    for ext in ("*.jpg", "*.jpeg", "*.png"):
+        images.extend(input_dir.glob(ext))
+
+    if not images:
+        import logging
+        logging.warning(f"[infer_images] No images found in: {input_dir}. Exiting gracefully.")
+        return
 
     logger = EventLogger(
         sqlite_path=cfg.get("logging", "sqlite_path"),
@@ -74,14 +90,6 @@ def main():
         raise FileNotFoundError(f"Missing weights: {weights_path}")
 
     model = YOLO(str(weights_path))
-
-    input_dir = Path(args.input_dir)
-    images = []
-    for ext in ("*.jpg", "*.jpeg", "*.png"):
-        images.extend(input_dir.glob(ext))
-
-    if not images:
-        raise RuntimeError(f"No images found in: {input_dir}")
 
     for img_path in images:
         img = cv2.imread(str(img_path))

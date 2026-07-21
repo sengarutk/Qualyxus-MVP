@@ -27,7 +27,7 @@ class GeometryEngine:
         self.pixel_to_mm_scale = 0.1
         
         # Setup feature extraction components (optimized parameters for low latency)
-        self.orb = cv2.ORB_create(nfeatures=85, scaleFactor=1.2, nlevels=3, edgeThreshold=15, patchSize=15)
+        self.orb = cv2.ORB_create(nfeatures=65, scaleFactor=1.2, nlevels=3, edgeThreshold=15, patchSize=15)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         
         self.template: np.ndarray | None = None
@@ -37,6 +37,11 @@ class GeometryEngine:
         self.template_centroid: tuple[float, float] | None = None
         self.template_w: int | None = None
         self.template_h: int | None = None
+        self.roi_bbox: tuple[int, int, int, int] | None = None
+
+        # Pre-allocate static scratchpad memory buffers
+        self._scratch_small: np.ndarray | None = None
+        self._scratch_aligned: np.ndarray | None = None
         
         self._load_template(template_path)
 
@@ -49,6 +54,7 @@ class GeometryEngine:
             self.template_centroid = None
             self.template_w = None
             self.template_h = None
+            self.roi_bbox = None
             return
             
         try:
@@ -68,6 +74,23 @@ class GeometryEngine:
                     self.template_w = w
                     self.template_h = h
                     
+                    # Pre-calculate 5% safety margin ROI bounding box of target part
+                    mask_temp = (img > 60).astype(np.uint8)
+                    ys, xs = np.where(mask_temp > 0)
+                    if len(xs) > 0 and len(ys) > 0:
+                        min_x, max_x = int(xs.min()), int(xs.max())
+                        min_y, max_y = int(ys.min()), int(ys.max())
+                        margin_x = max(1, int((max_x - min_x) * 0.05))
+                        margin_y = max(1, int((max_y - min_y) * 0.05))
+                        self.roi_bbox = (
+                            max(0, min_x - margin_x),
+                            max(0, min_y - margin_y),
+                            min(w, max_x + margin_x + 1),
+                            min(h, max_y + margin_y + 1)
+                        )
+                    else:
+                        self.roi_bbox = (0, 0, w, h)
+                    
                     mu_temp = cv2.moments(thresh_temp)
                     if mu_temp['m00'] > 0:
                         self.template_centroid = (mu_temp['m10'] / mu_temp['m00'], mu_temp['m01'] / mu_temp['m00'])
@@ -86,6 +109,7 @@ class GeometryEngine:
                     self.template_centroid = None
                     self.template_w = None
                     self.template_h = None
+                    self.roi_bbox = None
                     logger.error("[GeometryEngine] Failed to decode template image: %s", path_str)
             else:
                 self.template = None
@@ -95,6 +119,7 @@ class GeometryEngine:
                 self.template_centroid = None
                 self.template_w = None
                 self.template_h = None
+                self.roi_bbox = None
                 logger.warning("[GeometryEngine] Reference template path does not exist: %s", path_str)
         except Exception as e:
             self.template = None
@@ -104,6 +129,7 @@ class GeometryEngine:
             self.template_centroid = None
             self.template_w = None
             self.template_h = None
+            self.roi_bbox = None
             logger.error("[GeometryEngine] Exception loading reference template: %s", e)
 
     def update_template_specifications(self, config: dict):
@@ -157,6 +183,7 @@ class GeometryEngine:
             max_drift = self.max_spatial_drift_mm
             max_angle = self.max_orientation_drift_degrees
             scale = self.pixel_to_mm_scale
+            roi_bbox = self.roi_bbox
 
         if template is None or template_des is None or template_centroid is None or template_w is None or template_h is None:
             return {
@@ -182,7 +209,6 @@ class GeometryEngine:
                 live_frame_gray = live_frame
 
             # B. Spatial Registration & Affine Alignment Plane
-            # Optimize: Detect and compute only on the live frame
             kp2, des2 = self.orb.detectAndCompute(live_frame_gray, None)
 
             if des2 is None or len(kp2) < 4:
@@ -212,7 +238,6 @@ class GeometryEngine:
             dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
 
             # Estimate partial 2D transformation (dst_pts maps to src_pts)
-            # Capping maxIters to 150 prevents CPU cycles from being wasted on high iteration RANSAC runs
             M, inliers = cv2.estimateAffinePartial2D(dst_pts, src_pts, method=cv2.RANSAC, maxIters=150)
             if M is None or inliers is None or np.sum(inliers) < 4:
                 return {
@@ -247,15 +272,15 @@ class GeometryEngine:
             spatial_drift_x_mm = float(c_live_x - tc_x) * scale
             spatial_drift_y_mm = float(c_live_y - tc_y) * scale
 
-            # C. High-Velocity Structural Similarity Alternative
-            # Crop a 5% margin to prevent artificial boundary warping artifacts
-            dy, dx = int(template_h * 0.05), int(template_w * 0.05)
-            if dy > 0 and dx > 0 and template_h - 2*dy > 0 and template_w - 2*dx > 0:
+            # C. High-Velocity Structural Similarity (Strictly on Cropped ROI Canvas)
+            if roi_bbox is not None:
+                rx1, ry1, rx2, ry2 = roi_bbox
+                cropped_temp = template[ry1:ry2, rx1:rx2]
+                cropped_aligned = aligned_frame[ry1:ry2, rx1:rx2]
+            else:
+                dy, dx = int(template_h * 0.05), int(template_w * 0.05)
                 cropped_temp = template[dy:template_h-dy, dx:template_w-dx]
                 cropped_aligned = aligned_frame[dy:template_h-dy, dx:template_w-dx]
-            else:
-                cropped_temp = template
-                cropped_aligned = aligned_frame
 
             # Guard against zero variance in structural score
             std_temp = np.std(cropped_temp)

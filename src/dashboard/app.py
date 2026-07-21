@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import json
 import logging
@@ -545,18 +546,26 @@ def main():
         with p1:
             st.write("**Overlay**")
             overlay_path = str(row.get("overlay_path", "") or "")
-            if overlay_path and Path(overlay_path).exists():
-                st.image(overlay_path, width="stretch")
+            if overlay_path and os.path.exists(overlay_path):
+                try:
+                    st.image(overlay_path, use_container_width=True)
+                except Exception:
+                    st.warning("🏷️ Overlay image pruned by retention policy")
             else:
-                st.info("Overlay image not available")
+                st.warning("🏷️ Overlay image pruned or unavailable")
 
         with p2:
-            st.write("**Crop**")
+            st.write("**Crop / Full Image**")
             crop_path = str(row.get("crop_path", "") or "")
-            if crop_path and Path(crop_path).exists():
-                st.image(crop_path, width="stretch")
+            full_path = str(row.get("full_image_path", "") or "")
+            display_img = crop_path if (crop_path and os.path.exists(crop_path)) else (full_path if (full_path and os.path.exists(full_path)) else None)
+            if display_img:
+                try:
+                    st.image(display_img, use_container_width=True)
+                except Exception:
+                    st.warning("🏷️ Image pruned by retention policy")
             else:
-                st.info("Crop image not available")
+                st.warning("🏷️ Image pruned or unavailable")
 
         narrative = str(row.get("vlm_narrative", "") or "").strip()
         st.markdown("**🏷️ Reasoning AI**")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,7 @@ from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, 
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+logger = logging.getLogger("QualyxusDatabase")
 Base = declarative_base()
 
 
@@ -142,3 +144,63 @@ def dispose_db(sqlite_path: str) -> None:
             eng.dispose()
     except Exception:
         pass
+
+
+def purge_orphaned_actions(conn) -> None:
+    """Purge actions that were originally tied to an anomaly event but whose
+    corresponding events have been purged from defect_events, while leaving
+    independent administrative actions untouched.
+    """
+    import sqlite3
+
+    db_path = None
+    try:
+        res = conn.execute(text("PRAGMA database_list;")).fetchall()
+        for row in res:
+            if row[1] == 'main' and row[2]:
+                db_path = row[2]
+                break
+    except Exception:
+        pass
+
+    if not db_path:
+        db_path = "data/events/events.db"
+
+    independent_conn = None
+    try:
+        independent_conn = sqlite3.connect(db_path)
+        independent_conn.execute("ATTACH DATABASE 'data/events/actions.db' AS actions_db;")
+        
+        # Multi-Event Aware Action Purge
+        independent_conn.execute(
+            """
+            DELETE FROM actions_db.tracked_actions
+            WHERE action_id IN (
+                SELECT r.action_id
+                FROM actions_db.action_event_relations r
+                GROUP BY r.action_id
+                HAVING COUNT(CASE WHEN r.event_id IN (SELECT event_id FROM main.defect_events) THEN 1 END) = 0
+            );
+            """
+        )
+        # Cascading Junction Table Residual Purge
+        independent_conn.execute(
+            """
+            DELETE FROM actions_db.action_event_relations
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM actions_db.tracked_actions a
+                WHERE a.action_id = actions_db.action_event_relations.action_id
+            );
+            """
+        )
+        independent_conn.commit()
+    except Exception as exc:
+        logger.error("Independent purging of orphaned actions and relations failed: %s", exc)
+    finally:
+        if independent_conn is not None:
+            try:
+                independent_conn.close()
+            except Exception:
+                pass
+

@@ -55,7 +55,7 @@ class InferenceMultiplexer:
         self.worker_thread = threading.Thread(target=self._batch_processing_loop, name="InferenceMultiplexerDaemon", daemon=True)
         self.worker_thread.start()
         
-    def submit_frame(self, camera_id: str, frame: np.ndarray) -> str:
+    def submit_frame(self, camera_id: str, frame: np.ndarray, block: bool = True, timeout: float | None = 0.033) -> str:
         """Registers a frame for batch inference and returns a unique request ID."""
         request_id = str(uuid.uuid4())
         event = threading.Event()
@@ -64,7 +64,7 @@ class InferenceMultiplexer:
             self.results[request_id] = (event, None)
             
         try:
-            self.queue.put((request_id, camera_id, frame), timeout=0.033)
+            self.queue.put((request_id, camera_id, frame), block=block, timeout=timeout)
         except queue.Full:
             # Handle queue overflow gracefully
             with self.lock:
