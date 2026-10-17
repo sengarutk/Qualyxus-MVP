@@ -165,23 +165,19 @@ class TritonPreprocessor:
         if not self.is_available:
             raise RuntimeError("Triton preprocessing unavailable")
 
-        # Fast path: caller already provided a GPU tensor.
-        if isinstance(frame, torch.Tensor) and frame.is_cuda:
-            tensor = frame
-            # Accept either (1,3,H,W) or HWC.
-            if tensor.ndim == 4 and int(tensor.shape[0]) == 1 and int(tensor.shape[1]) == 3:
-                return tensor.half().contiguous(memory_format=torch.contiguous_format) if self.cfg.precision == "fp16" else tensor.float().contiguous(memory_format=torch.contiguous_format)
-            if tensor.ndim == 3 and int(tensor.shape[-1]) == 3:
+        # Fast path: caller already provided a normalized (1,3,H,W) GPU tensor.
+        if isinstance(frame, torch.Tensor) and frame.is_cuda and frame.ndim == 4:
+            if int(frame.shape[0]) == 1 and int(frame.shape[1]) == 3:
                 dtype = torch.float16 if self.cfg.precision == "fp16" else torch.float32
-                if tensor.dtype != dtype:
-                    tensor = tensor.to(dtype=dtype)
-                tensor = tensor.permute(2, 0, 1).contiguous(memory_format=torch.contiguous_format)
-                return tensor.unsqueeze(0)
+                return frame.to(dtype=dtype).contiguous(memory_format=torch.contiguous_format)
+            raise ValueError("Expected a (1,3,H,W) tensor for pre-normalized GPU input")
 
+        # Raw HWC BGR uint8 input (host or device) always goes through the kernel so the
+        # output is RGB, CHW and scaled to 0..1 regardless of where the frame lives.
         if isinstance(frame, np.ndarray):
             src = torch.from_numpy(frame).contiguous()
         else:
-            src = frame.contiguous().detach().cpu() if frame.is_cuda else frame.contiguous()
+            src = frame.detach().contiguous()
 
         if src.ndim != 3 or int(src.shape[2]) != 3:
             raise ValueError("Expected HWC image with 3 channels")

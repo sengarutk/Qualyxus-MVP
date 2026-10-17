@@ -72,8 +72,8 @@ class ShiftHandoverGenerator:
             SELECT event_id, timestamp, source, defect_type, confidence, severity,
                    operator_id, machine_id, shift_id
             FROM defect_events
-            WHERE timestamp >= ? AND timestamp < ?
-            ORDER BY timestamp ASC
+            WHERE julianday(timestamp) >= julianday(?) AND julianday(timestamp) < julianday(?)
+            ORDER BY julianday(timestamp) ASC
         """
         with sqlite3.connect(str(db_path)) as conn:
             df = pd.read_sql_query(query, conn, params=(_iso(start), _iso(end)))

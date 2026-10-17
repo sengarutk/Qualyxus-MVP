@@ -304,7 +304,10 @@ class ProductionEnduranceTester:
         monitor_task.cancel()
         db_hammer_task.cancel()
         multi_task.cancel()
-        server_task.cancel()
+        # Graceful API teardown (a raw task cancel makes uvicorn's lifespan log a traceback).
+        await pulse_server.stop()
+        if not server_task.done():
+            server_task.cancel()
         
         await asyncio.gather(*(cam_tasks + client_tasks + [sensor_task]), return_exceptions=True)
         await asyncio.gather(monitor_task, db_hammer_task, multi_task, server_task, return_exceptions=True)

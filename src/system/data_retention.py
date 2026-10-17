@@ -13,6 +13,7 @@ LOGGER = logging.getLogger(__name__)
 
 IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.webp")
 EVENT_LOG_GLOBS = ("*.csv", "*.db", "*.sqlite", "*.sqlite3", "*.json", "*.log", "*.txt")
+FLAT_EVENT_LOG_GLOBS = ("*.csv", "*.json", "*.log", "*.txt")
 
 
 @dataclass(frozen=True)
@@ -102,7 +103,10 @@ class DataRetentionManager:
                 retention_days=180,
                 archive_enabled=True,
                 archive_dir="data/archive/events",
-                include_globs=EVENT_LOG_GLOBS,
+                # Live SQLite databases (events.db / actions.db) are never expired as whole
+                # files: their mtime only reflects the last write and deleting them would
+                # wipe the entire audit history. Row-level retention belongs to the DB layer.
+                include_globs=FLAT_EVENT_LOG_GLOBS,
             ),
         )
         return cls(cfg)
@@ -293,4 +297,5 @@ __all__ = [
     "PolicyCleanupResult",
     "IMAGE_GLOBS",
     "EVENT_LOG_GLOBS",
+    "FLAT_EVENT_LOG_GLOBS",
 ]

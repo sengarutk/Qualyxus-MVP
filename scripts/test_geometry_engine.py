@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import os
 import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+import os
 import time
 import shutil
-from pathlib import Path
 import numpy as np
 import cv2
-
-# Set path routing
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.inference.analysis.geometry_engine import GeometryEngine
 

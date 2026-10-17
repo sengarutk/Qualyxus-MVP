@@ -141,7 +141,7 @@ def _load_runtime_events(db_path: str, start_time: str, end_time: str) -> tuple[
     """Load events from SQLite with strict runtime filtering and data validation."""
     query = """
         SELECT * FROM defect_events
-        WHERE timestamp BETWEEN ? AND ?
+        WHERE julianday(timestamp) BETWEEN julianday(?) AND julianday(?)
         AND source NOT LIKE 'synthetic%'
         AND source NOT LIKE 'demo%'
         AND source NOT LIKE 'train%'
@@ -278,25 +278,25 @@ def _pull_top_defect_images(defects_dir: Path, events_df: pd.DataFrame) -> list[
     top_events = events_df.nlargest(5, 'severity')  # Top 5 by severity
 
     for _, event in top_events.iterrows():
-        event_id = event['event_id']
-        
-        # Try to find the image in any camera subdirectory
+        event_id = str(event['event_id'])
+
+        # Prefer the evidence paths recorded on the event itself (crop > overlay > snapshot).
         image_path = None
-        if defects_dir.exists():
-            # Check all camera subdirectories
-            for camera_dir in defects_dir.iterdir():
-                if camera_dir.is_dir():
-                    candidate_path = camera_dir / f"{event_id}.jpg"
-                    if candidate_path.exists():
-                        image_path = candidate_path
-                        break
-            
-            # Also check the base directory for backward compatibility
-            if image_path is None:
-                base_path = defects_dir / f"{event_id}.jpg"
-                if base_path.exists():
-                    image_path = base_path
-        
+        for col in ("crop_path", "overlay_path", "full_image_path"):
+            candidate = event.get(col) if hasattr(event, "get") else None
+            if isinstance(candidate, str) and candidate and Path(candidate).is_file():
+                image_path = Path(candidate)
+                break
+
+        # Fall back to searching the defect directory (camera sub-folders included) for any
+        # snapshot whose file name carries the event id, e.g. cam_0_defect_<event_id>_frame_0001.png
+        if image_path is None and defects_dir.exists():
+            for pattern in (f"{event_id}.*", f"*{event_id}*"):
+                match = next((p for p in defects_dir.rglob(pattern) if p.is_file()), None)
+                if match is not None:
+                    image_path = match
+                    break
+
         if image_path:
             images.append({
                 'path': str(image_path.resolve()),

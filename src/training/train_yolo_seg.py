@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import logging
 from pathlib import Path
@@ -8,12 +9,27 @@ from src.config.config import Config, env_override_config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("TrainingOrchestrator")
 
-def main(cfg: Config = None):
+def _parse_cli_overrides(argv=None) -> dict:
+    parser = argparse.ArgumentParser(description="Train the YOLO segmentation model for the active recipe.")
+    parser.add_argument("--model", type=str, default=None, help="Base weights, e.g. yolov8s-seg.pt")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--imgsz", type=int, default=None)
+    parser.add_argument("--batch", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None, help="CUDA index (e.g. 0) or 'cpu'")
+    args = parser.parse_args(argv)
+    return {k: v for k, v in vars(args).items() if v is not None}
+
+
+def main(cfg: Config = None, cli_overrides: dict | None = None):
     logger.info("Initializing Decoupled YOLO Segmentation Training Pipeline...")
     if cfg is None:
         cfg = Config.load()
     # CRITICAL: Apply environment variable overrides universally
     cfg = env_override_config(cfg)
+    if cli_overrides:
+        training = dict(cfg.raw.get("training", {}) or {})
+        training.update(cli_overrides)
+        cfg = Config(raw={**cfg.raw, "training": training})
     
     dataset_name = cfg.get("dataset", "name") or "active_product_recipe"
     yolo_yaml_path = cfg.get("inference", "yolo_yaml")
@@ -52,4 +68,4 @@ def main(cfg: Config = None):
     logger.info(f"✅ Training optimized successfully. Assets saved to: {project_save_dir}")
 
 if __name__ == "__main__":
-    main()
+    main(cli_overrides=_parse_cli_overrides())

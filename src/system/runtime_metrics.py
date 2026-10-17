@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
 from pathlib import Path
 
-from src.system.disk_monitor import DiskMonitor
+logger = logging.getLogger("QualyxusRuntimeMetrics")
 
 
 class RuntimeMetricsLogger:
@@ -21,6 +22,7 @@ class RuntimeMetricsLogger:
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        self._stop_event.clear()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._loop, name="runtime-metrics", daemon=True)
         self._thread.start()
@@ -37,22 +39,14 @@ class RuntimeMetricsLogger:
         from src.system.disk_monitor import DiskPolicy
         return DiskPolicy()
 
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._thread = threading.Thread(target=self._loop, name="runtime-metrics", daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3.0)
-
     def _loop(self):
         while not self._stop_event.is_set():
-            self._write_once()
-            time.sleep(self.interval_seconds)
+            try:
+                self._write_once()
+            except Exception as exc:  # never let a transient I/O error kill the metrics thread
+                logger.warning("[RuntimeMetrics] Snapshot export failed: %s", exc)
+            # Interruptible wait so stop() returns promptly.
+            self._stop_event.wait(self.interval_seconds)
 
     def _memory_mb(self) -> float:
         try:
@@ -99,4 +93,7 @@ class RuntimeMetricsLogger:
                 "restarts": info.get("restarts", 0),
             }
 
-        self.output_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        # Atomic replace so the dashboard never reads a half-written file.
+        tmp_path = self.output_path.with_name(self.output_path.name + ".tmp")
+        tmp_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        os.replace(tmp_path, self.output_path)

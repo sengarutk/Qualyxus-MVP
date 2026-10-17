@@ -27,15 +27,27 @@ class InferenceMultiplexer:
         self.lock = threading.Lock()
         self.results = {}  # request_id -> (Event, result)
         
-        # Load YOLO model
+        # Load YOLO model: inference.model_path, falling back to the MODEL_ASSET_PATH
+        # deployment variable (set by the Docker image / compose file) when that file is absent.
         model_path = self.config.get("inference", "model_path") or "models/checkpoints/default/best.pt"
+        asset_path = os.environ.get("MODEL_ASSET_PATH")
+        if not os.path.exists(model_path) and asset_path and os.path.exists(asset_path):
+            model_path = asset_path
         logger.info(f"[InferenceMultiplexer] Loading model from: {model_path}")
+
+        # Prediction thresholds come from the same config the offline tools use.
+        self.conf = float(self.config.get("inference", "conf", default=0.35) or 0.35)
+        self.iou = float(self.config.get("inference", "iou", default=0.5) or 0.5)
         
-        # Hardware acceleration check
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Hardware acceleration check (an explicit inference.device of "cpu" forces CPU)
+        requested_device = str(self.config.get("inference", "device", default="") or "").lower()
+        if requested_device == "cpu" or not torch.cuda.is_available():
+            self.device = "cpu"
+        else:
+            self.device = "cuda"
         
         # Check if we should run in mock/simulation mode
-        test_cfg = self.config.raw.get("test_flags", {}) if self.config.raw else {}
+        test_cfg = (self.config.raw.get("test_flags", {}) or {}) if self.config.raw else {}
         self.mock_mode = bool(test_cfg.get("mock_inference", False)) or not os.path.exists(model_path)
         
         if self.mock_mode:
@@ -90,10 +102,14 @@ class InferenceMultiplexer:
         return result
         
     def stop(self):
-        """Stops the background daemon thread."""
+        """Stops the background daemon thread and releases any request still waiting on it."""
         self.stop_event.set()
         if self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=1.0)
+            self.worker_thread.join(timeout=2.0)
+        with self.lock:
+            pending = list(self.results.values())
+        for event, _ in pending:
+            event.set()
             
     def _batch_processing_loop(self):
         """Aggregates frames, performs batch inference, and fans out the results."""
@@ -153,8 +169,8 @@ class InferenceMultiplexer:
                         event.set()
             return
             
-        # Standardize color layout and stack inputs natively
-        h, w = frames[0].shape[:2]
+        # Standardize color layout. Frames are handed to Ultralytics as a list so that
+        # cameras with different resolutions are each letterboxed correctly.
         processed_frames = []
         for f in frames:
             # CRITICAL HARDENING: Normalize grayscale and single-channel layouts to BGR
@@ -168,15 +184,16 @@ class InferenceMultiplexer:
             # Direct dimension layout verification to handle multi-camera anomalies safely
             if len(f.shape) != 3 or f.shape[2] != 3:
                 f = cv2.cvtColor(f[:, :, 0] if len(f.shape) == 3 else f, cv2.COLOR_GRAY2BGR)
-                
-            if f.shape[:2] != (h, w):
-                f = cv2.resize(f, (w, h))
             processed_frames.append(f)
-            
-        stacked = np.stack(processed_frames, axis=0)
         
         # Execute YOLO batch inference
-        results = self.model.predict(stacked, device=self.device, verbose=False)
+        results = self.model.predict(
+            processed_frames,
+            device=self.device,
+            conf=self.conf,
+            iou=self.iou,
+            verbose=False,
+        )
         
         # Fan out predictions to the waiting threads via results lookup map
         for idx, res in enumerate(results):

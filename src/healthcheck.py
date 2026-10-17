@@ -17,7 +17,9 @@ def _check_db_writable(cfg: Config) -> bool:
         conn = sqlite3.connect(str(sqlite_path))
         cur = conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS __healthcheck (id INTEGER PRIMARY KEY, ts REAL)")
-        cur.execute("INSERT INTO __healthcheck (ts) VALUES (?)", (time.time(),))
+        # Single-row upsert: probes run every 30s forever, so the table must not grow.
+        cur.execute("INSERT OR REPLACE INTO __healthcheck (id, ts) VALUES (1, ?)", (time.time(),))
+        cur.execute("DELETE FROM __healthcheck WHERE id != 1")
         conn.commit()
         conn.close()
         return True

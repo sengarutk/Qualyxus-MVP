@@ -217,7 +217,12 @@ class UNSClient:
 
     def _build_client(self):
         assert mqtt is not None
-        client = mqtt.Client(client_id=self.client_id, transport=self.transport)
+        callback_api = getattr(mqtt, "CallbackAPIVersion", None)
+        if callback_api is not None:
+            # paho-mqtt >= 2.0: opt into the current callback signatures explicitly.
+            client = mqtt.Client(callback_api.VERSION2, client_id=self.client_id, transport=self.transport)
+        else:  # pragma: no cover - paho-mqtt 1.x
+            client = mqtt.Client(client_id=self.client_id, transport=self.transport)
         if self.username:
             client.username_pw_set(self.username, self.password)
         client.on_connect = self._on_connect
@@ -349,17 +354,30 @@ class UNSClient:
         except Exception as exc:
             LOGGER.warning("UNS replay buffer ack prune failed: %s", exc)
 
+    @staticmethod
+    def _reason_failed(reason_code) -> bool:
+        is_failure = getattr(reason_code, "is_failure", None)
+        if is_failure is not None:
+            return bool(is_failure)
+        try:
+            return int(reason_code) != 0
+        except (TypeError, ValueError):
+            return True
+
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):  # pragma: no cover - callback
         _ = (client, userdata, flags, properties)
-        if int(reason_code) == 0:
+        if not self._reason_failed(reason_code):
             self._connected_event.set()
             LOGGER.info("UNS connected to MQTT broker %s:%s", self.host, self.port)
         else:
             self._connected_event.clear()
             LOGGER.warning("UNS connection rejected with reason code %s", reason_code)
 
-    def _on_disconnect(self, client, userdata, reason_code, properties=None):  # pragma: no cover - callback
-        _ = (client, userdata, properties)
+    def _on_disconnect(self, client, userdata, *args):  # pragma: no cover - callback
+        # paho 2.x (VERSION2): (client, userdata, disconnect_flags, reason_code, properties)
+        # paho 1.x:            (client, userdata, rc)
+        reason_code = args[1] if len(args) >= 2 else (args[0] if args else None)
+        _ = (client, userdata)
         self._connected_event.clear()
         if not self._stop_event.is_set():
             LOGGER.warning("UNS disconnected from MQTT broker with reason code %s", reason_code)

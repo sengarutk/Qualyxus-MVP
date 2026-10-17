@@ -12,17 +12,25 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+*.egg-info/
 
 # Core Machine Learning Binary Weights (Dynamic)
-models/checkpoints/
-runs/
+# Patterns are anchored to the repository root so that source packages such as
+# src/data/ are never swallowed by the runtime data directory rules.
+/models/
+/runs/
 *.pt
 *.onnx
+*.engine
 
 # Metrology Storage, Simulation Artifacts, & CSV Telemetry Databases
-data/
-reports/
+/data/
+/reports/
 *.db
-*.csvqualyxus.db
-*.pt
-Qualyxus.egg-info/
+*.db-wal
+*.db-shm
+*.csv
+
+# Local environment secrets
+.env

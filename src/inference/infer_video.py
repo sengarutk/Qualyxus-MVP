@@ -8,40 +8,11 @@ import numpy as np
 from ultralytics import YOLO
 
 from src.config.config import Config
+from src.inference.infer_images import resolve_default_weights
 from src.inference.postprocess import overlay_mask, bbox_from_mask, severity_from_conf
 from src.logging.event_logger import EventLogger
 from src.logging.schema import DefectEvent
 from src.telemetry.telemetry_provider import TelemetryProvider
-
-
-def resolve_default_weights(cfg: Config) -> Path:
-    """
-    Resolve trained model weights.
-    Priority:
-    1) runs/ (Ultralytics default)
-    2) models/checkpoints (manual export)
-    """
-
-    # 1. Check Ultralytics runs directory
-    runs_path = Path("runs/segment/models/checkpoints/severstal_yolov8_seg/weights/best.pt")
-    if runs_path.exists():
-        return runs_path.resolve()
-
-    # 2. Fallback to models directory
-    models_path = (
-        Path(cfg.get("paths", "models_dir"))
-        / "severstal_yolov8_seg"
-        / "weights"
-        / "best.pt"
-    )
-
-    if models_path.exists():
-        return models_path.resolve()
-
-    raise FileNotFoundError(
-        "Could not find trained model weights in runs/ or models/. "
-        "Train the model first."
-    )
 
 
 def main():
@@ -52,16 +23,18 @@ def main():
     parser.add_argument("--source", type=str, default="line_1_cam_1")
     parser.add_argument("--every_n", type=int, default=10)
     args = parser.parse_args()
+    if args.every_n < 1:
+        parser.error("--every_n must be >= 1")
 
     cfg = Config.load()
     cfg.ensure_dirs()
 
-    save_dir = Path("data/live/defects") / args.source
+    save_dir = Path(args.save_dir or "data/live/defects") / args.source
     save_dir.mkdir(parents=True, exist_ok=True)
 
     logger = EventLogger(
-        sqlite_path=cfg.get("logging", "sqlite_path"),
-        csv_path=cfg.get("logging", "csv_path"),
+        sqlite_path=cfg.get("logging", "sqlite_path", default="data/events/events.db"),
+        csv_path=cfg.get("logging", "csv_path", default="data/events/events.csv"),
     )
 
     # Telemetry

@@ -19,6 +19,8 @@ def analyze_defect_crop_sync(crop_matrix: np.ndarray, expert_context: str, confi
 
     try:
         vlm_cfg = config.raw.get("vlm_reasoning", {}) or {}
+        if not bool(vlm_cfg.get("enabled", True)):
+            return ""
         local_api = vlm_cfg.get("local_api", "http://localhost:11434")
         backend = str(vlm_cfg.get("backend", "ollama")).lower()
         model = vlm_cfg.get("model", "moondream2")

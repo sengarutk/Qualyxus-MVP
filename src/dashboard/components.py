@@ -19,4 +19,4 @@ def kpi_row(
 
 
 def show_events_table(df: pd.DataFrame):
-    st.dataframe(df, use_container_width=True, height=420)
+    st.dataframe(df, width="stretch", height=420)

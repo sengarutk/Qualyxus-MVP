@@ -18,6 +18,24 @@ from src.analytics.temporal_rca import analyze_temporal_rca
 
 DEFAULT_DB_PATH = "data/events/events.db"
 
+# Every dimension analysed for lift-based correlation. Baselines must exist for each of
+# them, otherwise lift = rate / ~0 explodes and fabricates "high-confidence" root causes.
+CORRELATION_DIMENSIONS = (
+    "machine_id",
+    "shift_id",
+    "operator_id",
+    "defect_type",
+    "temperature",
+    "vibration",
+    "speed",
+    "lot_id",
+)
+
+
+def _dimension_key(series: pd.Series) -> pd.Series:
+    """Canonical string key used for both baselines and window grouping."""
+    return series.astype(object).where(series.notna(), "unknown").astype(str)
+
 
 @dataclass
 class RootCauseConfig:
@@ -145,7 +163,8 @@ class RootCauseIntelligence:
                     },
                     "events": window[[
                         "event_id", "timestamp", "source", "defect_type", "severity", "confidence", "line_id", "station_id"
-                    ]].to_dict(orient="records"),
+                    ]].assign(timestamp=window["timestamp"].map(lambda ts: ts.isoformat()))
+                    .to_dict(orient="records"),
                 }
             )
             break
@@ -155,12 +174,15 @@ class RootCauseIntelligence:
     def _build_baseline_rates(events: pd.DataFrame) -> dict[str, dict[str, float]]:
         """Baseline frequencies by dimension for lift-based correlation ranking."""
         if events.empty:
-            return {"machine_id": {}, "shift_id": {}, "operator_id": {}, "defect_type": {}}
+            return {col: {} for col in CORRELATION_DIMENSIONS}
 
         total = float(len(events))
         out: dict[str, dict[str, float]] = {}
-        for col in ["machine_id", "shift_id", "operator_id", "defect_type"]:
-            series = events[col].fillna("unknown").astype(str)
+        for col in CORRELATION_DIMENSIONS:
+            if col not in events.columns:
+                out[col] = {}
+                continue
+            series = _dimension_key(events[col])
             rates = (series.value_counts(dropna=False) / total).to_dict()
             out[col] = {str(k): float(v) for k, v in rates.items()}
         return out
@@ -171,12 +193,7 @@ class RootCauseIntelligence:
         baseline_rates: dict[str, dict[str, float]] | None = None,
     ) -> dict[str, Any]:
         if events.empty:
-            return {
-                "machine_id": [],
-                "shift_id": [],
-                "operator_id": [],
-                "defect_type": [],
-            }
+            return {col: [] for col in CORRELATION_DIMENSIONS}
 
         total_events = float(len(events))
         baseline_rates = baseline_rates or {}
@@ -195,7 +212,9 @@ class RootCauseIntelligence:
             grouped["defect_rate"] = grouped["defect_count"] / total_events
 
             baseline_map = baseline_rates.get(column, {})
-            grouped["baseline_rate"] = grouped[column].astype(str).map(baseline_map).fillna(0.0)
+            keys = _dimension_key(grouped[column])
+            # A value absent from the baseline population carries no lift evidence (neutral).
+            grouped["baseline_rate"] = keys.map(baseline_map).fillna(grouped["defect_rate"])
             grouped["lift_ratio"] = grouped["defect_rate"] / (grouped["baseline_rate"] + eps)
 
             # Rank by normalized impact (lift), then support (count).
@@ -203,16 +222,7 @@ class RootCauseIntelligence:
             top = grouped.head(self.config.max_contributors_per_group)
             return top.to_dict(orient="records")
 
-        return {
-            "machine_id": grouped_top("machine_id"),
-            "shift_id": grouped_top("shift_id"),
-            "operator_id": grouped_top("operator_id"),
-            "defect_type": grouped_top("defect_type"),
-            "temperature": grouped_top("temperature"),
-            "vibration": grouped_top("vibration"),
-            "speed": grouped_top("speed"),
-            "lot_id": grouped_top("lot_id"),
-        }
+        return {col: grouped_top(col) for col in CORRELATION_DIMENSIONS}
 
     def detect_time_anomalies(self, events: pd.DataFrame) -> dict[str, Any]:
         if events.empty:
@@ -274,7 +284,16 @@ class RootCauseIntelligence:
         scaler = StandardScaler()
         scaled = scaler.fit_transform(features)
 
-        k = max(2, min(self.config.kmeans_clusters, len(features)))
+        distinct_points = len(np.unique(features, axis=0))
+        if distinct_points < 2:
+            return {
+                "k": 1,
+                "counts": [{"cluster": 0, "count": int(len(features))}],
+                "centroids": [],
+                "note": "All events share an identical feature profile; clustering skipped",
+            }
+        # KMeans cannot form more clusters than there are distinct feature vectors.
+        k = max(2, min(self.config.kmeans_clusters, distinct_points))
         model = KMeans(n_clusters=k, random_state=42, n_init=10)
         labels = model.fit_predict(scaled)
 
@@ -820,19 +839,19 @@ class RootCauseIntelligence:
                 window_start=(
                     events["timestamp"].min().isoformat()
                     if not events.empty
-                    else pd.Timestamp.utcnow().isoformat()
+                    else pd.Timestamp.now(tz="UTC").isoformat()
                 ),
                 window_end=(
                     events["timestamp"].max().isoformat()
                     if not events.empty
-                    else pd.Timestamp.utcnow().isoformat()
+                    else pd.Timestamp.now(tz="UTC").isoformat()
                 ),
             ),
             "systemic_clusters": self.detect_systemic_clusters(events),
         }
 
         if events.empty:
-            now = pd.Timestamp.utcnow().tz_localize("UTC") if pd.Timestamp.utcnow().tzinfo is None else pd.Timestamp.utcnow()
+            now = pd.Timestamp.now(tz="UTC")
             return {
                 "last_hour": self._analyze_window(
                     events,
@@ -864,6 +883,9 @@ class RootCauseIntelligence:
         reference_ts = events["timestamp"].max()
         if reference_ts.tzinfo is None:
             reference_ts = reference_ts.tz_localize("UTC")
+        # Windows are [start, end). Anchor the end just past the newest event (next whole
+        # second) so the most recent defect is part of the "last hour" / "last 24h" windows.
+        window_end = (reference_ts + pd.Timedelta(seconds=1)).floor("s")
 
         last_hour_start = reference_ts - timedelta(hours=1)
         last_24h_start = reference_ts - timedelta(hours=24)
@@ -876,7 +898,7 @@ class RootCauseIntelligence:
             "last_hour": self._analyze_window(
                 events,
                 last_hour_start,
-                reference_ts,
+                window_end,
                 baseline_rates,
                 window_name="last_hour",
                 kpi_inputs=kpi_inputs,
@@ -892,7 +914,7 @@ class RootCauseIntelligence:
             "last_24h": self._analyze_window(
                 events,
                 last_24h_start,
-                reference_ts,
+                window_end,
                 baseline_rates,
                 window_name="last_24h",
                 kpi_inputs=kpi_inputs,

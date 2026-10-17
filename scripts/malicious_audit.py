@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_ROOT_DIR = _Path(__file__).resolve().parents[1]
+if str(_ROOT_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT_DIR))
+
+
 """Malicious end-to-end MVP stress test & logic validation.
 
 Run:

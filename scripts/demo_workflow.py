@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_ROOT_DIR = _Path(__file__).resolve().parents[1]
+if str(_ROOT_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT_DIR))
+
+
 import json
 import socket
 import sqlite3
@@ -22,7 +30,7 @@ OUTPUT_JSON = DEMO_DIR / "demo_workflow_output.json"
 RCA_SNAPSHOT = DEMO_DIR / "rca_snapshot.json"
 ACTION_SNAPSHOT = DEMO_DIR / "action_snapshot.json"
 
-SEED_REFERENCE_TIME = datetime(2026, 3, 7, 8, 0, 0, tzinfo=timezone.utc).isoformat()
+SEED_REFERENCE_TIME = "run_time - 2h15m (fixed event spacing, anchored to the demo run)"
 
 
 def _iso(dt: datetime) -> str:
@@ -64,8 +72,14 @@ def _init_dbs() -> None:
 
 
 def inject_synthetic_events() -> int:
-    """Inject deterministic synthetic events."""
-    base_ts = datetime(2026, 3, 7, 8, 0, 0, tzinfo=timezone.utc)  # Fixed seed time
+    """Inject deterministic synthetic events.
+
+    The event pattern (spacing, values, ids) is fixed, but it is anchored to the current
+    time so the spike falls inside the outcome evaluator's "before action" window when the
+    demo action is acknowledged and closed moments later.
+    """
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    base_ts = now - timedelta(hours=2, minutes=15)
 
     events = []
 
@@ -212,7 +226,7 @@ def main() -> None:
     # Step 5: Outcome evaluation
     outcome_eval_start = time.time()
     evaluator = OutcomeEvaluator(events_db_path=str(EVENTS_DB), actions_db_path=str(ACTIONS_DB))
-    outcome = evaluator.evaluate_recent_closed_actions()
+    outcome = evaluator.evaluate_action_outcome(action_id)
     outcome_eval_sec = time.time() - outcome_eval_start
     outcome_effective = outcome.get("outcome_summary", {}).get("effective", False)
     improvement_percent = outcome.get("outcome_metrics", {}).get("improvement_percent", 0.0)

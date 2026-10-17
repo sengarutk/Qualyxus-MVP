@@ -98,14 +98,19 @@ class PLCAdapter:
         try:
             from pymodbus.client import ModbusTcpClient
             endpoint_ip = self.config.endpoint or "127.0.0.1"
-            client = ModbusTcpClient(endpoint_ip)
-            if client.connect():
-                client.write_register(register_address, severity, slave=self.config.unit_id)
-                client.close()
+            client = ModbusTcpClient(endpoint_ip, timeout=1.5, retries=0)
+            try:
+                if not client.connect():
+                    logger.error(f"[Modbus] Connection failed to physical industrial node at: {endpoint_ip}")
+                    return False
+                try:
+                    # pymodbus >= 3.10 renamed the unit selector from `slave` to `device_id`.
+                    client.write_register(register_address, severity, device_id=self.config.unit_id)
+                except TypeError:
+                    client.write_register(register_address, severity, slave=self.config.unit_id)
                 return True
-            else:
-                logger.error(f"[Modbus] Connection failed to physical industrial node at: {endpoint_ip}")
-                return False
+            finally:
+                client.close()
         except Exception as e:
             logger.error(f"[Modbus] Failed to write holding register 100 via pyModbus client: {e}")
             return False

@@ -124,7 +124,7 @@ class ProcessTimelineReconstructor:
                     "approval_required": bool(r["approval_required"]),
                     "approved_by": r["approved_by"],
                     "closure_notes": r["closure_notes"],
-                    "action_payload": json.loads(r["action_payload"]),
+                    "action_payload": json.loads(r["action_payload"] or "{}"),
                     "updated_at": r["updated_at"],
                 }
             )

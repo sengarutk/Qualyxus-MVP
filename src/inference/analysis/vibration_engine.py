@@ -62,11 +62,6 @@ except ImportError:
 
 from src.fleet.historian import PredictiveHistorian
 
-# Adjust path to find narrator module regardless of __main__ execution
-_root_dir = str(Path(__file__).resolve().parents[2])
-if _root_dir not in sys.path:
-    sys.path.insert(0, _root_dir)
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -139,37 +134,41 @@ def _iso_status(psd_peak: float) -> str:
     return "DANGER"
 
 
+_KAP_INIT_LOCK = threading.Lock()
+
+
 def _ensure_kap_db(db_path: Path) -> None:
     """
-    Create and seed knowledge_base.db with a guaranteed-clean state.
-    Uses DROP TABLE + CREATE to eliminate any stale data from previous runs.
+    Create knowledge_base.db and seed the reference tables when they are empty.
+
+    Seeding is idempotent: tables are created if missing and only populated when empty,
+    so concurrent analyzers (one per camera, re-created on worker restarts) never observe
+    a dropped table mid-query and operator-curated KAP rows are preserved.
     """
     os.makedirs(str(db_path.parent), exist_ok=True)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _KAP_INIT_LOCK, sqlite3.connect(str(db_path), timeout=5.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
-        
-        # Nuke any stale schema/data from prior versions
-        conn.execute("DROP TABLE IF EXISTS mechanical_nodes")
-        conn.execute("DROP TABLE IF EXISTS iso_10816_limits")
         conn.executescript(_KAP_SCHEMA)
-        
-        conn.executemany(
-            "INSERT INTO mechanical_nodes "
-            "(fault_label, freq_low, freq_high, causal_link) "
-            "VALUES (?, ?, ?, ?)",
-            _KAP_SEED_NODES,
-        )
-        conn.executemany(
-            "INSERT INTO iso_10816_limits "
-            "(machine_group, foundation_type, zone_c_threshold, zone_d_threshold) "
-            "VALUES (?, ?, ?, ?)",
-            _ISO_LIMITS_SEED,
-        )
+
+        if conn.execute("SELECT COUNT(*) FROM mechanical_nodes").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO mechanical_nodes "
+                "(fault_label, freq_low, freq_high, causal_link) "
+                "VALUES (?, ?, ?, ?)",
+                _KAP_SEED_NODES,
+            )
+        if conn.execute("SELECT COUNT(*) FROM iso_10816_limits").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO iso_10816_limits "
+                "(machine_group, foundation_type, zone_c_threshold, zone_d_threshold) "
+                "VALUES (?, ?, ?, ?)",
+                _ISO_LIMITS_SEED,
+            )
         conn.commit()  # atomic commit
         logger.info(
-            "[VibrationEngine] KAP DB initialised. WAL active. ISO seeds: %d",
+            "[VibrationEngine] KAP DB ready. WAL active. ISO seeds: %d",
             len(_ISO_LIMITS_SEED)
         )
 
@@ -212,10 +211,7 @@ class VibrationAnalyzer:
         _ensure_kap_db(self._kap_db_path)
         
         # Phase 5: Voice Singleton integration
-        if VLMNarrator is not None:
-            self.narrator = VLMNarrator()
-        else:
-            self.narrator = None
+        self.narrator = self._resolve_narrator()
 
         self.cache_lock = threading.Lock()
         self._forensic_cache = {}
@@ -251,6 +247,26 @@ class VibrationAnalyzer:
         self.ignore_vibration = False
         self.nominal_baseline = None
         
+    @staticmethod
+    def _resolve_narrator():
+        """Reuse the orchestrator's configured narrator; otherwise build one from config."""
+        from src.core.factory_manager import FactoryManager
+        narrator = FactoryManager().get_instance("narrator")
+        if narrator is not None:
+            return narrator
+        if VLMNarrator is None:
+            return None
+        try:
+            from src.config.config import Config
+            vlm_cfg = Config.load().get("vlm_reasoning", default={}) or {}
+        except Exception:
+            vlm_cfg = {}
+        try:
+            return VLMNarrator(config=vlm_cfg)
+        except Exception as exc:
+            logger.warning("[VibrationEngine] VLM narrator unavailable: %s", exc)
+            return None
+
     def load_profile(self, config: dict):
         self.ignore_vibration = config.get("ignore_vibration", False)
         if "nominal_baseline" in config:
@@ -262,8 +278,7 @@ class VibrationAnalyzer:
         self.reset()
         
         # Phase 5: Voice Singleton integration
-        if VLMNarrator is not None:
-            self.narrator = VLMNarrator()
+        self.narrator = self._resolve_narrator()
 
     # ------------------------------------------------------------------
     # Schema helper  —  the single source of truth for key layout

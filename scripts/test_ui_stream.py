@@ -5,10 +5,12 @@ import numpy as np
 import sys
 from pathlib import Path
 
-# Add src to path so we can import VibrationAnalyzer
-sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
+# Add the repository root so the `src` package resolves exactly as in production.
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-from inference.analysis.vibration_engine import VibrationAnalyzer
+from src.inference.analysis.vibration_engine import VibrationAnalyzer
 
 
 def make_signal(hz: float, duration_sec: float, fs: float = 120.0) -> np.ndarray:

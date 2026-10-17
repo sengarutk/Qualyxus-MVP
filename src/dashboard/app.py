@@ -130,10 +130,13 @@ def _verification_badge(action: dict) -> str:
 
 def main():
     cfg = Config.load()
-    sqlite_path = cfg.get("logging", "sqlite_path")
-    actions_db_path = "data/events/actions.db"
-    status_path = "data/live/camera_status.json"
-    runtime_metrics_path = "data/runtime/runtime_metrics.json"
+    sqlite_path = cfg.get("logging", "sqlite_path", default="data/events/events.db")
+    actions_db_path = str(Path(sqlite_path).parent / "actions.db")
+    status_path = os.getenv(
+        "CAMERA_STATUS_PATH",
+        str(cfg.get("camera_manager", "status_path", default="data/live/camera_status.json")),
+    )
+    runtime_metrics_path = str(cfg.get("runtime_metrics", "output_path", default="data/runtime/runtime_metrics.json"))
     systemic_insight_path = Path(cfg.get("paths", "data_dir", default="data")) / "runtime" / "systemic_insight.json"
 
     st.title("🏭 Qualyxus Operational KPI Dashboard")
@@ -152,7 +155,12 @@ def main():
 
     system_health = fetch_system_health()
     state = str(system_health.get("state", "SAFE") or "SAFE")
-    badge = {"SAFE": "🟢 Optimal", "WARNING": "🟡 Throttled", "CRITICAL": "🔴 Critical"}.get(state, state)
+    badge = {
+        "SAFE": "🟢 Optimal",
+        "WARNING": "🟡 Throttled",
+        "CRITICAL": "🔴 Critical",
+        "EMERGENCY": "🚨 Emergency",
+    }.get(state, state)
     vitals = system_health.get("vitals", {}) or {}
     st.sidebar.markdown("## System Vitals")
     st.sidebar.metric("Guardian State", badge)
@@ -177,7 +185,7 @@ def main():
     timeline_df = query_timeline_events(sqlite_path=sqlite_path, limit=300)
     if timeline_df.empty:
         st.warning("No events in SQLite yet. Start live inference runtime.")
-        st.code("python -m src.inference.infer_live --config config.yaml", language="bash")
+        st.code("python main.py", language="bash")
         return
 
     kpis = get_kpi_metrics(sqlite_path=sqlite_path, status_path=status_path)
@@ -248,7 +256,7 @@ def main():
             alerts = alerts_payload.get("alerts", []) or []
             st.metric("Active alerts", len(alerts))
             if alerts:
-                st.dataframe(alerts[:20], use_container_width=True, hide_index=True)
+                st.dataframe(alerts[:20], width="stretch", hide_index=True)
             else:
                 st.caption("No active alerts.")
         else:
@@ -272,7 +280,7 @@ def main():
                     }
                     for a in open_actions
                 ]
-                st.dataframe(table_rows, use_container_width=True, hide_index=True)
+                st.dataframe(table_rows, width="stretch", hide_index=True)
 
                 st.markdown("**Action Workflow**")
                 action_options = [str(a.get("action_id")) for a in open_actions if a.get("action_id")]
@@ -293,7 +301,7 @@ def main():
 
                 w1, w2, w3 = st.columns(3)
                 with w1:
-                    if st.button("Acknowledge", use_container_width=True):
+                    if st.button("Acknowledge", width="stretch"):
                         try:
                             enforce_permission(selected_role, Permission.CLOSE_ACTIONS, context="acknowledge action")
                             tracker = ActionTracker(sqlite_path=actions_db_path)
@@ -307,7 +315,7 @@ def main():
                             st.error(f"Acknowledge failed: {exc}")
 
                 with w2:
-                    if st.button("Approve", use_container_width=True):
+                    if st.button("Approve", width="stretch"):
                         try:
                             enforce_permission(selected_role, Permission.APPROVE_ACTIONS, context="approve action")
                             tracker = ActionTracker(sqlite_path=actions_db_path)
@@ -321,7 +329,7 @@ def main():
                             st.error(f"Approve failed: {exc}")
 
                 with w3:
-                    if st.button("Close", use_container_width=True):
+                    if st.button("Close", width="stretch"):
                         try:
                             enforce_permission(selected_role, Permission.CLOSE_ACTIONS, context="close action")
                             tracker = ActionTracker(sqlite_path=actions_db_path)
@@ -381,7 +389,7 @@ def main():
     cameras_payload = (metrics_payload.get("cameras", {}) or {}) if isinstance(metrics_payload, dict) else {}
 
     if not cameras_payload:
-        st.info("Runtime metrics unavailable. Expected file: data/runtime/runtime_metrics.json")
+        st.info(f"Runtime metrics unavailable. Expected file: {runtime_metrics_path}")
     else:
         cam_rows = []
         for cam_id, info in cameras_payload.items():
@@ -409,7 +417,7 @@ def main():
         h3.metric("Dropped frames", total_dropped)
         h4.metric("Uptime", uptime_text)
 
-        st.dataframe(cam_rows, use_container_width=True, hide_index=True)
+        st.dataframe(cam_rows, width="stretch", hide_index=True)
 
     st.divider()
     st.subheader("💾 Storage & Retention Status")
@@ -440,14 +448,14 @@ def main():
     with c1:
         if not defects_per_hour.empty:
             fig = px.line(defects_per_hour, x="hour_bucket", y="defect_count", markers=True, title="Defects per Hour")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No hourly trend data.")
 
     with c2:
         if not severity_df.empty:
             fig = px.bar(severity_df, x="severity", y="count", title="Severity Distribution")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No severity distribution data.")
 
@@ -462,7 +470,7 @@ def main():
                 barmode="group",
                 title="Shift Comparison",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No shift data.")
 
@@ -476,14 +484,14 @@ def main():
                 histfunc="sum",
                 title="Hourly Heatmap (Defects vs Time)",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("No heatmap data.")
 
     st.subheader("Defects by Machine")
     if not machine_df.empty:
         fig = px.bar(machine_df.head(10), x="machine", y="count")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.divider()
     st.subheader("Root Cause Insights")
@@ -530,7 +538,7 @@ def main():
                     "window_end": wp.get("window_end", "n/a"),
                 }
             )
-        st.dataframe(breakdown_rows, use_container_width=True, hide_index=True)
+        st.dataframe(breakdown_rows, width="stretch", hide_index=True)
 
     st.divider()
     st.subheader("Live Operations")
@@ -548,7 +556,7 @@ def main():
             overlay_path = str(row.get("overlay_path", "") or "")
             if overlay_path and os.path.exists(overlay_path):
                 try:
-                    st.image(overlay_path, use_container_width=True)
+                    st.image(overlay_path, width="stretch")
                 except Exception:
                     st.warning("🏷️ Overlay image pruned by retention policy")
             else:
@@ -561,7 +569,7 @@ def main():
             display_img = crop_path if (crop_path and os.path.exists(crop_path)) else (full_path if (full_path and os.path.exists(full_path)) else None)
             if display_img:
                 try:
-                    st.image(display_img, use_container_width=True)
+                    st.image(display_img, width="stretch")
                 except Exception:
                     st.warning("🏷️ Image pruned by retention policy")
             else:

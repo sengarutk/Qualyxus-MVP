@@ -127,7 +127,10 @@ class ActionVerifier:
                         to_remove.append(action_id)
                 except Exception:
                     if now - task.started_at >= (task.timeout * self.timeout_multiplier):
-                        self._mark_status(action_id, "TIMEOUT")
+                        try:
+                            self._mark_status(action_id, "TIMEOUT")
+                        except Exception:
+                            pass  # tracker unavailable; still stop watching to avoid a hot loop
                         to_remove.append(action_id)
 
             if to_remove:
@@ -135,4 +138,4 @@ class ActionVerifier:
                     for action_id in to_remove:
                         self.active_verifications.pop(action_id, None)
 
-            time.sleep(self.poll_interval)
+            self._stop_event.wait(self.poll_interval)

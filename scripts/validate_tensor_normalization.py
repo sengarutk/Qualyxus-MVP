@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_ROOT_DIR = _Path(__file__).resolve().parents[1]
+if str(_ROOT_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT_DIR))
+
+
 """Validate GPU-side preprocessing (uint8->float32 + /255) and Ultralytics warnings.
 
 This script exists to validate that our preprocessing path feeds Ultralytics a
@@ -21,14 +29,16 @@ from src.inference.postprocess import make_preprocessor, preprocess_for_inferenc
 
 
 def _pick_sample_image() -> str:
-    # Prefer any recorded live frame if present.
-    candidates = list(Path("data/live/raw").rglob("*.jpg"))
-    if candidates:
-        return str(sorted(candidates)[-1])
+    # Prefer any recorded live frame if present (CameraManager writes PNG frames).
+    for pattern in ("*.png", "*.jpg", "*.jpeg"):
+        candidates = list(Path("data/live/raw").rglob(pattern))
+        if candidates:
+            return str(sorted(candidates)[-1])
     # Fallback to repo samples.
-    samples = list(Path("data/samples").glob("*.jpg"))
-    if samples:
-        return str(sorted(samples)[0])
+    for pattern in ("*.png", "*.jpg", "*.jpeg"):
+        samples = list(Path("data/samples").glob(pattern))
+        if samples:
+            return str(sorted(samples)[0])
     raise FileNotFoundError("No sample images found under data/live/raw or data/samples")
 
 

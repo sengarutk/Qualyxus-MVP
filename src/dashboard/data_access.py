@@ -44,19 +44,19 @@ def get_kpi_metrics(sqlite_path: str, status_path: str) -> dict:
     current_shift = _shift_from_hour(now.tm_hour)
 
     with engine.connect() as conn:
+        # Event timestamps are stored in UTC; the A/B/C shift calendar is plant-local time.
+        # (shift_id carries telemetry labels such as "day"/"night", so it cannot be compared
+        # with the A/B/C calendar used here.)
         defects_per_hour = conn.execute(
             text(
                 """
                 WITH enriched AS (
                     SELECT
-                        COALESCE(
-                            shift_id,
-                            CASE
-                                WHEN CAST(strftime('%H', timestamp) AS INTEGER) BETWEEN 6 AND 13 THEN 'A'
-                                WHEN CAST(strftime('%H', timestamp) AS INTEGER) BETWEEN 14 AND 21 THEN 'B'
-                                ELSE 'C'
-                            END
-                        ) AS shift_name,
+                        CASE
+                            WHEN CAST(strftime('%H', timestamp, 'localtime') AS INTEGER) BETWEEN 6 AND 13 THEN 'A'
+                            WHEN CAST(strftime('%H', timestamp, 'localtime') AS INTEGER) BETWEEN 14 AND 21 THEN 'B'
+                            ELSE 'C'
+                        END AS shift_name,
                         timestamp
                     FROM defect_events
                 )

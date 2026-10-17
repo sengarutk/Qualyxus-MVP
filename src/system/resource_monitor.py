@@ -32,12 +32,13 @@ class ResourceGovernor:
         self._critical_since: float | None = None
         self._warning_since: float | None = None
         # Stability knobs (seconds). These may be overridden via Config.resource_management.
-        self._critical_hold_seconds = float(getattr(self.rm, "critical_hold_seconds", 300.0) or 300.0)
-        self._warning_hold_seconds = float(getattr(self.rm, "warning_hold_seconds", 120.0) or 120.0)
-        self._critical_cooldown_seconds = float(getattr(self.rm, "critical_cooldown_seconds", 900.0) or 900.0)
-        self._warning_cooldown_seconds = float(getattr(self.rm, "warning_cooldown_seconds", 300.0) or 300.0)
+        # (Config.resource_management already applies defaults; explicit zeros are honoured.)
+        self._critical_hold_seconds = float(self.rm.critical_hold_seconds)
+        self._warning_hold_seconds = float(self.rm.warning_hold_seconds)
+        self._critical_cooldown_seconds = float(self.rm.critical_cooldown_seconds)
+        self._warning_cooldown_seconds = float(self.rm.warning_cooldown_seconds)
         # Emergency threshold (immediate latch). Default chosen to match malicious-audit test.
-        self._emergency_temp_c = float(getattr(self.rm, "emergency_temp_c", 90.0) or 90.0)
+        self._emergency_temp_c = float(self.rm.emergency_temp_c)
 
         # External hook: caller may register a callback invoked on EMERGENCY latch.
         self._emergency_callback = None
@@ -76,15 +77,20 @@ class ResourceGovernor:
             return True
 
     def _cpu_temperature(self) -> float:
+        reader = getattr(psutil, "sensors_temperatures", None)
+        if reader is None:  # Windows/macOS builds of psutil do not expose sensors
+            return 0.0
         try:
-            temps = psutil.sensors_temperatures()
+            temps = reader() or {}
             for entries in temps.values():
                 for entry in entries:
                     current = getattr(entry, "current", None)
                     if current is not None:
                         return float(current)
         except Exception as exc:
-            LOGGER.warning("CPU temperature read failed: %s", exc)
+            if not getattr(self, "_cpu_temp_warned", False):
+                LOGGER.warning("CPU temperature read failed (further warnings suppressed): %s", exc)
+                self._cpu_temp_warned = True
             return 0.0
         return 0.0
 
@@ -98,7 +104,9 @@ class ResourceGovernor:
             used_pct = (float(mem.used) / float(mem.total) * 100.0) if mem.total else 0.0
             return temp, used_pct
         except Exception as exc:
-            LOGGER.warning("GPU vitals read failed: %s", exc)
+            if not getattr(self, "_gpu_warned", False):
+                LOGGER.warning("GPU vitals read failed (further warnings suppressed): %s", exc)
+                self._gpu_warned = True
             return 0.0, 0.0
 
     def get_vitals(self) -> SystemVitals:
@@ -182,6 +190,15 @@ class ResourceGovernor:
                 if current != SystemState.CRITICAL:
                     if self._critical_since is not None and (now - self._critical_since) >= self._critical_hold_seconds:
                         self._last_state = SystemState.CRITICAL
+                        self._last_transition_ts = now
+                    elif (
+                        current == SystemState.SAFE
+                        and self._warning_since is not None
+                        and (now - self._warning_since) >= self._warning_hold_seconds
+                    ):
+                        # Critical pressure implies warning pressure: escalate to WARNING
+                        # while the (longer) critical hold time is still accumulating.
+                        self._last_state = SystemState.WARNING
                         self._last_transition_ts = now
                 return self._last_state
 

@@ -27,7 +27,8 @@ class FederatedServer:
         if sha256 != client_payload.get("sha256"):
             raise ValueError("Federated payload integrity check failed")
         buffer = io.BytesIO(payload_bytes)
-        return torch.load(buffer, map_location="cpu")
+        # Payloads arrive from remote nodes: never unpickle arbitrary objects, tensors only.
+        return torch.load(buffer, map_location="cpu", weights_only=True)
 
     @staticmethod
     def fedavg(weight_sets: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

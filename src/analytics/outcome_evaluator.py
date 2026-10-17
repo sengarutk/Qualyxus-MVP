@@ -103,7 +103,7 @@ class OutcomeEvaluator:
             "approved_by": row["approved_by"],
             "closure_notes": row["closure_notes"],
             "version": int(row["version"]),
-            "action_payload": json.loads(row["action_payload"]),
+            "action_payload": json.loads(row["action_payload"] or "{}"),
             "updated_at": row["updated_at"],
         }
 
@@ -152,7 +152,7 @@ class OutcomeEvaluator:
                 """
                 SELECT COUNT(*) AS c
                 FROM defect_events
-                WHERE timestamp >= ? AND timestamp < ?
+                WHERE julianday(timestamp) >= julianday(?) AND julianday(timestamp) < julianday(?)
                 """,
                 (_iso(start), _iso(end)),
             ).fetchone()
@@ -237,21 +237,18 @@ class OutcomeEvaluator:
         cycle_before = _pick_window_value(cycle_time, "before")
         cycle_after = _pick_window_value(cycle_time, "after")
 
-        def _norm_scrap(v: float | None) -> float | None:
-            if v is None:
-                return None
-            return float(v / 100.0) if v > 1.0 else float(v)
-
-        def _safe_impr(before: float | None, after: float | None) -> float | None:
+        def _safe_impr(before: float | None, after: float | None, *, higher_is_better: bool = False) -> float | None:
             if before is None or after is None or abs(before) <= 1e-12:
                 return None
-            return ((before - after) / before) * 100.0
+            delta = (after - before) if higher_is_better else (before - after)
+            return (delta / before) * 100.0
 
         kpi_metrics = {
             "production_volume": {
                 "before": prod_before,
                 "after": prod_after,
-                "improvement_percent": _safe_impr(prod_before, prod_after),
+                # More output is an improvement; for scrap and cycle time lower is better.
+                "improvement_percent": _safe_impr(prod_before, prod_after, higher_is_better=True),
             },
             "scrap_rate": {
                 "before": scrap_before,

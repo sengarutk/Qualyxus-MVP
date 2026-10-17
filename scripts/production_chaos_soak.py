@@ -258,6 +258,10 @@ def main():
     except Exception as e:
         _assert(False, f"GeometryEngine crashed under poisoned matrix: {e}")
         traceback.print_exc()
+    finally:
+        # The synthetic template must not linger in the operator's template directory.
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
     # 2. Contaminate Live Telemetry in VibrationAnalyzer
     vib_analyzer = VibrationAnalyzer(buffer_size=64, kap_db_path="data/knowledge/knowledge_base.db", camera_id="cam_math_test")

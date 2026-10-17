@@ -20,6 +20,24 @@ from src.logging.metadata_contract import compute_audit_hash, to_metadata_dict
 logger = logging.getLogger("QualyxusEventLogger")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Large per-pixel arrays are persisted elsewhere and must never be pushed to SSE clients.
+_BROADCAST_EXCLUDED_KEYS = {"mask", "frame_data"}
+
+
+def _to_json_safe(value):
+    """Recursively convert numpy / datetime values into JSON-serialisable primitives."""
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v) for k, v in value.items() if k not in _BROADCAST_EXCLUDED_KEYS}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
 class EventLogger:
     """
     Asynchronous, single-worker batch serialization engine backed by memory-bound queues 
@@ -54,8 +72,19 @@ class EventLogger:
                     logger.warning("[EventLogger] Failed to run schema migration on re-initialization: %s", e)
             return
             
-        self.db_path = sqlite_path or os.environ.get("SQLITE_DB_PATH", "data/live/events.db")
-        self.csv_fallback_path = csv_path or os.environ.get("CSV_FALLBACK_PATH", "data/live/events.csv")
+        logging_cfg = self._configured_logging_paths() if not (sqlite_path and csv_path) else {}
+        self.db_path = (
+            sqlite_path
+            or os.environ.get("SQLITE_DB_PATH")
+            or logging_cfg.get("sqlite_path")
+            or "data/events/events.db"
+        )
+        self.csv_fallback_path = (
+            csv_path
+            or os.environ.get("CSV_FALLBACK_PATH")
+            or logging_cfg.get("csv_path")
+            or "data/events/events.csv"
+        )
         
         # Thread-safe asyncio ring buffer capping memory footprint bounds
         self.queue = asyncio.Queue(maxsize=10000)
@@ -65,6 +94,9 @@ class EventLogger:
         
         self.db_executor = ThreadPoolExecutor(max_workers=1)
         self.db_lock = threading.Lock()
+        # VLM narratives can complete before the async batch that inserts their event row.
+        self._pending_narratives: dict[str, str] = {}
+        self._camera_cfg_cache: tuple[float, dict[str, dict]] = (0.0, {})
         self.worker_task = None
         self._starting = False
         self._db_conn = None
@@ -75,6 +107,14 @@ class EventLogger:
             self._init_db()
         except Exception as e:
             logger.warning("[EventLogger] Failed to run schema migration on initialization: %s", e)
+
+    @staticmethod
+    def _configured_logging_paths() -> dict:
+        try:
+            from src.config.config import Config
+            return dict(Config.load().get("logging", default={}) or {})
+        except Exception:
+            return {}
 
     @staticmethod
     def new_event_id() -> str:
@@ -191,8 +231,8 @@ class EventLogger:
         """Fans out a sanitized JSON dictionary payload to all active memory queues safely across thread scopes."""
         if not hasattr(self, "subscribers") or not self.subscribers:
             return
-            
-        import asyncio
+
+        payload = _to_json_safe(payload)
         from src.core.factory_manager import FactoryManager
         cm = FactoryManager().get_instance("CameraManager")
         main_loop = getattr(cm, "main_loop", None) if cm else None
@@ -255,7 +295,11 @@ class EventLogger:
             except Exception:
                 pass
 
+        if not event.vlm_narrative:
+            event.vlm_narrative = self._pop_pending_narrative(event.event_id)
+
         # 3. Synchronous SQLite Insert (upsert transaction)
+        conn = None
         try:
             conn = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -298,11 +342,13 @@ class EventLogger:
                 event.inspection_profile
             ))
             cursor.execute("COMMIT;")
-            conn.close()
         except Exception as exc:
             logger.error("[EventLogger] Sync DB write failed: %s. Reverting to emergency CSV.", exc)
             self._write_csv_row_sync(event)
             raise
+        finally:
+            if conn is not None:
+                conn.close()
 
         # 4. CSV Logging
         self._write_csv_row_sync(event)
@@ -312,50 +358,43 @@ class EventLogger:
         payload = to_metadata_dict(event)
         self.broadcast_to_subscribers(payload)
 
+    def _camera_config(self, camera_id: str) -> dict:
+        """Per-camera config entry, resolved from the live CameraManager / ConfigVault / config file.
+
+        The resolved table is cached for 30s so CSV writes never re-parse YAML per event.
+        """
+        cached_at, table = self._camera_cfg_cache
+        if time.monotonic() - cached_at > 30.0 or (camera_id not in table and table == {}):
+            cameras: list = []
+            try:
+                from src.core.factory_manager import FactoryManager
+                camera_manager = FactoryManager().get_instance("CameraManager")
+                if camera_manager is not None:
+                    cameras = list(camera_manager.raw_config.get("cameras", []) or [])
+                if not cameras:
+                    vault = FactoryManager().get_instance("ConfigVault")
+                    if vault is not None:
+                        cameras = list(vault.get("cameras", default=[]) or [])
+                if not cameras:
+                    from src.config.config import Config
+                    cameras = list(Config.load().get("cameras", default=[]) or [])
+            except Exception:
+                cameras = []
+            table = {str(c.get("id")): c for c in cameras if isinstance(c, dict)}
+            self._camera_cfg_cache = (time.monotonic(), table)
+        return table.get(str(camera_id), {})
+
+    def _pop_pending_narrative(self, event_id) -> str | None:
+        if not event_id:
+            return None
+        with self.db_lock:
+            return self._pending_narratives.pop(str(event_id), None)
+
     def _write_csv_row_sync(self, event: DefectEvent):
         try:
             # Check if independent logs are enabled for this camera source
-            independent = False
+            independent = bool(self._camera_config(event.source).get("independent_logs", False))
             session_id = None
-            try:
-                # 1. Try to check configuration from CameraManager
-                from src.core.factory_manager import FactoryManager
-                camera_manager = FactoryManager().get_instance("CameraManager")
-                if camera_manager:
-                    cameras = camera_manager.raw_config.get("cameras", [])
-                    for cam in cameras:
-                        if cam.get("id") == event.source:
-                            independent = bool(cam.get("independent_logs", False))
-                            break
-            except Exception:
-                pass
-
-            if not independent:
-                try:
-                    # 2. Try Config from ConfigVault
-                    from src.core.factory_manager import FactoryManager
-                    vault = FactoryManager().get_instance("ConfigVault")
-                    if vault:
-                        cameras = vault.get("cameras", default=[])
-                        for cam in cameras:
-                            if cam.get("id") == event.source:
-                                independent = bool(cam.get("independent_logs", False))
-                                break
-                except Exception:
-                    pass
-
-            if not independent:
-                try:
-                    # 3. Try Config.load() fallback
-                    from src.config.config import Config
-                    cfg = Config.load()
-                    cameras = cfg.get("cameras", default=[])
-                    for cam in cameras:
-                        if cam.get("id") == event.source:
-                            independent = bool(cam.get("independent_logs", False))
-                            break
-                except Exception:
-                    pass
 
             if independent:
                 # Retrieve session_id if available
@@ -420,19 +459,8 @@ class EventLogger:
     def _write_geometry_csv_row_sync(self, event: dict):
         try:
             camera_id = event.get("camera_id", "UNKNOWN")
-            independent = False
+            independent = bool(self._camera_config(camera_id).get("independent_logs", False))
             session_id = None
-            try:
-                from src.core.factory_manager import FactoryManager
-                camera_manager = FactoryManager().get_instance("CameraManager")
-                if camera_manager:
-                    cameras = camera_manager.raw_config.get("cameras", [])
-                    for cam in cameras:
-                        if cam.get("id") == camera_id:
-                            independent = bool(cam.get("independent_logs", False))
-                            break
-            except Exception:
-                pass
 
             if independent:
                 try:
@@ -497,23 +525,36 @@ class EventLogger:
         except Exception:
             pass
             
+        # Derive confidence/severity from the detection itself. Telemetry fields stay NULL:
+        # this path has no telemetry context and must not invent plant readings.
+        confidence = None
+        box = item.get("box")
+        try:
+            if box is not None and len(box) > 4:
+                confidence = float(box[4])
+        except Exception:
+            confidence = None
+        if confidence is None:
+            confidence = 0.0
+        from src.inference.postprocess import severity_from_conf
+
         payload = {
             "event_id": event_id,
             "timestamp": ts_datetime,
             "source": item.get("camera_id", "UNKNOWN"),
-            "defect_type": "surface defect",
-            "confidence": 0.85,
-            "severity": 2,
+            "defect_type": "anomaly",
+            "confidence": confidence,
+            "severity": severity_from_conf(confidence),
             "batch_id": None,
             "operator_id": None,
-            "machine_id": "m1",
-            "shift_id": "s1",
-            "line_id": str(profile_line_id) if profile_line_id else "l1",
-            "station_id": str(profile_station_id) if profile_station_id else "st1",
-            "temperature": 75.0,
-            "vibration": 0.05,
-            "speed": 1.0,
-            "lot_id": "lot1",
+            "machine_id": None,
+            "shift_id": None,
+            "line_id": str(profile_line_id) if profile_line_id else None,
+            "station_id": str(profile_station_id) if profile_station_id else None,
+            "temperature": None,
+            "vibration": None,
+            "speed": None,
+            "lot_id": None,
             "full_image_path": "",
             "overlay_path": None,
             "crop_path": None,
@@ -604,6 +645,11 @@ class EventLogger:
                         item["inspection_profile"] = profile_name
                     except Exception:
                         pass
+
+                    if not item.get("vlm_narrative"):
+                        pending = self._pending_narratives.pop(str(item.get("event_id")), None)
+                        if pending:
+                            item["vlm_narrative"] = pending
 
                     if not item.get("audit_hash"):
                         try:
@@ -862,19 +908,24 @@ class EventLogger:
         Appends compiled VLM forensic descriptions to an active defect event record row 
         safely within our central, thread-safe database transaction lock context.
         """
-        import sqlite3
-        # Corrected: Update vlm_narrative column instead of defect_type to prevent classification corruption.
-        # Corrected: Reference self.db_path instead of non-existent self.sqlite_path attribute.
         query = "UPDATE defect_events SET vlm_narrative = ? WHERE event_id = ?"
         with self.db_lock:
+            conn = None
             try:
                 conn = sqlite3.connect(self.db_path, timeout=5.0)
                 cursor = conn.cursor()
                 cursor.execute(query, (narrative, event_id))
+                updated = cursor.rowcount
                 conn.commit()
-                conn.close()
+                if updated == 0:
+                    # Row not inserted yet (async batch still queued): attach it on insert.
+                    self._pending_narratives[str(event_id)] = narrative
+                    if len(self._pending_narratives) > 1000:
+                        self._pending_narratives.pop(next(iter(self._pending_narratives)))
             except Exception as e:
-                import logging
-                logging.getLogger("EventLogger").error(
-                    f"[Modbus/VLM Boundary] Failed to update narrative column data for event tracking signature {event_id}: {e}"
+                logger.error(
+                    "[EventLogger] Failed to update narrative for event %s: %s", event_id, e
                 )
+            finally:
+                if conn is not None:
+                    conn.close()

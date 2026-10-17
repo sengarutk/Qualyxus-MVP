@@ -14,15 +14,16 @@ from src.dataset.synthetic_generator import inject_synthetic_data
 from src.dataset.yolo_convert import rle_decode, mask_to_polygons, polygon_to_yolo_seg_line
 
 
-def write_dataset_yaml(yaml_path: Path):
+def write_dataset_yaml(yaml_path: Path, dataset_root: Path):
     yaml_text = f"""# Severstal dataset for YOLOv8 segmentation
-path: {yaml_path.parent.as_posix()}
+path: {dataset_root.resolve().as_posix()}
 train: images/train
 val: images/val
 
 names:
   0: defect
 """
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
     yaml_path.write_text(yaml_text, encoding="utf-8")
 
 
@@ -77,7 +78,7 @@ def prepare():
     n_val = int(len(image_ids) * val_split)
     val_ids = set(image_ids[:n_val])
 
-    write_dataset_yaml(yaml_path)
+    write_dataset_yaml(yaml_path, processed_dir)
 
     print(f"Total defect images: {len(image_ids)} | Train: {len(image_ids)-len(val_ids)} | Val: {len(val_ids)}")
     print(f"Writing dataset yaml: {yaml_path}")

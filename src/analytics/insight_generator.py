@@ -37,7 +37,9 @@ def _confidence_tag(value: float) -> str:
 
 def _base_confidence(scope: dict[str, Any]) -> float:
     confidence = scope.get("confidence", {}) or {}
-    return float(confidence.get("overall_confidence", 0.5) or 0.5)
+    value = confidence.get("overall_confidence")
+    # A genuine 0.0 confidence must stay 0.0; only a missing value falls back to neutral.
+    return 0.5 if value is None else float(value)
 
 
 def _trend_insight(root: dict[str, Any]) -> Insight | None:
@@ -201,7 +203,7 @@ def _combined_signal_insight(root: dict[str, Any]) -> Insight | None:
 
     machine = (top_machine or {}).get("machine_id", "unknown machine")
     shift = (top_shift or {}).get("shift_id", "unknown shift")
-    defect_type = (top_defect or {}).get("defect_type", "defects")
+    defect_type = str((top_defect or {}).get("defect_type", "defects"))
     direction = "increased" if delta_pct > 0 else "decreased"
 
     if spikes:

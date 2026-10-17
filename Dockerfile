@@ -13,8 +13,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TORCH_NUM_THREADS=1 \
     OMP_NUM_THREADS=1
 
+# curl is required by the docker-compose HTTP healthchecks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  ffmpeg libsm6 libxext6 libgl1 \
+  ffmpeg libsm6 libxext6 libgl1 curl \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -22,10 +23,10 @@ WORKDIR /app
 # Install dependencies first for better Docker layer caching.
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
-  && pip install --no-cache-dir -r /app/requirements.txt \
-  && pip install --no-cache-dir fastapi uvicorn plotly
+  && pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy only required runtime source/configs.
+COPY main.py /app/main.py
 COPY src /app/src
 COPY scripts /app/scripts
 COPY config.yaml /app/config.yaml
@@ -33,4 +34,6 @@ COPY config.yaml /app/config.yaml
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD python -m src.healthcheck || exit 1
 
-CMD ["python", "-m", "src.inference.infer_live", "--config", "/app/config.yaml"]
+# main.py is the full edge runtime: camera ingestion, batched inference,
+# event persistence, the Pulse SSE API (port 8000) and the MQTT uplink.
+CMD ["python", "main.py"]

@@ -64,7 +64,7 @@ class TelemetryBroadcaster:
             # Pre-serialize to an immutable string outside the lock.
             # This completely eliminates cross-client state bleeding and avoids 
             # the massive performance penalty of `copy.deepcopy()`.
-            immutable_json_payload = json.dumps(payload)
+            immutable_json_payload = json.dumps(payload, default=str)
         except Exception as e:
             logger.error("[Broadcaster] Failed to serialize telemetry payload: %s", e)
             return
@@ -123,7 +123,7 @@ async def stream_telemetry(request: Request):
                 try:
                     # Non-blocking await with a low-overhead heartbeat timeout fallthrough
                     payload = await asyncio.wait_for(client_queue.get(), timeout=1.0)
-                    yield f"data: {json.dumps(payload)}\n\n"
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
                 except asyncio.TimeoutError:
                     # Enforce low-overhead keepalive heartbeats to keep the TCP link open
                     yield ": heartbeat\n\n"
@@ -183,57 +183,61 @@ async def health_check():
     return {"status": "ok", "timestamp": time.time()}
 
 class PulseServer:
-    def __init__(self):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8000):
         self.app = app
+        self.host = host
+        self.port = int(port)
         self.server = None
+        self._finished: asyncio.Event | None = None
         
     async def run_async(self):
-        logger.info("[PulseServer] Booting ASGI SSE Telemetry Engine on port 8000")
+        logger.info("[PulseServer] Booting ASGI SSE Telemetry Engine on port %d", self.port)
         config = uvicorn.Config(
             self.app, 
-            host="0.0.0.0", 
-            port=8000, 
-            log_level="error"
+            host=self.host, 
+            port=self.port, 
+            log_level="error",
+            # Open SSE streams never end on their own; bound the graceful drain on shutdown.
+            timeout_graceful_shutdown=1,
         )
         self.server = uvicorn.Server(config)
+        self._finished = asyncio.Event()
         
         try:
             await self.server.serve()
         except asyncio.CancelledError:
             # Hardening Guard: Intercept the master loop's raw task cancellation
             logger.warning("[PulseServer] Task cancellation intercepted. Diverting to clean port severance pipeline...")
-            await self.stop()
+            self._force_close()
             raise  # Re-raise the CancelledError to preserve async task contract compliance
+        finally:
+            self._finished.set()
 
-    async def stop(self):
+    def _force_close(self):
+        for srv in getattr(self.server, "servers", []) or []:
+            srv.close()
+
+    async def stop(self, timeout: float = 3.0):
         """
         Awaitable Port Severance Hook.
-        Forcefully unbinds HTTP listeners from the OS network stack and guarantees socket release.
+        Requests a graceful uvicorn exit and waits for serve() to return, forcing the
+        listening sockets closed if the drain exceeds `timeout`.
         """
-        if self.server is None or not self.server.started:
+        if self.server is None or self._finished is None or self._finished.is_set():
             return
             
         logger.info("[PulseServer] Triggering active listener drop sequence...")
         self.server.should_exit = True
-        
-        # Validation Poll Loop with a strict maximum bound to guarantee closure
-        start_time = time.perf_counter()
-        timeout = 2.0  # 2.0 seconds maximum socket severance budget
-        
         try:
-            while self.server.started:
-                if time.perf_counter() - start_time > timeout:
-                    logger.warning("[PulseServer] Socket teardown timeout exceeded. Forcing socket closure.")
-                    for srv in getattr(self.server, "servers", []):
-                        srv.close()
-                    break
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(self._finished.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[PulseServer] Socket teardown timeout exceeded. Forcing socket closure.")
+            self.server.force_exit = True
+            self._force_close()
         except asyncio.CancelledError:
-            # Flaw Fix: Catch the inevitable CancelledError thrown by `asyncio.sleep()` when 
-            # this method is called from within a cancellation handler.
-            logger.warning("[PulseServer] Sleep trap triggered during stop loop. Forcing synchronous socket closure.")
-            for srv in getattr(self.server, "servers", []):
-                srv.close()
+            logger.warning("[PulseServer] Stop interrupted. Forcing synchronous socket closure.")
+            self._force_close()
+            raise
             
         logger.info("[PulseServer] Network engine shutdown complete.")
 

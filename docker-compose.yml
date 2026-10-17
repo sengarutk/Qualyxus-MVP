@@ -1,7 +1,7 @@
 services:
   qualyxus-inference:
     build: .
-    command: python src/inference/infer_live.py
+    command: python main.py
     network_mode: "host"
     volumes:
       - ./data:/app/data
@@ -27,9 +27,9 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      # Hardened Fix: Route the inline request to hit the dedicated /api/v1/health endpoint.
+      # Hit the dedicated /api/v1/health endpoint served by main.py's Pulse server.
       # Hitting the SSE stream endpoint creates persistent socket leaks because the stream never closes.
-      # Utilizing the newly added 'curl' from the base layer for strict validation.
+      # curl is installed in the Dockerfile base layer.
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
       interval: 10s
       timeout: 5s

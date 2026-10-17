@@ -21,6 +21,7 @@ class WatchdogManager:
         base_backoff: float = 1.0,
         max_backoff: float = 30.0,
         logger_stall_timeout: float = 5.0,
+        frame_drop_window_seconds: float = 60.0,
     ):
         self.heartbeat_timeout = heartbeat_timeout
         self.frame_drop_threshold = frame_drop_threshold
@@ -28,9 +29,23 @@ class WatchdogManager:
         self.base_backoff = base_backoff
         self.max_backoff = max_backoff
         self.logger_stall_timeout = logger_stall_timeout
+        # Frame drops are judged per fixed-length window: a lifetime counter would eventually
+        # restart a perfectly healthy long-running stream.
+        self.frame_drop_window_seconds = max(1.0, float(frame_drop_window_seconds))
 
         self.failure_counts: dict[str, int] = {}
         self.next_restart_after: dict[str, float] = {}
+        self._drop_baselines: dict[tuple[str, str], tuple[float, int]] = {}
+
+    def _drops_in_window(self, state, cam: str, now: float) -> int:
+        """Frames dropped by this worker session since the start of the current window."""
+        dropped = int(getattr(state, "dropped_frames", 0) or 0)
+        key = (cam, str(getattr(state, "session_id", "")))
+        window_start, baseline = self._drop_baselines.get(key, (now, dropped))
+        if dropped < baseline or (now - window_start) > self.frame_drop_window_seconds:
+            window_start, baseline = now, dropped
+        self._drop_baselines[key] = (window_start, baseline)
+        return dropped - baseline
 
     def evaluate(self, state, now: float | None = None) -> WatchdogDecision:
         """
@@ -52,7 +67,7 @@ class WatchdogManager:
             
             if last_heartbeat > 0 and (now - last_heartbeat) > self.heartbeat_timeout:
                 reason = "heartbeat_timeout"
-            elif getattr(state, "dropped_frames", 0) >= self.frame_drop_threshold:
+            elif self._drops_in_window(state, cam, now) >= self.frame_drop_threshold:
                 reason = "repeated_frame_drops"
             elif getattr(state, "queue_overflow_streak", 0) >= self.queue_overflow_streak_threshold:
                 reason = "queue_overflow_persistent"
@@ -66,6 +81,10 @@ class WatchdogManager:
 
             if reason is None:
                 return WatchdogDecision(restart=False)
+
+            # A restarted worker gets a fresh drop window.
+            for key in [k for k in self._drop_baselines if k[0] == cam]:
+                self._drop_baselines.pop(key, None)
 
             # Process failure accumulation and handle backoff
             failures = self.failure_counts.get(cam, 0) + 1

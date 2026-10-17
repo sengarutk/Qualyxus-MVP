@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import re
+import hashlib
 from pathlib import Path
 
 import cv2
@@ -14,33 +16,49 @@ from src.logging.schema import DefectEvent
 from src.telemetry.telemetry_provider import TelemetryProvider
 
 
+def extract_camera_id(filename: str) -> str:
+    """Dynamically extracts camera identifier prefix from image filename."""
+    match = re.search(r"^(cam_[a-zA-Z0-9_]+?)(?:_frame|_defect|_mask|\.|$)", filename, re.IGNORECASE)
+    if not match:
+        match = re.search(r"^(cam_\d+|cam_[a-zA-Z0-9]+)", filename, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    return "general"
+
+
+def compute_image_hash(img_array: np.ndarray) -> str:
+    """Computes MD5 hash over image byte array for duplicate detection."""
+    return hashlib.md5(img_array.tobytes()).hexdigest()
+
+
 def resolve_default_weights(cfg: Config) -> Path:
     """
     Resolve trained model weights.
     Priority:
-    1) runs/ (Ultralytics default)
-    2) models/checkpoints (manual export)
+    1) <paths.models_dir>/<dataset.name>/weights/best.pt  (output of src.training.train_yolo_seg)
+    2) inference.model_path from the active config
+    3) legacy Severstal locations under runs/ and models/
     """
+    models_dir = Path(cfg.get("paths", "models_dir", default="models/checkpoints") or "models/checkpoints")
+    dataset_name = cfg.get("dataset", "name", default="active_product_recipe") or "active_product_recipe"
+    candidates = [models_dir / dataset_name / "weights" / "best.pt"]
 
-    # 1. Check Ultralytics runs directory
-    runs_path = Path("runs/segment/models/checkpoints/severstal_yolov8_seg/weights/best.pt")
-    if runs_path.exists():
-        return runs_path.resolve()
+    configured = cfg.get("inference", "model_path")
+    if configured:
+        candidates.append(Path(configured))
 
-    # 2. Fallback to models directory
-    models_path = (
-        Path(cfg.get("paths", "models_dir"))
-        / "severstal_yolov8_seg"
-        / "weights"
-        / "best.pt"
-    )
-
-    if models_path.exists():
-        return models_path.resolve()
+    candidates += [
+        Path("runs/segment/models/checkpoints/severstal_yolov8_seg/weights/best.pt"),
+        models_dir / "severstal_yolov8_seg" / "weights" / "best.pt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
 
     raise FileNotFoundError(
-        "Could not find trained model weights in runs/ or models/. "
-        "Train the model first."
+        "Could not find trained model weights. Looked in: "
+        + ", ".join(str(c) for c in candidates)
+        + ". Train the model first or pass --weights."
     )
 
 
@@ -49,15 +67,14 @@ def main():
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--input_dir", type=str, default="data/live/raw")
     parser.add_argument("--save_dir", type=str, default="data/live/defects")
-    parser.add_argument("--source", type=str, default="demo_cam_1")
+    parser.add_argument("--source", type=str, default=None)
     args = parser.parse_args()
 
     cfg = Config.load()
     cfg.ensure_dirs()
 
-    base_save = args.save_dir if args.save_dir else "data/live/defects"
-    save_dir = Path(base_save) / args.source
-    save_dir.mkdir(parents=True, exist_ok=True)
+    base_save = Path(args.save_dir) if args.save_dir else Path("data/live/defects")
+    base_save.mkdir(parents=True, exist_ok=True)
 
     input_dir = Path(args.input_dir)
     if not input_dir.exists():
@@ -75,8 +92,8 @@ def main():
         return
 
     logger = EventLogger(
-        sqlite_path=cfg.get("logging", "sqlite_path"),
-        csv_path=cfg.get("logging", "csv_path"),
+        sqlite_path=cfg.get("logging", "sqlite_path", default="data/events/events.db"),
+        csv_path=cfg.get("logging", "csv_path", default="data/events/events.csv"),
     )
 
     # Telemetry
@@ -90,11 +107,17 @@ def main():
         raise FileNotFoundError(f"Missing weights: {weights_path}")
 
     model = YOLO(str(weights_path))
+    written_overlay_hashes: dict[str, Path] = {}
 
     for img_path in images:
         img = cv2.imread(str(img_path))
         if img is None:
             continue
+
+        # Dynamically extract camera channel ID or fall back to general/CLI source
+        cam_id = args.source or extract_camera_id(img_path.name)
+        cam_save_dir = base_save / cam_id
+        cam_save_dir.mkdir(parents=True, exist_ok=True)
 
         result = model.predict(img, conf=conf, iou=iou, verbose=False)[0]
         if result.masks is None or result.masks.data is None:
@@ -109,10 +132,16 @@ def main():
                 continue
 
             mask_bin = (mask > 0.5).astype(np.uint8)
-
             overlay = overlay_mask(img, mask_bin)
-            overlay_path = save_dir / f"{img_path.stem}_overlay_{i}.jpg"
-            cv2.imwrite(str(overlay_path), overlay)
+
+            # Deduplicate overlay writing based on content hash and reuse path
+            overlay_hash = compute_image_hash(overlay)
+            if overlay_hash in written_overlay_hashes and written_overlay_hashes[overlay_hash].exists():
+                overlay_path = written_overlay_hashes[overlay_hash]
+            else:
+                overlay_path = cam_save_dir / f"{img_path.stem}_overlay_{i}.jpg"
+                cv2.imwrite(str(overlay_path), overlay)
+                written_overlay_hashes[overlay_hash] = overlay_path
 
             crop_path = None
             bbox = bbox_from_mask(mask_bin)
@@ -126,16 +155,18 @@ def main():
                 if x2 >= x1 and y2 >= y1:
                     crop = img[y1:y2 + 1, x1:x2 + 1]
                     if crop.size > 0:
-                        crop_path = save_dir / f"{img_path.stem}_crop_{i}.jpg"
+                        crop_path = cam_save_dir / f"{img_path.stem}_crop_{i}.jpg"
+                        # Always (re)write: raw frame names repeat across capture sessions, so a
+                        # stale crop from an earlier session must never be attached to this event.
                         cv2.imwrite(str(crop_path), crop)
 
-            # Fetch telemetry
-            telemetry_ctx = telemetry.get_telemetry(args.source)
+            # Fetch telemetry for extracted camera channel ID
+            telemetry_ctx = telemetry.get_telemetry(cam_id)
 
             event = DefectEvent(
                 event_id=logger.new_event_id(),
                 timestamp=logger.now(),
-                source=args.source,
+                source=cam_id,
                 defect_type="defect",
                 confidence=c,
                 severity=severity_from_conf(c),

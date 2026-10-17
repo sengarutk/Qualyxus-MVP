@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+_ROOT_DIR = _Path(__file__).resolve().parents[1]
+if str(_ROOT_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT_DIR))
+
+
 import time
 from pathlib import Path
 
@@ -8,7 +16,7 @@ import numpy as np
 import torch
 
 from src.config.config import Config
-from src.inference.postprocess import cpu_normalize_frame, gpu_normalize_frame, make_preprocessor
+from src.inference.postprocess import UnifiedPreprocessor, make_preprocessor
 
 
 def _load_sample_frame() -> np.ndarray:
@@ -39,18 +47,19 @@ def main() -> None:
     accel_cfg = cfg.get("hardware_acceleration", default={}) or {}
     precision = str(accel_cfg.get("precision", "fp16"))
     preprocessor = make_preprocessor(use_triton=True, precision=precision)
+    baseline = UnifiedPreprocessor(use_triton=False, precision=precision)
 
-    cpu_latency, cpu_fps = _measure(lambda: cpu_normalize_frame(frame))
+    cpu_latency, cpu_fps = _measure(lambda: baseline.cpu_normalize_frame(frame))
     print(f"CPU/OpenCV normalization: {cpu_latency:.3f} ms/frame | {cpu_fps:.2f} FPS")
 
     if torch.cuda.is_available():
-        gpu_latency, gpu_fps = _measure(lambda: gpu_normalize_frame(frame, precision=precision))
+        gpu_latency, gpu_fps = _measure(lambda: baseline.gpu_normalize_frame(frame))
         print(f"PyTorch GPU normalization: {gpu_latency:.3f} ms/frame | {gpu_fps:.2f} FPS")
     else:
         gpu_latency, gpu_fps = 0.0, 0.0
         print("PyTorch GPU normalization: unavailable (CUDA not detected)")
 
-    if preprocessor is not None:
+    if preprocessor.triton is not None:
         triton_latency, triton_fps = _measure(lambda: preprocessor.process(frame, device="cuda"))
         print(f"Triton kernel normalization: {triton_latency:.3f} ms/frame | {triton_fps:.2f} FPS")
         if gpu_latency > 0:

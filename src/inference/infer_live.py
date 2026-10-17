@@ -62,7 +62,9 @@ class InferenceMultiplexer:
             logger.critical("Halting execution immediately to prevent CPU fallback performance degradation.")
             sys.exit(1)
             
-        self.status_file = os.environ.get("CAMERA_STATUS_PATH", "data/live/camera_status.json")
+        # Batch telemetry has its own file: CAMERA_STATUS_PATH belongs to CameraManager's
+        # per-worker status (consumed by the healthcheck and dashboard).
+        self.status_file = os.environ.get("INFERENCE_STATUS_PATH", "data/live/inference_status.json")
         self.total_processed = 0
 
     def enqueue_frame_from_thread(self, camera_id: str, tensor: torch.Tensor, timestamp_perf: float, loop: asyncio.AbstractEventLoop):
