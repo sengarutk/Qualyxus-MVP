@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 from pathlib import Path
+import pandas as pd
 import plotly.express as px
 import streamlit as st
 
@@ -33,6 +34,7 @@ from src.config.config import Config
 from src.dashboard.components import kpi_row, show_events_table
 from src.operations.action_tracker import ActionTracker
 from src.operations.alert_manager import build_alerts, load_unresolved_actions
+from src.operations.auth import SESSION_S, UserStore
 from src.operations.rbac import (
     Role,
     Permission,
@@ -57,6 +59,8 @@ from src.dashboard.data_access import (
     query_live_events,
     query_severity_distribution,
     events_table_ready,
+    fetch_machine_health,
+    fetch_part_position,
     query_timeline_events,
 )
 
@@ -131,6 +135,43 @@ def _verification_badge(action: dict) -> str:
     return mapping.get(status, status.title())
 
 
+@st.cache_resource
+def _user_store(path: str) -> UserStore:
+    return UserStore(path)
+
+
+def _sign_in(cfg) -> tuple[str, str]:
+    """The signed-in account and its role. With no accounts yet, the page is read-only."""
+    store = _user_store(str(cfg.get("dashboard", "users_file", default="secrets/users.json")))
+    if not store.has_users():
+        st.sidebar.warning("Read-only: no accounts yet. Create one with "
+                           "`python -m src.operations.auth add <name> --role manager`.")
+        return "anonymous", Role.OPERATOR.value
+
+    session = st.session_state.get("auth")
+    if session and time.time() < session["expires"]:
+        st.sidebar.markdown(f"Signed in as **{session['user']}** ({session['role']})")
+        if st.sidebar.button("Sign out"):
+            del st.session_state["auth"]
+            st.rerun()
+        return session["user"], session["role"]
+
+    st.session_state.pop("auth", None)
+    with st.form("sign_in"):
+        st.subheader("Sign in")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        role = store.authenticate(username, password)
+        if role is not None:
+            st.session_state["auth"] = {"user": username, "role": role, "expires": time.time() + SESSION_S}
+            st.rerun()
+        wait = store.locked_for(username)
+        st.error(f"Too many attempts. Try again in {wait / 60:.0f} minutes." if wait else "Wrong username or password.")
+    st.stop()
+
+
 def main():
     cfg = Config.load()
     sqlite_path = cfg.get("logging", "sqlite_path", default="data/events/events.db")
@@ -144,17 +185,7 @@ def main():
 
     st.title("🏭 Qualyxus Operational KPI Dashboard")
     auto_refresh = st.sidebar.toggle("Auto-refresh every 5s", value=True)
-    selected_role = st.sidebar.selectbox(
-        "Current role",
-        options=[r.value for r in Role],
-        index=3,  # manager by default
-        help="Role-based visibility is applied in Operations Control Panel.",
-    )
-    current_user = st.sidebar.text_input(
-        "Current user",
-        value=f"{selected_role}:user-01",
-        help="Used for action workflow audit fields (acknowledge/approve/close).",
-    )
+    current_user, selected_role = _sign_in(cfg)
 
     system_health = fetch_system_health()
     state = str(system_health.get("state", "SAFE") or "SAFE")
@@ -241,6 +272,7 @@ def _render_vision_section(cfg, status_path: str) -> None:
         str(cfg.get("inspection", "review", "dir", default="data/review")),
         str(cfg.get("inspection", "audit", "dir", default="data/audit")),
         required_cameras=required,
+        audit_key_file=cfg.get("inspection", "audit", "key_file", default=None),
     )
     parts = overview.get("parts") or {}
     review = overview.get("review") or {}
@@ -351,6 +383,9 @@ def _render_process_section(cfg, actions_db_path: str) -> None:
             st.dataframe(high[["time", "cycle_id", "risk", "likely_defect", "factors", "failed"]],
                          width="stretch", hide_index=True)
 
+    _render_machine_health(cfg)
+    _render_part_position(cfg)
+
     prescriptions = overview.get("prescriptions") or []
     st.markdown(f"**Setpoint prescriptions awaiting action ({len(prescriptions)})**")
     if prescriptions:
@@ -358,6 +393,43 @@ def _render_process_section(cfg, actions_db_path: str) -> None:
         st.dataframe(prescriptions, width="stretch", hide_index=True)
     else:
         st.caption("No open prescriptions.")
+
+
+def _render_machine_health(cfg) -> None:
+    st.markdown("**Machine health by component**")
+    health = fetch_machine_health(
+        str(cfg.get("process", "db_path", default="data/events/process.db")),
+        cfg.get("process", "components", default=None),
+    )
+    if not health:
+        st.caption("Machine health needs at least 20 baseline cycles.")
+        return
+    icons = {"OK": "🟢", "WATCH": "🟡", "ACT": "🔴"}
+    for column, item in zip(st.columns(len(health)), health):
+        column.metric(f"{icons[item['status']]} {item['component']}", f"{item['health']:.0f}/100",
+                      help=f"Signal {item['signal']}, wear index {item['wear_index']}")
+    st.dataframe(
+        [{"component": h["component"], "status": h["status"], "wear_index": h["wear_index"],
+          "cycles_to_act": h["cycles_to_act"], "signal": h["signal"]} for h in health],
+        width="stretch", hide_index=True,
+    )
+    trend = pd.DataFrame({h["component"]: pd.Series(h["history"]) for h in health})
+    fig = px.line(trend, labels={"index": "cycle", "value": "wear index", "variable": "component"},
+                  title="Wear index per component (higher is worse)")
+    st.plotly_chart(fig, width="stretch")
+    st.caption("cycles_to_act is a straight-line estimate from the recent trend, not a remaining-life prediction.")
+
+
+def _render_part_position(cfg) -> None:
+    st.markdown("**Part-position drift**")
+    position = fetch_part_position(str(cfg.get("process", "db_path", default="data/events/process.db")))
+    if not position:
+        st.caption("No part positions recorded yet.")
+        return
+    st.dataframe(position["summary"], width="stretch", hide_index=True)
+    fig = px.line(position["series"], x="time", y="drift_px", color="camera_id",
+                  title="Part offset from its normal position (pixels)")
+    st.plotly_chart(fig, width="stretch")
 
 
 def _render_esg_section(sqlite_path: str) -> None:
@@ -743,25 +815,14 @@ def _render_operations(cfg, sqlite_path, actions_db_path, status_path, runtime_m
             st.caption("AI Root-Cause Narrative not available for this event.")
 
     if auto_refresh:
-        # Flaw Fix (Issue 5): Keep the timer strictly local to the iframe context.
-        # When Streamlit reruns on user input, this iframe is unmounted, 
-        # naturally clearing the countdown window without violating the browser's Same-Origin Policy.
-        import streamlit.components.v1 as components
-        components.html(
-            """
-            <div style="display: none; width: 0px; height: 0px; visibility: hidden;">
-                <script>
-                    window.setTimeout(function() {
-                        if (window.parent) {
-                            window.parent.postMessage({type: 'streamlit:rerun'}, '*');
-                        }
-                    }, 5000);
-                </script>
-            </div>
-            """,
-            height=0,
-            width=0,
-        )
+        _auto_refresh()
+
+
+@st.fragment(run_every=5)
+def _auto_refresh() -> None:
+    if st.session_state.pop("_refresh_armed", False):
+        st.rerun()
+    st.session_state["_refresh_armed"] = True
 
 
 if __name__ == "__main__":

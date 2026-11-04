@@ -1,14 +1,19 @@
 from __future__ import annotations
 import random
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("PLCAdapter")
 
-# Advisory flag written to holding register 100. The plant's PLC logic decides what to do
-# with it: 0 = clear, 1-3 = rejected part by severity, 4 = part could not be inspected.
-PLC_FLAG_REGISTER = 100
+# Advisory holding registers. The plant's PLC logic decides what to do with every value.
+#   verdict    0 = pass, 1-3 = reject by severity, 4 = part could not be inspected
+#   part       machine cycle counter of that part (16 bit); it changes with every verdict
+#   heartbeat  counts while inspection is healthy; if it stops, treat parts as not inspected
+#   alert      machine-level alert (geometry, vibration) that belongs to no single part
+PLC_REGISTERS = {"verdict": 100, "part": 101, "heartbeat": 102, "alert": 103}
+PLC_PASS = 0
 PLC_FLAG_NOT_INSPECTED = 4
 
 @dataclass
@@ -25,6 +30,11 @@ class PLCAdapter:
 
     def __init__(self, config: PLCAdapterConfig | None = None):
         self.config = config or PLCAdapterConfig()
+        self.registers = {**PLC_REGISTERS, **(self.config.register_map or {})}
+        self.write_failures = 0
+        self._heartbeat = 0
+        self._client = None
+        self._lock = threading.Lock()
 
     @property
     def is_simulated(self) -> bool:
@@ -76,49 +86,78 @@ class PLCAdapter:
             "unit_id": self.config.unit_id,
         }
 
+    def _send(self, address: int, values: list[int]) -> bool:
+        """Write over one persistent connection, reconnecting once if the PLC dropped it."""
+        if self.is_simulated:
+            return True
+        with self._lock:
+            for _attempt in range(2):
+                try:
+                    if self._client is None:
+                        from pymodbus.client import ModbusTcpClient
+
+                        client = ModbusTcpClient(self.config.endpoint or "127.0.0.1", port=self.config.port,
+                                                 timeout=1.5, retries=0)
+                        if not client.connect():
+                            raise ConnectionError(f"cannot reach {self.config.endpoint}:{self.config.port}")
+                        self._client = client
+                    write = self._client.write_register if len(values) == 1 else self._client.write_registers
+                    payload = values[0] if len(values) == 1 else values
+                    try:
+                        # pymodbus >= 3.10 renamed the unit selector from `slave` to `device_id`.
+                        response = write(address, payload, device_id=self.config.unit_id)
+                    except TypeError:
+                        response = write(address, payload, slave=self.config.unit_id)
+                    if hasattr(response, "isError") and response.isError():
+                        raise IOError(str(response))
+                    return True
+                except Exception as e:
+                    logger.warning(f"[Modbus] Write to register {address} failed: {e}")
+                    self.close()
+            self.write_failures += 1
+            logger.error(f"[Modbus] Giving up on register {address}: {self.write_failures} failed writes so far.")
+            return False
+
+    def close(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logger.debug("[Modbus] Client close failed", exc_info=True)
+
+    def write_part_verdict(self, verdict: dict[str, Any]) -> bool:
+        """One verdict for one physical part: flag, then the part number the PLC tracks.
+
+        The part number changing tells the PLC a new verdict is ready. On adjacent registers
+        both go in one Modbus frame, so the PLC can never read a flag with the wrong part.
+        """
+        flag, part = int(verdict["flag"]), int(verdict["part"]) & 0xFFFF
+        logger.info(f"[Modbus] Part {part} {verdict.get('verdict')}: advisory flag {flag}")
+        if self.registers["part"] == self.registers["verdict"] + 1:
+            return self._send(self.registers["verdict"], [flag, part])
+        return self._send(self.registers["verdict"], [flag]) and self._send(self.registers["part"], [part])
+
+    def write_heartbeat(self) -> bool:
+        """Counter the PLC watches: if it stops changing, treat parts as not inspected."""
+        self._heartbeat = (self._heartbeat + 1) & 0xFFFF
+        return self._send(self.registers["heartbeat"], [self._heartbeat])
+
     def write_advisory_flag(self, anomaly_payload: dict[str, Any]) -> bool:
-        """
-        Writes an advisory flag to Modbus TCP holding register 100 with function code
-        0x06 (write_register). Advisory only: the plant's PLC keeps every stop and
-        safety decision, and this class never touches a certified safety function.
-        """
-        # Resolve severity dynamically from both top-level keys and nested diagnostic blocks
+        """Machine-level alert (geometry, vibration) that belongs to no single part."""
         diagnostic = anomaly_payload.get("diagnostic", {})
         if isinstance(diagnostic, dict):
             severity_raw = diagnostic.get("severity", anomaly_payload.get("severity", 1))
         else:
             severity_raw = anomaly_payload.get("severity", 1)
-            
         try:
             severity = int(severity_raw)
         except (ValueError, TypeError):
             severity = 1
-            
-        register_address = PLC_FLAG_REGISTER
         kind = anomaly_payload.get("type", "ADVISORY")
-        camera_id = anomaly_payload.get("camera_id", "unknown")
-        logger.info(f"[Modbus] Advisory flag {kind} from {camera_id}: register {register_address} = {severity} (FC=0x06)")
-        
-        if self.is_simulated:
-            logger.info(f"[Modbus] Simulation mode: register {register_address} write skipped.")
-            return True
-            
-        try:
-            from pymodbus.client import ModbusTcpClient
-            endpoint_ip = self.config.endpoint or "127.0.0.1"
-            client = ModbusTcpClient(endpoint_ip, port=self.config.port, timeout=1.5, retries=0)
-            try:
-                if not client.connect():
-                    logger.error(f"[Modbus] Connection failed to physical industrial node at: {endpoint_ip}")
-                    return False
-                try:
-                    # pymodbus >= 3.10 renamed the unit selector from `slave` to `device_id`.
-                    client.write_register(register_address, severity, device_id=self.config.unit_id)
-                except TypeError:
-                    client.write_register(register_address, severity, slave=self.config.unit_id)
-                return True
-            finally:
-                client.close()
-        except Exception as e:
-            logger.error(f"[Modbus] Failed to write holding register 100 via pyModbus client: {e}")
-            return False
+        logger.info(f"[Modbus] Machine alert {kind} from {anomaly_payload.get('camera_id', 'unknown')}: {severity}")
+        return self._send(self.registers["alert"], [severity])
+
+    def clear(self) -> bool:
+        """Leave no advisory flag set when the runtime stops."""
+        return self._send(self.registers["verdict"], [PLC_PASS]) and self._send(self.registers["alert"], [PLC_PASS])

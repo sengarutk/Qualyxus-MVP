@@ -5,6 +5,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
@@ -309,6 +310,55 @@ def fetch_system_health() -> dict:
 
 
 @st.cache_data(ttl=10)
+def fetch_machine_health(process_db_path: str, components: dict | None = None, *, baseline_cycles: int = 100,
+                         recent_cycles: int = 600) -> list[dict]:
+    """Per-component wear read from the machine cycles (see src.process.machine_health)."""
+    if not Path(process_db_path).exists():
+        return []
+    from src.process.machine_health import assess_machine
+    from src.process.store import ProcessStore
+
+    store = ProcessStore(process_db_path)
+    try:
+        baseline = store.cycle_features(limit=baseline_cycles, newest=False)
+        recent = store.cycle_features(limit=recent_cycles, newest=True)
+    finally:
+        store.close()
+    return [vars(c) for c in assess_machine(baseline, recent, components)]
+
+
+def fetch_part_position(process_db_path: str, *, baseline_parts: int = 30, watch_px: float = 8.0,
+                        watch_deg: float = 3.0) -> dict:
+    """Where parts sit in each camera's frame, and how far that has drifted from normal."""
+    if not Path(process_db_path).exists():
+        return {}
+    from src.process.store import ProcessStore
+
+    store = ProcessStore(process_db_path)
+    try:
+        rows = [dict(r) for r in store.part_positions()]
+    finally:
+        store.close()
+    if not rows:
+        return {}
+    frame = pd.DataFrame(rows)
+    frame["time"] = pd.to_datetime(frame["ts"], unit="s")
+    series, summary = [], []
+    for camera, group in frame.groupby("camera_id"):
+        reference = group.head(baseline_parts)[["pos_x", "pos_y", "pos_angle"]].median()
+        group = group.assign(
+            drift_px=np.hypot(group["pos_x"] - reference["pos_x"], group["pos_y"] - reference["pos_y"]),
+            drift_deg=(group["pos_angle"] - reference["pos_angle"]).abs(),
+        )
+        recent = group.tail(20)
+        drift_px, drift_deg = float(recent["drift_px"].median()), float(recent["drift_deg"].median())
+        summary.append({"camera": camera, "drift_px": round(drift_px, 1), "drift_deg": round(drift_deg, 2),
+                        "status": "WATCH" if drift_px >= watch_px or drift_deg >= watch_deg else "OK",
+                        "parts": len(group)})
+        series.append(group)
+    return {"series": pd.concat(series), "summary": summary}
+
+
 def fetch_process_overview(process_db_path: str, actions_db_path: str, window_hours: float = 8.0) -> dict:
     """Process-quality loop: KPIs, risk timeline and pending prescriptions."""
     if not Path(process_db_path).exists():
@@ -365,7 +415,8 @@ def fetch_process_overview(process_db_path: str, actions_db_path: str, window_ho
 
 @st.cache_data(ttl=15)
 def fetch_vision_overview(status_path: str, process_db_path: str, registry_dir: str | None, review_dir: str,
-                          audit_dir: str, window_hours: float = 8.0, required_cameras: tuple[str, ...] = ()) -> dict:
+                          audit_dir: str, window_hours: float = 8.0, required_cameras: tuple[str, ...] = (),
+                          audit_key_file: str | None = None) -> dict:
     """Vision-model operations: health per camera, registry/shadow, review queue, defect mix, audit."""
     out: dict = {"cameras": [], "registry": [], "requests": [], "shadow": [], "review": {}, "defect_types": [],
                  "parts": {}, "audit": None}
@@ -434,5 +485,5 @@ def fetch_vision_overview(status_path: str, process_db_path: str, registry_dir: 
     if Path(audit_dir).exists():
         from src.inference.audit_log import verify_chain
 
-        out["audit"] = verify_chain(audit_dir)
+        out["audit"] = verify_chain(audit_dir, audit_key_file)
     return out

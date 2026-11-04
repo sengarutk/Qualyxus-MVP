@@ -2,7 +2,6 @@ import asyncio
 import logging
 import signal
 import sys
-from pymodbus.client import ModbusTcpClient
 
 from src.config.vault import ConfigVault
 from src.core.factory_manager import FactoryManager
@@ -163,22 +162,6 @@ class CoreOrchestrator:
                 loop,
             )
 
-    def _execute_blocking_plc_clear(self, plc_ip, plc_port, unit_id=1):
-        """Executed inside an isolated thread worker pool to protect the async loop from GIL locks."""
-        # Maintained Positive Mod: Explicit hard timeout, no reconnect storm during shutdown.
-        client = ModbusTcpClient(plc_ip, port=plc_port, timeout=1.5, retries=0)
-        try:
-            if client.connect():
-                client.write_register(100, 0x0000, device_id=unit_id)
-                logger.info("[Main] Advisory flag cleared on the PLC (register 100 = 0).")
-            else:
-                logger.error("[Main] Could not reach the PLC to clear the advisory flag during shutdown.")
-        except Exception as e:
-            logger.warning("[Main] Advisory flag clear failed: %s", e)
-        finally:
-            # Deterministic connection severing protects file descriptor tables from leaking
-            client.close()
-
     async def shutdown(self):
         if not self.running:
             return
@@ -208,16 +191,13 @@ class CoreOrchestrator:
             except Exception as e:
                 logger.warning("[Main] Pulse server task ended with error: %s", e)
             
-        # Stage 2: Safe-State Hardware (only when a physical PLC endpoint is configured)
-        plc_ip = self.config.get("plc_ip", default=None) or self.config.get("telemetry", "endpoint", default=None)
-        if plc_ip:
-            logger.info("[Main] STAGE 2: Clearing the advisory flag via Modbus (%s)...", plc_ip)
-            plc_port = int(self.config.get("plc_port", default=None) or self.config.get("telemetry", "port", default=502) or 502)
-            unit_id = int(self.config.get("plc_unit_id", default=None) or self.config.get("telemetry", "unit_id", default=1) or 1)
-            await loop.run_in_executor(None, self._execute_blocking_plc_clear, plc_ip, plc_port, unit_id)
-        else:
-            logger.info("[Main] STAGE 2: No PLC endpoint configured (plc_ip / telemetry.endpoint). Nothing to clear.")
-        
+        # Stage 2: leave no advisory flag set on a real PLC
+        adapter = self.camera_manager.telemetry.adapter
+        if not adapter.is_simulated:
+            logger.info("[Main] STAGE 2: Clearing advisory flags on the PLC...")
+            await loop.run_in_executor(None, adapter.clear)
+        adapter.close()
+
         # Stage 3: Evacuate Persistence
         logger.info("[Main] STAGE 3: Evacuating persistent logger queues to SQLite/CSV...")
         

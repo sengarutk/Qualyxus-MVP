@@ -22,7 +22,7 @@ try:
 except ImportError:
     _psutil = None
 
-from src.camera.part_inspection import CompletedPart, PartPresenceTracker
+from src.camera.part_inspection import CompletedPart, PartPresenceTracker, PartVerdictFuser, part_pose
 from src.config.config import Config
 from src.core.factory_manager import FactoryManager
 from src.inference.analysis.geometry_engine import GeometryEngine
@@ -34,7 +34,7 @@ from src.system.disk_monitor import DiskMonitor
 from src.system.resource_monitor import ResourceGovernor
 from src.system.runtime_metrics import RuntimeMetricsLogger
 from src.system.watchdog import WatchdogManager
-from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED
+from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED, PLC_PASS
 from src.telemetry.telemetry_provider import TelemetryProvider
 
 logger = logging.getLogger(__name__)
@@ -371,6 +371,15 @@ class CameraManager:
         self._presence_off_frames = int(inspection_cfg.get("off_frames", 2))
         self.part_trackers: dict[str, PartPresenceTracker] = {}
         self.inspection_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="part-inspection")
+        self.part_fuser = PartVerdictFuser(
+            (str(c.get("id")) for c in (self.raw_config.get("cameras") or [])
+             if c.get("enabled", True) and c.get("required_view")),
+            timeout_s=float((self.raw_config.get("inspection") or {}).get("view_timeout_s", 5.0)),
+        )
+        self.heartbeat_s = float((self.raw_config.get("telemetry") or {}).get("heartbeat_s", 1.0))
+        self._last_heartbeat = 0.0
+        self._part_counter = 0
+        self._inspection_faulted = False
         # Models per recipe (registry-versioned with shadow + hot reload, or explicit config paths).
         from src.inference.inspection_stack import StackProvider
 
@@ -394,7 +403,7 @@ class CameraManager:
         if audit_cfg.get("enabled", True):
             from src.inference.audit_log import InspectionAuditLog
 
-            self.audit_log = InspectionAuditLog(audit_cfg.get("dir", "data/audit"))
+            self.audit_log = InspectionAuditLog(audit_cfg.get("dir", "data/audit"), audit_cfg.get("key_file"))
         self._pool_cfg = inspection_cfg.get("good_pool", {}) or {}
         self._good_pools: dict[str, Any] = {}
         self.process_service = None
@@ -1257,6 +1266,7 @@ class CameraManager:
         detections seen while the part was in view. Any of them failing the part fails it.
         A shadow stack, when registered, judges the same part without affecting the verdict.
         """
+        cycle_id = None
         try:
             frame = part.best_frame
             service = self.process_service
@@ -1296,15 +1306,17 @@ class CameraManager:
             not_inspected = stack.empty and not failed
             verdict = "not_inspected" if not_inspected else ("fail" if failed else "pass")
             normalized = judged.normalized_score
+            self._inspection_faulted = not_inspected
             if failed:
-                self._signal_part("PART_REJECT", state, self._part_severity(anomaly, top, confidence),
-                                  cycle_id=cycle_id, defect_type=defect_type)
+                self._report_view(state, cycle_id, self._part_severity(anomaly, top, confidence))
             elif not_inspected:
-                self._signal_part("PART_NOT_INSPECTED", state, PLC_FLAG_NOT_INSPECTED, cycle_id=cycle_id)
+                self._report_view(state, cycle_id, PLC_FLAG_NOT_INSPECTED)
                 if not state.not_inspected_logged:
                     state.not_inspected_logged = True
                     logger.error("[%s] No inspection model is loaded for recipe '%s': parts are recorded as "
                                  "not_inspected until one is available.", state.camera_id, recipe)
+            else:
+                self._report_view(state, cycle_id, PLC_PASS)
             image_sha = None
             if self.audit_log is not None or shadow is not None or self.review_queue is not None:
                 from src.inference.audit_log import image_sha256
@@ -1366,6 +1378,7 @@ class CameraManager:
                     anomaly_score=normalized,
                     event_id=event_id,
                     alignment=alignment,
+                    position=part_pose(frame),
                 )
             state.parts_inspected += 1
             if failed:
@@ -1373,7 +1386,8 @@ class CameraManager:
         except Exception as e:
             logger.error("[%s] Part inspection failed: %s", state.camera_id, e, exc_info=True)
             state.parts_not_inspected += 1
-            self._signal_part("PART_NOT_INSPECTED", state, PLC_FLAG_NOT_INSPECTED)
+            self._inspection_faulted = True
+            self._report_view(state, cycle_id, PLC_FLAG_NOT_INSPECTED)
 
     @staticmethod
     def _part_severity(anomaly, top, confidence: float | None) -> int:
@@ -1381,13 +1395,40 @@ class CameraManager:
             return 3 if anomaly.normalized_score >= 2.0 else (2 if anomaly.normalized_score >= 1.3 else 1)
         return severity_from_conf(confidence or 0.5)
 
-    def _signal_part(self, kind: str, state: CameraWorkerState, severity: int, **details) -> None:
-        """Queue one part's advisory PLC flag without blocking the inspection worker."""
+    def _report_view(self, state: CameraWorkerState, cycle_id: str | None, flag: int) -> None:
+        verdict = self.part_fuser.add(cycle_id, state.camera_id, int(flag), time.time())
+        if verdict is not None:
+            self._publish_part_verdict(verdict)
+
+    def _publish_part_verdict(self, verdict: dict[str, Any]) -> None:
+        """One physical part's final verdict: queued for the PLC and kept in the audit trail."""
+        cycle_id = verdict["cycle_id"]
+        tail = str(cycle_id).rsplit("-", 1)[-1] if cycle_id else ""
+        self._part_counter = (self._part_counter + 1) & 0xFFFF
+        part = int(tail) if tail.isdigit() else self._part_counter
+        signal = {**verdict, "type": "PART_VERDICT", "part": part & 0xFFFF, "timestamp": time.time()}
+        if verdict["verdict"] != "pass" and verdict["missing"]:
+            logger.warning("[Inspection] Part %s %s: no result from %s", part, verdict["verdict"], verdict["missing"])
+        if self.audit_log is not None:
+            self.audit_log.append({"ts": signal["timestamp"], "record": "part_verdict", "part": signal["part"],
+                                   "cycle_id": cycle_id, "verdict": verdict["verdict"], "flag": verdict["flag"],
+                                   "views": verdict["views"], "missing_views": verdict["missing"]})
         try:
-            self.fast_queue.put_nowait({"type": kind, "camera_id": state.camera_id, "timestamp": time.time(),
-                                        "severity": int(severity), **details})
+            self.fast_queue.put_nowait(signal)
         except queue.Full:
-            logger.error("[%s] Reflex queue full: %s flag dropped.", state.camera_id, kind)
+            logger.error("[Inspection] Reflex queue full: verdict for part %s dropped.", part)
+
+    def _reflex_tick(self, adapter) -> None:
+        """Close parts whose views timed out, and keep the PLC heartbeat moving."""
+        now = time.time()
+        for verdict in self.part_fuser.expired(now):
+            self._publish_part_verdict(verdict)
+        if adapter is not None and not self._inspection_faulted and now - self._last_heartbeat >= self.heartbeat_s:
+            self._last_heartbeat = now
+            try:
+                self.plc_executor.submit(adapter.write_heartbeat)
+            except RuntimeError:
+                pass  # shutting down
 
     def _update_model_health(self, camera_id: str, recipe: str, stack, normalized: float | None, failed: bool) -> None:
         det = stack.anomaly
@@ -1540,16 +1581,19 @@ class CameraManager:
     # ------------------------------------------------------------------
 
     def _reflex_worker(self):
+        adapter = getattr(self.telemetry, "adapter", None)
         while not self.shutdown_event.is_set():
+            self._reflex_tick(adapter)
             try:
-                signal_data = self.fast_queue.get(timeout=0.5)
+                signal_data = self.fast_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
             try:
-                adapter = getattr(self.telemetry, "adapter", None)
                 if adapter is not None:
+                    write = adapter.write_part_verdict if signal_data.get("type") == "PART_VERDICT" \
+                        else adapter.write_advisory_flag
                     try:
-                        self.plc_executor.submit(adapter.write_advisory_flag, signal_data)
+                        self.plc_executor.submit(write, signal_data)
                     except RuntimeError:
                         pass
 

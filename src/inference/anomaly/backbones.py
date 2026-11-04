@@ -24,7 +24,9 @@ export ``HF_TOKEN`` before selecting them. They are opt-in because the license i
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import cv2
@@ -49,6 +51,11 @@ VIT_CHECKPOINTS: dict[str, tuple[str, str]] = {
     "dinov3_vitl16": ("facebook/dinov3-vitl16-pretrain-lvd1689m", "DINOv3-License"),
 }
 CNN_BACKBONES = ("wide_resnet50_2", "resnet18")
+
+
+def bundle_dir() -> Path:
+    """Where bundled backbones live (see src.inference.anomaly.bundle)."""
+    return Path(os.getenv("QUALYXUS_BACKBONE_DIR") or Path(__file__).resolve().parents[3] / "models" / "backbones")
 
 
 def is_vit(name: str) -> bool:
@@ -111,7 +118,11 @@ class ViTBackbone(torch.nn.Module):
         if license_name != "Apache-2.0":
             logger.warning("[Backbone] %s is distributed under %s - verify it permits your use.", name, license_name)
         self.name = name
-        self.model = AutoModel.from_pretrained(checkpoint).eval()
+        local = bundle_dir() / name
+        if (local / "config.json").exists():
+            self.model = AutoModel.from_pretrained(local, local_files_only=True).eval()
+        else:
+            self.model = AutoModel.from_pretrained(checkpoint).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
         cfg = self.model.config
@@ -148,7 +159,11 @@ class CNNBackbone(torch.nn.Module):
         super().__init__()
         import torchvision
 
-        if name == "wide_resnet50_2":
+        local = bundle_dir() / f"{name}.pth"
+        if local.exists() and name in CNN_BACKBONES:
+            model = getattr(torchvision.models, name)(weights=None)
+            model.load_state_dict(torch.load(local, map_location="cpu", weights_only=True))
+        elif name == "wide_resnet50_2":
             model = torchvision.models.wide_resnet50_2(weights=torchvision.models.Wide_ResNet50_2_Weights.IMAGENET1K_V1)
         elif name == "resnet18":
             model = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)

@@ -287,6 +287,7 @@ class ProcessIntelligenceService:
         part_id: str | None = None,
         source: str = "vision",
         alignment: AlignmentResult | None = None,
+        position: tuple[float, float, float] | None = None,
     ) -> InspectionRecord:
         if verdict not in (PASS, FAIL):
             raise ValueError(f"verdict must be '{PASS}' or '{FAIL}', got {verdict!r}")
@@ -303,6 +304,9 @@ class ProcessIntelligenceService:
             cycle_id=alignment.cycle_id,
             alignment_confidence=alignment.confidence if alignment.cycle_id else None,
             source=source,
+            pos_x=position[0] if position else None,
+            pos_y=position[1] if position else None,
+            pos_angle=position[2] if position else None,
         ))
         if alignment.cycle_id:
             with self._lock:

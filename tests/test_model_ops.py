@@ -11,6 +11,7 @@ from typing import Any
 import cv2
 import numpy as np
 import pytest
+import torch
 
 from src.inference.anomaly.base import AnomalyDetector
 from src.process.synthetic_parts import BACKGROUND, render_part
@@ -316,7 +317,7 @@ class _StubStack:
 
 def test_inspect_part_records_shadow_audit_review_and_pool(tmp_path):
     from src.camera.camera_manager import CameraManager, CameraWorkerState
-    from src.camera.part_inspection import CompletedPart
+    from src.camera.part_inspection import CompletedPart, PartVerdictFuser
     from src.inference.anomaly.monitoring import ReviewQueue
     from src.inference.audit_log import InspectionAuditLog, verify_chain
     from src.inference.model_registry import VisionModelRegistry
@@ -340,6 +341,8 @@ def test_inspect_part_records_shadow_audit_review_and_pool(tmp_path):
     cm._pool_cfg = {"dir": str(tmp_path / "pool"), "every_n": 1}
     cm._good_pools, cm.model_health, cm._health_cfg, cm.retrain_on_drift = {}, {}, {}, True
     recorded: list[Any] = []
+    cm.fast_queue, cm.part_fuser = queue.Queue(), PartVerdictFuser()
+    cm._part_counter, cm._inspection_faulted = 0, False
     cm._record_new_defect = lambda *a, **k: recorded.append(k) or True
     cm._telemetry_context = lambda *a, **k: None
 
@@ -351,8 +354,9 @@ def test_inspect_part_records_shadow_audit_review_and_pool(tmp_path):
     rep = reg.shadow_report("housing", review_dir=None, version="v0002")
     assert rep["parts"] == 1 and rep["shadow_only_rejects"] == 1
     audit = verify_chain(tmp_path / "audit")
-    assert audit["ok"] and audit["records"] == 1
-    rec = json.loads(next((tmp_path / "audit").glob("*.jsonl")).read_text())
+    assert audit["ok"] and audit["records"] == 2    # the view's evidence + the part's final verdict
+    lines = [json.loads(line) for line in next((tmp_path / "audit").glob("*.jsonl")).read_text().splitlines()]
+    rec = next(r for r in lines if r.get("record") != "part_verdict")
     assert rec["models"]["anomaly"]["version"] == "v0001" and rec["shadow"]["verdict"] == "fail"
     assert rec["image_sha256"] and len(list((tmp_path / "pool" / "housing").glob("*.png"))) == 1
     assert cm._health_status["cam"]["models"] == {"anomaly": "v0001"}
@@ -414,6 +418,7 @@ def test_approved_retrain_trains_on_the_pool_and_registers_a_shadow(tmp_path):
 
 def _reject_path_manager(tmp_path, stack):
     from src.camera.camera_manager import CameraManager, CameraWorkerState
+    from src.camera.part_inspection import PartVerdictFuser
     from src.inference.audit_log import InspectionAuditLog
 
     class Provider:
@@ -432,6 +437,8 @@ def _reject_path_manager(tmp_path, stack):
     cm._pool_cfg = {"dir": str(tmp_path / "pool"), "every_n": 1}
     cm._good_pools, cm.model_health, cm._health_cfg, cm.retrain_on_drift = {}, {}, {}, False
     cm.fast_queue = queue.Queue(maxsize=20)
+    cm.part_fuser = PartVerdictFuser()
+    cm._part_counter, cm._inspection_faulted = 0, False
     cm._record_new_defect = lambda *a, **k: True
     cm._telemetry_context = lambda *a, **k: None
     return cm, CameraWorkerState("cam", "s", None, queue.Queue(), queue.Queue(), threading.Event())
@@ -444,15 +451,16 @@ def test_failed_part_raises_the_advisory_plc_flag(tmp_path):
     cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
     assert state.parts_failed == 1
     signal = cm.fast_queue.get_nowait()
-    assert signal["type"] == "PART_REJECT" and 1 <= signal["severity"] <= 3
+    assert signal["verdict"] == "fail" and 1 <= signal["flag"] <= 3
 
 
-def test_passed_part_raises_no_flag(tmp_path):
+def test_passed_part_reports_a_clear_flag_with_its_number(tmp_path):
     from src.camera.part_inspection import CompletedPart
 
     cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
     cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
-    assert state.parts_inspected == 1 and cm.fast_queue.empty()
+    signal = cm.fast_queue.get_nowait()
+    assert state.parts_inspected == 1 and signal["verdict"] == "pass" and signal["flag"] == 0 and signal["part"] == 1
 
 
 def test_part_with_no_model_is_not_passed(tmp_path):
@@ -468,9 +476,9 @@ def test_part_with_no_model_is_not_passed(tmp_path):
     assert (state.parts_inspected, state.parts_failed, state.parts_not_inspected) == (0, 0, 1)
     assert not (tmp_path / "pool").exists() or not list((tmp_path / "pool").rglob("*.png"))
     signal = cm.fast_queue.get_nowait()
-    assert signal["type"] == "PART_NOT_INSPECTED" and signal["severity"] == PLC_FLAG_NOT_INSPECTED
+    assert signal["verdict"] == "not_inspected" and signal["flag"] == PLC_FLAG_NOT_INSPECTED
     records = [json.loads(line) for f in (tmp_path / "audit").glob("*.jsonl") for line in f.read_text().splitlines()]
-    assert [r["verdict"] for r in records] == ["not_inspected"]
+    assert {r["verdict"] for r in records} == {"not_inspected"}
 
 
 def test_inspection_crash_flags_the_part_instead_of_losing_it(tmp_path):
@@ -483,35 +491,305 @@ def test_inspection_crash_flags_the_part_instead_of_losing_it(tmp_path):
     cm, state = _reject_path_manager(tmp_path, Broken(False, "v0001", 0.4))
     cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
     assert state.parts_not_inspected == 1
-    assert cm.fast_queue.get_nowait()["type"] == "PART_NOT_INSPECTED"
+    assert cm.fast_queue.get_nowait()["verdict"] == "not_inspected"
 
 
-def test_advisory_flag_reaches_a_real_modbus_socket():
-    """The reject flag crosses a real TCP socket as a Modbus 0x06 write, on the configured port."""
+def _modbus_recorder():
+    """A real TCP server that answers Modbus writes and records them."""
     import socket
     import struct
 
-    from src.telemetry.plc_adapter import PLCAdapter, PLCAdapterConfig
-
     server = socket.create_server(("127.0.0.1", 0))
-    port = server.getsockname()[1]
-    writes: list[tuple[int, int, int]] = []
+    frames: list[tuple[int, int, list[int]]] = []
 
     def serve():
         conn, _ = server.accept()
         with conn:
-            request = conn.recv(12)
-            function, register, value = struct.unpack(">BHH", request[7:12])
-            writes.append((function, register, value))
-            conn.sendall(request)  # a Modbus 0x06 response echoes the request
+            while True:
+                header = conn.recv(7)
+                if len(header) < 7:
+                    return
+                body = conn.recv(struct.unpack(">H", header[4:6])[0] - 1)
+                function, address = body[0], struct.unpack(">H", body[1:3])[0]
+                if function == 0x06:
+                    frames.append((function, address, [struct.unpack(">H", body[3:5])[0]]))
+                    conn.sendall(header + body)
+                else:  # 0x10 write multiple
+                    count = struct.unpack(">H", body[3:5])[0]
+                    frames.append((function, address, list(struct.unpack(f">{count}H", body[6:6 + 2 * count]))))
+                    reply = body[:5]
+                    conn.sendall(header[:4] + struct.pack(">H", len(reply) + 1) + header[6:7] + reply)
 
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
-    adapter = PLCAdapter(PLCAdapterConfig(mode="plc", endpoint="127.0.0.1", port=port))
-    assert adapter.write_advisory_flag({"type": "PART_REJECT", "severity": 3}) is True
+    return server, frames, worker
+
+
+def test_part_verdict_writes_flag_and_part_number_in_one_frame_on_a_real_socket():
+    from src.telemetry.plc_adapter import PLCAdapter, PLCAdapterConfig
+
+    server, frames, worker = _modbus_recorder()
+    adapter = PLCAdapter(PLCAdapterConfig(mode="plc", endpoint="127.0.0.1", port=server.getsockname()[1]))
+    assert adapter.write_part_verdict({"verdict": "fail", "flag": 3, "part": 70001})
+    assert adapter.write_heartbeat() and adapter.write_heartbeat()
+    assert adapter.write_advisory_flag({"type": "GEOMETRIC_CRITICAL", "severity": 2})
+    adapter.close()
     worker.join(timeout=2)
     server.close()
-    assert writes == [(0x06, 100, 3)]
+    assert frames == [(0x10, 100, [3, 70001 & 0xFFFF]), (0x06, 102, [1]), (0x06, 102, [2]), (0x06, 103, [2])]
+
+
+def test_plc_write_failure_is_counted_not_raised():
+    from src.telemetry.plc_adapter import PLCAdapter, PLCAdapterConfig
+
+    adapter = PLCAdapter(PLCAdapterConfig(mode="plc", endpoint="127.0.0.1", port=1))
+    assert adapter.write_heartbeat() is False and adapter.write_failures == 1
+
+
+def test_fuser_gives_one_verdict_per_part_and_times_out_a_dead_camera():
+    from src.camera.part_inspection import PartVerdictFuser
+
+    fuser = PartVerdictFuser(["top", "side"], timeout_s=5.0)
+    assert fuser.add("c1", "top", 0, 0.0) is None
+    assert fuser.add("c1", "side", 0, 1.0)["verdict"] == "pass"
+
+    assert fuser.add("c2", "top", 0, 2.0) is None
+    failed = fuser.add("c2", "side", 2, 3.0)
+    assert failed["verdict"] == "fail" and failed["flag"] == 2
+
+    assert fuser.add("c3", "top", 0, 10.0) is None
+    assert fuser.expired(14.9) == []
+    late = fuser.expired(15.0)
+    assert late[0]["verdict"] == "not_inspected" and late[0]["flag"] == 4 and late[0]["missing"] == ["side"]
+    assert fuser.add("c3", "side", 0, 16.0) is None       # too late: no second verdict
+
+    assert fuser.add("c4", "top", 1, 20.0) is None        # a timed-out view still cannot hide a fail
+    assert fuser.expired(25.0)[0]["verdict"] == "fail"
+
+
+def test_fuser_without_required_views_is_a_single_camera_station():
+    from src.camera.part_inspection import PartVerdictFuser
+
+    fuser = PartVerdictFuser()
+    assert fuser.add(None, "cam", 0, 0.0)["verdict"] == "pass"
+    assert fuser.add("c1", "cam", 3, 0.0)["flag"] == 3
+
+
+def test_unlinked_view_of_a_multi_view_part_is_never_a_pass():
+    from src.camera.part_inspection import PartVerdictFuser
+
+    fuser = PartVerdictFuser(["top", "side"])
+    assert fuser.add(None, "top", 0, 0.0)["verdict"] == "not_inspected"
+
+
+def _audit_with(tmp_path, n=5):
+    from src.inference.audit_log import InspectionAuditLog, verify_chain
+
+    directory = tmp_path / "audit"
+    log = InspectionAuditLog(directory)
+    for i in range(n):
+        log.append({"part": i, "verdict": "pass"})
+    assert verify_chain(directory) == {"ok": True, "records": n, "head": log._last_hash}
+    return directory, verify_chain
+
+
+def test_audit_detects_deleting_the_newest_records(tmp_path):
+    directory, verify = _audit_with(tmp_path)
+    log_file = next(directory.glob("*.jsonl"))
+    log_file.write_text("\n".join(log_file.read_text().splitlines()[:3]) + "\n")
+    result = verify(directory)
+    assert not result["ok"] and "2 newest records are missing" in result["error"]
+
+
+def test_audit_detects_a_fully_rebuilt_chain_without_the_key(tmp_path):
+    import hashlib
+
+    directory, verify = _audit_with(tmp_path)
+    log_file = next(directory.glob("*.jsonl"))
+    prev, lines = "0" * 64, []
+    for line in log_file.read_text().splitlines():
+        rec = json.loads(line)
+        rec["verdict"], rec["prev_hash"] = "fail", prev
+        body = {k: v for k, v in rec.items() if k != "hash"}
+        rec["hash"] = prev = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+        lines.append(json.dumps(rec, sort_keys=True))
+    log_file.write_text("\n".join(lines) + "\n")
+    assert not verify(directory)["ok"]
+
+
+def test_audit_detects_a_deleted_or_edited_anchor(tmp_path):
+    from src.inference.audit_log import anchor_path
+
+    directory, verify = _audit_with(tmp_path)
+    anchor = anchor_path(directory)
+    payload = json.loads(anchor.read_text())
+    anchor.write_text(json.dumps({**payload, "records": 2}))
+    assert "altered" in verify(directory)["error"]
+    anchor.unlink()
+    assert "anchor file missing" in verify(directory)["error"]
+
+
+def test_audit_chain_survives_records_stamped_before_the_current_day(tmp_path):
+    from src.inference.audit_log import InspectionAuditLog, verify_chain
+
+    log = InspectionAuditLog(tmp_path / "audit")
+    log.append({"ts": time.time(), "verdict": "pass"})
+    log.append({"ts": time.time() - 3 * 86400, "verdict": "pass"})
+    assert verify_chain(tmp_path / "audit")["records"] == 2
+
+
+def test_audit_log_continues_its_chain_after_a_restart(tmp_path):
+    from src.inference.audit_log import InspectionAuditLog
+
+    directory, verify = _audit_with(tmp_path)
+    InspectionAuditLog(directory).append({"part": 9, "verdict": "pass"})
+    assert verify(directory)["records"] == 6
+
+
+def test_accounts_check_password_lock_out_and_never_store_it(tmp_path):
+    from src.operations.auth import LOCKOUT_S, MAX_FAILURES, UserStore
+
+    path = tmp_path / "users.json"
+    store = UserStore(path)
+    assert not store.has_users()
+    with pytest.raises(ValueError):
+        store.add("ravi", "short", "QA")
+    with pytest.raises(ValueError):
+        store.add("ravi", "long enough password", "owner")
+    store.add("ravi", "long enough password", "QA")
+    assert "long enough password" not in path.read_text() and oct(path.stat().st_mode)[-3:] == "600"
+
+    assert store.authenticate("ravi", "long enough password", now=0.0) == "QA"
+    assert store.authenticate("nobody", "long enough password", now=0.0) is None
+    for _ in range(MAX_FAILURES):
+        assert store.authenticate("ravi", "wrong password!", now=10.0) is None
+    assert store.authenticate("ravi", "long enough password", now=11.0) is None
+    assert store.authenticate("ravi", "long enough password", now=10.0 + LOCKOUT_S + 1) == "QA"
+
+
+def test_dashboard_needs_a_login_once_accounts_exist(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    from src.operations.auth import UserStore
+
+    users = tmp_path / "users.json"
+    UserStore(users).add("ravi", "long enough password", "QA")
+    config = tmp_path / "config.yaml"
+    config.write_text(f"logging: {{sqlite_path: {tmp_path}/events.db}}\ndashboard: {{users_file: {users}}}\n")
+    monkeypatch.setenv("CONFIG_PATH", str(config))
+
+    at = AppTest.from_file("src/dashboard/app.py", default_timeout=30).run()
+    assert not at.exception and at.subheader[0].value == "Sign in" and not at.metric
+    at.text_input[0].set_value("ravi")
+    at.text_input[1].set_value("wrong password!")
+    at.button[0].click()
+    at.run()
+    assert at.error and "auth" not in at.session_state
+    at.text_input[1].set_value("long enough password")
+    at.button[0].click()
+    at.run()
+    assert at.session_state["auth"]["role"] == "QA" and not at.exception
+
+
+def test_dashboard_renders_machine_health_and_position_from_real_records(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    from src.logging.event_logger import EventLogger
+    from src.process.features import CycleFeatureExtractor
+    from src.process.models import InspectionRecord
+    from src.process.simulator import InjectionMoldingSimulator
+    from src.process.store import ProcessStore
+
+    EventLogger(sqlite_path=str(tmp_path / "events.db"), csv_path=str(tmp_path / "e.csv"))._init_db()
+    store = ProcessStore(tmp_path / "process.db")
+    sim, extractor, now = InjectionMoldingSimulator(seed=3), CycleFeatureExtractor(), time.time()
+    for i in range(60):
+        cycle, _ = sim.next_cycle(start_ts=now - 600 + i)
+        store.save_cycle(cycle, extractor.extract(cycle))
+        store.save_inspection(InspectionRecord("", "cam", cycle.end_ts, "pass", cycle_id=cycle.cycle_id,
+                                               pos_x=300.0 + i, pos_y=200.0, pos_angle=0.0))
+    store.close()
+    config = tmp_path / "config.yaml"
+    config.write_text(f"logging: {{sqlite_path: {tmp_path}/events.db}}\n"
+                      f"process: {{enabled: true, db_path: {tmp_path}/process.db}}\n"
+                      f"dashboard: {{users_file: {tmp_path}/users.json}}\n"
+                      f"esg_params: {{enabled: false}}\n")
+    monkeypatch.setenv("CONFIG_PATH", str(config))
+
+    at = AppTest.from_file("src/dashboard/app.py", default_timeout=60).run()
+    assert not at.exception, [e.message for e in at.exception]
+    assert any("/100" in str(m.value) for m in at.metric)
+    assert "**Part-position drift**" in [m.value for m in at.markdown]
+
+
+def test_bundled_vit_backbone_loads_with_no_hub_access(tmp_path, monkeypatch):
+    from transformers import Dinov2Config, Dinov2Model
+
+    from src.inference.anomaly.backbones import ViTBackbone
+
+    tiny = Dinov2Config(hidden_size=24, num_hidden_layers=2, num_attention_heads=2, image_size=56, patch_size=14)
+    Dinov2Model(tiny).save_pretrained(tmp_path / "dinov2_vits14")
+    monkeypatch.setenv("QUALYXUS_BACKBONE_DIR", str(tmp_path))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty"))
+    assert ViTBackbone("dinov2_vits14", device=torch.device("cpu")).embed_dim == 24
+
+
+def test_machine_health_follows_hidden_wear_in_the_simulator():
+    from src.process.features import CycleFeatureExtractor
+    from src.process.machine_health import assess_machine
+    from src.process.simulator import InjectionMoldingSimulator
+
+    sim, extractor = InjectionMoldingSimulator(seed=11), CycleFeatureExtractor()
+    rows, truth = [], {"Heater bands": [], "Check ring": [], "Mould cooling": []}
+    for i in range(4000):
+        cycle, outcome = sim.next_cycle(start_ts=float(i))
+        rows.append(extractor.extract(cycle))
+        truth["Heater bands"].append(-outcome.hidden_state["heater_offset"])
+        truth["Check ring"].append(outcome.hidden_state["check_ring_wear"])
+        truth["Mould cooling"].append(outcome.hidden_state["cooling_fouling"])
+    health = {c.component: c for c in assess_machine(rows[:100], rows)}
+    for name, wear in truth.items():
+        assert np.corrcoef(health[name].history, wear)[0, 1] > 0.85, name
+    assert {c.status for c in health.values()} <= {"OK", "WATCH", "ACT"}
+
+
+def test_machine_health_ignores_an_intentional_setpoint_change_and_missing_signals():
+    from src.process.machine_health import assess_component, assess_machine
+
+    spec = {"signal": "melt", "setpoint": "sp", "direction": -1.0}
+    rng = np.random.default_rng(0)
+    base = [{"melt": 230 + rng.normal(0, 0.8), "sp": 230.0} for _ in range(100)]
+    moved = [{"melt": 245 + rng.normal(0, 0.8), "sp": 245.0} for _ in range(100)]
+    assert assess_component("x", spec, base, moved).status == "OK"
+    worn = [{"melt": 212 + rng.normal(0, 0.8), "sp": 230.0} for _ in range(100)]
+    assert assess_component("x", spec, base, worn).status == "ACT"
+    assert assess_machine(base, moved, {"y": {"signal": "not_reported"}}) == []
+
+
+def test_part_pose_reads_position_and_angle_from_the_frame():
+    from src.camera.part_inspection import part_pose
+
+    frame = np.full((480, 640, 3), 40, np.uint8)
+    box = cv2.boxPoints(((400.0, 200.0), (300.0, 120.0), 10.0)).astype(np.int32)
+    cv2.fillPoly(frame, [box], (180, 180, 180))
+    x, y, angle = part_pose(frame)
+    assert abs(x - 400) < 3 and abs(y - 200) < 3 and abs(angle - 10) < 2
+    assert part_pose(np.full((480, 640, 3), 40, np.uint8)) is None
+
+
+def test_part_position_drift_is_reported_per_camera(tmp_path, monkeypatch):
+    from src.dashboard.data_access import fetch_part_position
+    from src.process.models import InspectionRecord
+    from src.process.store import ProcessStore
+
+    store = ProcessStore(tmp_path / "p.db")
+    for i in range(80):
+        x = 300.0 if i < 50 else 300.0 + (i - 50)
+        store.save_inspection(InspectionRecord("", "cam", float(i), "pass", pos_x=x, pos_y=200.0, pos_angle=0.0))
+    store.close()
+    summary = fetch_part_position(str(tmp_path / "p.db"))["summary"][0]
+    assert summary["camera"] == "cam" and summary["status"] == "WATCH" and summary["drift_px"] > 15
 
 
 def test_one_view_catches_a_defect_on_its_face_only():

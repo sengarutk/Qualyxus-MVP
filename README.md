@@ -37,6 +37,41 @@ Configure it in the `process:`, `inspection:` and per-camera `process_link:` sec
 map the signals (examples are in `config.yaml`); calibrate the camera's transport delay
 with `src.process.alignment.estimate_transport_delay`.
 
+## Running on a plant network
+
+**Air-gapped install.** Bundle the backbones on a connected machine, then ship `models/`:
+
+```bash
+python -m src.inference.anomaly.bundle --model models/anomaly/<recipe>.pt --verify
+```
+
+`--verify` reloads the model the way a clean disconnected box would, with an empty download
+cache and the model hubs disabled. The Docker image keeps hub access off at runtime.
+
+**Accounts.** Until an account exists the dashboard is read-only. Once one exists, everyone
+must sign in, and the account sets the role:
+
+```bash
+python -m src.operations.auth add <name> --role QA
+```
+
+**PLC contract.** Advisory holding registers (override with `telemetry.register_map`; set
+`telemetry.mode: plc` and `telemetry.endpoint` to write to a real PLC):
+
+| Register | Meaning |
+|---|---|
+| 100 | Part verdict: 0 pass, 1-3 reject by severity, 4 could not be inspected |
+| 101 | Machine cycle counter of that part (changes with every verdict; written with 100 in one frame) |
+| 102 | Heartbeat counter: stops when inspection is unhealthy, so treat parts as not inspected |
+| 103 | Machine-level alert (geometry, vibration) that belongs to no single part |
+
+Each physical part gets one verdict. On a multi-camera station a part passes only when every
+`required_view` has passed it; a view missing after `inspection.view_timeout_s` gives flag 4.
+
+**Audit trail.** Records are chained with a keyed hash, and `data/audit.anchor.json` catches
+deleted newest records. Keep `inspection.audit.key_file` away from the log on a real line, and
+copy the anchor off the box regularly.
+
 ## Vision model stack
 
 | Role | Models | License | When |

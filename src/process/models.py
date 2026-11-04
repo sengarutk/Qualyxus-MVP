@@ -52,6 +52,9 @@ class InspectionRecord:
     cycle_id: str | None = None
     alignment_confidence: float | None = None
     source: str = "vision"  # "vision" | "audit"
+    pos_x: float | None = None        # part centre in the frame, pixels
+    pos_y: float | None = None
+    pos_angle: float | None = None    # degrees
 
 
 @dataclass

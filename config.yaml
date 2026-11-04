@@ -61,6 +61,7 @@ telemetry:
   endpoint: null
   port: 502
   unit_id: 1
+  heartbeat_s: 1.0
   register_map: null
 
 hardware_acceleration:
@@ -251,6 +252,8 @@ inspection:
   audit:
     enabled: true
     dir: "data/audit"
+    # Keep this away from the log on a real line: whoever holds it can rewrite the trail.
+    key_file: "secrets/audit.key"
   # Sampled confidently-good parts per recipe: the training set for approved retraining.
   good_pool:
     enabled: true
@@ -265,6 +268,8 @@ inspection:
     enabled: true
     dir: "data/review"
     band: [0.8, 1.25]
+  # A part is not_inspected if a required_view has not reported this long after the first one.
+  view_timeout_s: 5.0
   presence_std_threshold: 2.2
   on_frames: 2
   off_frames: 2

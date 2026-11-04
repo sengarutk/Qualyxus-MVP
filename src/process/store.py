@@ -46,7 +46,10 @@ CREATE TABLE IF NOT EXISTS inspections (
     event_id      TEXT,
     cycle_id      TEXT,
     alignment_confidence REAL,
-    source        TEXT NOT NULL DEFAULT 'vision'
+    source        TEXT NOT NULL DEFAULT 'vision',
+    pos_x         REAL,
+    pos_y         REAL,
+    pos_angle     REAL
 );
 CREATE INDEX IF NOT EXISTS idx_inspections_cycle ON inspections(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_inspections_ts ON inspections(ts);
@@ -105,6 +108,10 @@ class ProcessStore:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._conn.executescript(_SCHEMA)
+        columns = {r[1] for r in self._conn.execute("PRAGMA table_info(inspections)")}
+        for column in ("pos_x", "pos_y", "pos_angle"):
+            if column not in columns:
+                self._conn.execute(f"ALTER TABLE inspections ADD COLUMN {column} REAL")
         self._conn.commit()
 
     def close(self) -> None:
@@ -211,13 +218,13 @@ class ProcessStore:
             """
             INSERT OR REPLACE INTO inspections (
                 inspection_id, camera_id, ts, verdict, defect_type, anomaly_score, event_id,
-                cycle_id, alignment_confidence, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cycle_id, alignment_confidence, source, pos_x, pos_y, pos_angle
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.inspection_id, record.camera_id, float(record.ts), record.verdict,
                 record.defect_type, record.anomaly_score, record.event_id, record.cycle_id,
-                record.alignment_confidence, record.source,
+                record.alignment_confidence, record.source, record.pos_x, record.pos_y, record.pos_angle,
             ),
         )
         return record
@@ -298,6 +305,20 @@ class ProcessStore:
                         "missing_views": missing, "audited": p["audit"] is not None,
                         "defect_types": sorted(set(p["defect_types"]))})
         return out
+
+    def part_positions(self, limit: int = 600) -> list[sqlite3.Row]:
+        """Measured part pose of the latest inspections, oldest first."""
+        rows = self._query(
+            "SELECT camera_id, ts, pos_x, pos_y, pos_angle FROM inspections "
+            "WHERE pos_x IS NOT NULL ORDER BY ts DESC LIMIT ?", (int(limit),))
+        return list(reversed(rows))
+
+    def cycle_features(self, *, limit: int, newest: bool) -> list[dict[str, float]]:
+        """Feature rows of the first or latest ``limit`` cycles, oldest first."""
+        order = "DESC" if newest else "ASC"
+        rows = self._query(f"SELECT features FROM process_cycles ORDER BY end_ts {order} LIMIT ?", (int(limit),))
+        out = [json.loads(r["features"]) for r in rows]
+        return list(reversed(out)) if newest else out
 
     def inspections_between(self, ts_from: float, ts_to: float) -> list[sqlite3.Row]:
         return self._query("SELECT * FROM inspections WHERE ts BETWEEN ? AND ? ORDER BY ts", (ts_from, ts_to))
