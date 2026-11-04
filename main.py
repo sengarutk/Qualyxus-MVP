@@ -106,30 +106,12 @@ class CoreOrchestrator:
         logger.info("[Main] Spawning background execution daemons...")
         self.t_pulse = asyncio.create_task(self.pulse_server.run_async(), name="PulseServer_Daemon")
         
-        # Create a monitoring task for our centralized shutdown event
-        shutdown_monitor = asyncio.create_task(self.shutdown_trigger_event.wait(), name="Shutdown_Monitor")
-        
         logger.info("[Main] Primary edge intelligence pipeline fully engaged.")
-        
+
+        # The API is a convenience: if it dies, inspection keeps running.
+        self.t_pulse.add_done_callback(_report_api_end)
         try:
-            done, pending = await asyncio.wait(
-                [self.t_pulse, shutdown_monitor], 
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            # Evaluate loop status safely without triggering CancelledError panics
-            for task in done:
-                if task.get_name() != "Shutdown_Monitor" and not task.cancelled():
-                    exc = task.exception()
-                    if exc:
-                        logger.critical("[Main] FATAL DAEMON CRASH DETECTED: %s", exc, exc_info=exc)
-                        break
-            
-            # Only the shutdown monitor is cancelled here; the daemons are stopped
-            # gracefully (in order) by shutdown().
-            if not shutdown_monitor.done():
-                shutdown_monitor.cancel()
-                        
+            await self.shutdown_trigger_event.wait()
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.warning("[Main] Operator interrupt intercepted. Engaging execution barrier bypass.")
             self.shutdown_trigger_event.set()
@@ -217,9 +199,21 @@ class CoreOrchestrator:
         self.factory_manager.shutdown_singletons()
         logger.info("[Main] Core shutdown sequence complete. Process exiting cleanly.")
 
+def _report_api_end(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("[Main] Telemetry API crashed; inspection continues: %s", task.exception())
+
+
+def _ignore_cancelled_callbacks(loop, context) -> None:
+    """The MQTT client's reconnect timer ends in a CancelledError if shutdown catches it waiting."""
+    if not isinstance(context.get("exception"), asyncio.CancelledError):
+        loop.default_exception_handler(context)
+
+
 async def main():
     orchestrator = CoreOrchestrator()
     loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_ignore_cancelled_callbacks)
     
     def _shutdown_handler():
         logger.warning("[Main] Intercepted OS termination signal. Priming shutdown sequence.")

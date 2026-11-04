@@ -214,6 +214,10 @@ class PulseServer:
         
         try:
             await self.server.serve()
+        except SystemExit:
+            # uvicorn exits the process when it cannot bind. The API is optional; inspection is not.
+            logger.error("[PulseServer] Cannot listen on %s:%d. Telemetry API is off; inspection continues.",
+                         self.host, self.port)
         except asyncio.CancelledError:
             # Hardening Guard: Intercept the master loop's raw task cancellation
             logger.warning("[PulseServer] Task cancellation intercepted. Diverting to clean port severance pipeline...")

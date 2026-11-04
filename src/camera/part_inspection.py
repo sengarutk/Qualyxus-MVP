@@ -83,12 +83,16 @@ class PartVerdictFuser:
         self.timeout_s = float(timeout_s)
         self._open: dict[str, dict[str, Any]] = {}
         self._closed: collections.deque[str] = collections.deque(maxlen=512)
+        self._seen: collections.deque[str] = collections.deque(maxlen=4096)
         self._unmatched: str | None = None
         self._unmatched_count = 0
         self._lock = threading.Lock()
 
     def add(self, cycle_id: str | None, camera_id: str, flag: int, now: float) -> dict[str, Any] | None:
         """Record one view's flag; returns the part's verdict once it is decided."""
+        if cycle_id is not None:
+            with self._lock:
+                self._seen.append(cycle_id)
         if not self.required or camera_id not in self.required:
             verdict, value = _verdict_of([flag], True)
             return {"cycle_id": cycle_id, "verdict": verdict, "flag": value, "views": {camera_id: flag}, "missing": []}
@@ -109,6 +113,18 @@ class PartVerdictFuser:
             self._unmatched_count += 1
             self._unmatched = f"unmatched-{self._unmatched_count}"
         return self._unmatched
+
+    def unseen(self, part_keys: Iterable[str]) -> list[dict[str, Any]]:
+        """Verdicts for parts the machine made that no camera ever reported."""
+        out = []
+        with self._lock:
+            for key in part_keys:
+                if key not in self._seen:
+                    self._seen.append(key)
+                    self._closed.append(key)   # a very late view must not reopen it
+                    out.append({"cycle_id": key, "verdict": "not_inspected", "flag": PLC_FLAG_NOT_INSPECTED,
+                                "views": {}, "missing": sorted(self.required) or ["station"]})
+        return out
 
     def expired(self, now: float) -> list[dict[str, Any]]:
         """Parts whose required views did not all report in time."""

@@ -103,8 +103,6 @@ transformers==5.12.1
 triton==3.1.0
 typing_extensions==4.15.0
 tzdata==2025.3
-ultralytics-thop==2.0.18
-ultralytics==8.4.21
 urllib3==2.8.0
 uvicorn==0.42.0
 watchdog==6.0.0

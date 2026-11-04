@@ -7,7 +7,6 @@ import uuid
 import numpy as np
 import cv2
 import torch
-from ultralytics import YOLO
 
 logger = logging.getLogger("InferenceMultiplexer")
 
@@ -49,20 +48,30 @@ class InferenceMultiplexer:
         
         # Check if we should run in mock/simulation mode
         test_cfg = (self.config.raw.get("test_flags", {}) or {}) if self.config.raw else {}
-        self.mock_mode = bool(test_cfg.get("mock_inference", False)) or not os.path.exists(model_path)
-        
+        # The frame detector is optional and off by default: parts are judged by the inspection
+        # models, and Ultralytics is AGPL-3.0, so it is only loaded for lines that ask for it.
+        classes = self.config.get("inference", "defect_classes", default=[])
+        enabled = bool(self.config.get("inference", "frame_detector", default=bool(classes)))
+        self.mock_mode = bool(test_cfg.get("mock_inference", False)) or not enabled
+        self.load_failed = False
+        if enabled and not self.mock_mode and not os.path.exists(model_path):
+            logger.error("[InferenceMultiplexer] Frame detector %s not found.", model_path)
+            self.mock_mode = self.load_failed = True
+
         if self.mock_mode:
-            logger.warning("[InferenceMultiplexer] Model file missing or mock_inference flag set. Running in mock mode.")
+            logger.info("[InferenceMultiplexer] Frame detector not in use.")
             self.model = None
         else:
             try:
+                from ultralytics import YOLO
+
                 self.model = YOLO(model_path)
                 self.model.to(self.device)
                 self.class_names = {int(k): str(v) for k, v in (getattr(self.model, "names", None) or {}).items()}
             except Exception as e:
-                logger.error(f"[InferenceMultiplexer] Failed to load model: {e}. Falling back to mock mode.")
+                logger.error(f"[InferenceMultiplexer] Failed to load frame detector: {e}.")
                 self.model = None
-                self.mock_mode = True
+                self.mock_mode = self.load_failed = True
                 
         # Start background processing daemon thread
         self.stop_event = threading.Event()
@@ -95,7 +104,7 @@ class InferenceMultiplexer:
             event, _ = self.results[request_id]
             
         # Wait for the background daemon to set the event
-        finished = event.wait(timeout=timeout_sec)
+        event.wait(timeout=timeout_sec)
         
         with self.lock:
             # Safely pop to avoid memory leak

@@ -67,6 +67,8 @@ python -m src.operations.auth add <name> --role QA
 
 Each physical part gets one verdict. On a multi-camera station a part passes only when every
 `required_view` has passed it; a view missing after `inspection.view_timeout_s` gives flag 4.
+A machine cycle whose part no camera reported also gives flag 4 (`time`-linked stations, see
+`inspection.expect_part_per_cycle`). A multi-cavity shot uses a running count in register 101.
 
 **Telemetry API.** It listens on this machine only. To open it to the plant network, set
 `api.host`, and set `QUALYXUS_API_TOKEN` so the streams need a bearer token. Browser origins

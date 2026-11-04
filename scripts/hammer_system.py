@@ -32,7 +32,7 @@ async def test_inference_backpressure():
     manager.boot_singletons()
     
     try:
-        with patch("src.inference.infer_live.YOLO"):
+        with patch("ultralytics.YOLO"):
             multiplexer = InferenceMultiplexer(config)
     except Exception as e:
         logger.error(f"Could not load Multiplexer: {e}")

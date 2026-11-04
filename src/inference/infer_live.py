@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import numpy as np
-from ultralytics import YOLO
 
 from src.config.vault import ConfigVault
 from src.core.factory_manager import FactoryManager
@@ -44,6 +43,8 @@ class InferenceMultiplexer:
         logger.info("[Multiplexer] Allocating singular master YOLO segmentation model in VRAM.")
         model_path = os.environ.get("MODEL_ASSET_PATH", "models/best.pt")
         
+        from ultralytics import YOLO
+
         self.model = YOLO(model_path)
         self.model.to('cuda')
         

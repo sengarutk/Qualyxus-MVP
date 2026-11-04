@@ -310,7 +310,10 @@ def _health_fields(cm, views=()):
     cm._lock = threading.Lock()
     cm._view_faults, cm._delivery_fault_until = {}, 0.0
     cm._heartbeat_write, cm._hold_reason = None, None
-    cm.max_frame_age_s = 5.0
+    cm.max_frame_age_s, cm.max_inspect_s = 5.0, 10.0
+    cm.frame_detector_missing, cm._inspecting_since = False, None
+    cm._inspection_slots = threading.Semaphore(4)
+    cm.expect_part_per_cycle, cm._cycles_checked_to, cm._next_unseen_check = True, {}, 0.0
     cm.workers = {}
     for view in views or ("cam",):
         state = CameraWorkerState(view, "s", None, queue.Queue(), queue.Queue(), threading.Event())
@@ -1259,3 +1262,153 @@ def test_model_that_failed_to_load_makes_parts_not_inspected(tmp_path):
     stack = InspectionStack("r", anomaly_path=bad)
     stack.segmenter = object()                # the other model is fine: still only half a check
     assert stack.empty
+
+
+# ---------------------------------------------------- parts that slip through the normal path
+class _Machine:
+    """Process side of a station: which cycles finished, and how they link to the camera."""
+
+    def __init__(self, cycles, mode="time", parts_per_cycle=1):
+        link = type("Link", (), {"machine_id": "m", "mode": mode, "transport_delay_s": 4.0, "tolerance_s": 2.0,
+                                 "parts_per_cycle": parts_per_cycle})
+        self.aligner = type("Aligner", (), {"links": {"cam": link}})
+        self.store = type("Store", (), {"cycles_between": staticmethod(
+            lambda machine, since, until: [(c, t) for c, t in cycles if since < t <= until])})
+
+
+def _unseen_after(cm, service, wall_now=100.0):
+    cm.process_service = service
+    cm.part_fuser.timeout_s = 5.0
+    cm._cycles_checked_to = {"m": 0.0}
+    return cm._unseen_parts(wall_now)         # cycles up to t=87 are overdue
+
+
+def test_cycle_no_camera_saw_is_reported_not_forgotten(tmp_path):
+    cm, state = _heartbeat_manager(tmp_path)
+    cm.plc_executor.shutdown()
+    state.camera_id = "top"
+    for view in ("top", "side"):
+        state.camera_id = view
+        cm._report_view(state, "m-1", 0)
+    found = _unseen_after(cm, _Machine([("m-1", 50.0), ("m-2", 60.0), ("m-3", 95.0)]))
+    assert [(v["cycle_id"], v["flag"], v["verdict"]) for v in found] == [("m-2", 4, "not_inspected")]
+    assert found[0]["missing"] == ["side", "top"]
+
+
+def test_unseen_part_is_reported_once_and_stops_the_heartbeat(tmp_path):
+    cm, _ = _heartbeat_manager(tmp_path)
+    service = _Machine([("m-2", 60.0)])
+    for verdict in _unseen_after(cm, service):
+        cm._publish_part_verdict(verdict)
+    assert cm.fast_queue.qsize() == 1 and cm.part_fuser.unseen(["m-2"]) == []
+    assert _beats_after_tick(cm) == 0
+
+
+def test_each_missing_cavity_of_a_shot_gets_a_verdict(tmp_path):
+    cm, state = _heartbeat_manager(tmp_path, ["cam"])
+    cm.plc_executor.shutdown()
+    cm.part_fuser.required = frozenset()
+    state.camera_id = "cam"
+    cm._report_view(state, "m-1#0", 0)
+    found = _unseen_after(cm, _Machine([("m-1", 50.0)], parts_per_cycle=2))
+    assert [v["cycle_id"] for v in found] == ["m-1#1"]
+
+
+def test_unseen_check_is_off_where_timing_says_nothing(tmp_path):
+    cm, _ = _heartbeat_manager(tmp_path)
+    cm.plc_executor.shutdown()
+    assert _unseen_after(cm, _Machine([("m-2", 60.0)], mode="fifo")) == []
+    cm.expect_part_per_cycle, cm._next_unseen_check = False, 0.0
+    assert _unseen_after(cm, _Machine([("m-2", 60.0)])) == []
+
+
+def test_slow_box_reports_overflow_parts_instead_of_queueing_forever(tmp_path):
+    from src.camera.part_inspection import PartVerdictFuser
+
+    cm, state = _heartbeat_manager(tmp_path, ["cam"])
+    cm.plc_executor.shutdown()
+    cm.part_fuser = PartVerdictFuser()
+    cm.inspection_enabled = True
+    cm.presence_std_threshold, cm._presence_on_frames, cm._presence_off_frames = 3.0, 1, 1
+    cm.inspection_executor = type("Busy", (), {"submit": staticmethod(lambda *a: None)})
+    cm._inspection_slots = threading.Semaphore(0)
+    part, empty = render_part(160, 120, None, seed=3), np.full((120, 160, 3), 40, np.uint8)
+    cm.part_trackers = {}
+    cm._track_part(state, part, 1, [], [])
+    cm._track_part(state, empty, 2, [], [])
+    assert cm.fast_queue.get_nowait()["verdict"] == "not_inspected"
+    assert cm._view_faults["cam"] is True
+
+
+def test_stuck_inspection_stops_the_heartbeat(tmp_path):
+    cm, _ = _heartbeat_manager(tmp_path)
+    cm._inspecting_since = time.monotonic() - 60
+    assert _beats_after_tick(cm) == 0
+
+
+def test_inspection_slot_is_returned_even_when_inspection_crashes(tmp_path):
+    cm, state = _heartbeat_manager(tmp_path)
+    cm.plc_executor.shutdown()
+    slots = threading.Semaphore(1)
+    slots.acquire()
+    cm._inspection_slots = slots
+    cm._inspect_part = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        cm._inspect_queued(state, None)
+    assert slots.acquire(blocking=False) and cm._inspecting_since is None
+
+
+def test_frame_detector_that_failed_to_load_makes_parts_not_inspected(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
+    cm.frame_detector_missing = True
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    assert cm.fast_queue.get_nowait()["verdict"] == "not_inspected"
+
+
+def test_yolo_stays_out_of_the_default_runtime(monkeypatch):
+    import builtins
+
+    from src.config.config import Config
+    from src.inference.multiplexer import InferenceMultiplexer
+
+    real_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        assert name.split(".")[0] != "ultralytics", "default runtime imported ultralytics"
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    mux = InferenceMultiplexer(Config.load())
+    mux.stop()
+    assert mux.mock_mode and not mux.load_failed
+
+
+def test_configured_frame_detector_that_is_missing_is_flagged(tmp_path):
+    from src.inference.multiplexer import InferenceMultiplexer
+
+    class Cfg:
+        raw = {}
+
+        @staticmethod
+        def get(*keys, default=None):
+            return {"model_path": str(tmp_path / "gone.pt"), "defect_classes": ["scratch"]}.get(keys[-1], default)
+
+    mux = InferenceMultiplexer(Cfg())
+    mux.stop()
+    assert mux.load_failed
+
+
+def test_busy_api_port_does_not_stop_inspection(monkeypatch):
+    import asyncio
+
+    import uvicorn
+
+    from src.api.pulse_server import PulseServer
+
+    async def cannot_bind(self):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(uvicorn.Server, "serve", cannot_bind)
+    asyncio.run(PulseServer().run_async())       # returns instead of ending the process

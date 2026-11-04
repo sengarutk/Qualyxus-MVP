@@ -186,6 +186,10 @@ class CameraSyncManager:
 
 # A lost verdict holds the heartbeat this long, so the PLC's watchdog can see it happened.
 VERDICT_LOST_HOLD_S = 10.0
+# How often to look for machine cycles no camera reported, and extra time allowed on top of the
+# transport delay, tolerance and view timeout before calling a part unseen.
+UNSEEN_CHECK_S = 1.0
+UNSEEN_MARGIN_S = 2.0
 
 @dataclass
 class CameraWorkerState:
@@ -390,6 +394,14 @@ class CameraManager:
         self._delivery_fault_until = 0.0
         self._heartbeat_write = None
         self._hold_reason: str | None = None
+        self.frame_detector_missing = bool(getattr(self.multiplexer, "load_failed", False))
+        inspect_cfg = self.raw_config.get("inspection") or {}
+        self.max_inspect_s = float(inspect_cfg.get("max_inspect_s", 10.0))
+        self._inspection_slots = threading.Semaphore(int(inspect_cfg.get("max_inspection_backlog", 64)))
+        self._inspecting_since: float | None = None
+        self.expect_part_per_cycle = bool(inspect_cfg.get("expect_part_per_cycle", True))
+        self._cycles_checked_to: dict[str, float] = {}
+        self._next_unseen_check = 0.0
         # Models per recipe (registry-versioned with shadow + hot reload, or explicit config paths).
         from src.inference.inspection_stack import StackProvider
 
@@ -1262,11 +1274,26 @@ class CameraManager:
             ))
         present = is_part_present(frame, self.presence_std_threshold)
         completed = tracker.update(frame, present, time.time(), frame_id, event_ids, defect_types)
+        state.last_infer_ts = time.perf_counter()   # this frame made it through the part pipeline
         if completed is not None:
+            if not self._inspection_slots.acquire(blocking=False):
+                logger.error("[%s] Inspection backlog full: part recorded as not inspected.", state.camera_id)
+                state.parts_not_inspected += 1
+                self._view_faults[state.camera_id] = True
+                self._report_view(state, None, PLC_FLAG_NOT_INSPECTED)
+                return
             try:
-                self.inspection_executor.submit(self._inspect_part, state, completed)
+                self.inspection_executor.submit(self._inspect_queued, state, completed)
             except RuntimeError:
-                pass  # shutting down
+                self._inspection_slots.release()  # shutting down
+
+    def _inspect_queued(self, state: CameraWorkerState, part: CompletedPart) -> None:
+        self._inspecting_since = time.monotonic()
+        try:
+            self._inspect_part(state, part)
+        finally:
+            self._inspecting_since = None
+            self._inspection_slots.release()
 
     def _inspect_part(self, state: CameraWorkerState, part: CompletedPart) -> None:
         """Final verdict for one physical part, recorded against its producing cycle.
@@ -1321,7 +1348,7 @@ class CameraManager:
                     event_id = None
 
             # No loaded model means nobody looked at this part, which is not a pass.
-            not_inspected = (stack.empty or bool(fault)) and not failed
+            not_inspected = (stack.empty or bool(fault) or self.frame_detector_missing) and not failed
             verdict = "not_inspected" if not_inspected else ("fail" if failed else "pass")
             normalized = judged.normalized_score
             self._view_faults[state.camera_id] = not_inspected
@@ -1479,15 +1506,42 @@ class CameraManager:
         faulted = sorted(c for c, bad in self._view_faults.items() if bad)
         if faulted:
             return f"cannot inspect on {faulted}"
+        started = self._inspecting_since
+        if started is not None and now - started > self.max_inspect_s:
+            return f"a part has been in inspection for over {self.max_inspect_s:.0f} s"
         if now < self._delivery_fault_until:
             return "a part verdict did not reach the PLC"
         silent = self._silent_views()
         return f"no frames from {silent}" if silent else None
 
+    def _unseen_parts(self, wall_now: float) -> list[dict[str, Any]]:
+        """Parts of finished cycles that should have reached the cameras by now and did not."""
+        service = self.process_service
+        if service is None or not self.expect_part_per_cycle or wall_now < self._next_unseen_check:
+            return []
+        self._next_unseen_check = wall_now + UNSEEN_CHECK_S
+        machines: dict[str, Any] = {}
+        for link in service.aligner.links.values():
+            if link.mode == "time":
+                machines.setdefault(link.machine_id, link)
+        verdicts = []
+        for machine_id, link in machines.items():
+            until = wall_now - (link.transport_delay_s + link.tolerance_s + self.part_fuser.timeout_s + UNSEEN_MARGIN_S)
+            since = self._cycles_checked_to.setdefault(machine_id, wall_now)
+            if until <= since:
+                continue
+            self._cycles_checked_to[machine_id] = until
+            keys = []
+            for cycle_id, _end_ts in service.store.cycles_between(machine_id, since, until):
+                keys += ([f"{cycle_id}#{i}" for i in range(link.parts_per_cycle)]
+                         if link.parts_per_cycle > 1 else [cycle_id])
+            verdicts += self.part_fuser.unseen(keys)
+        return verdicts
+
     def _reflex_tick(self, adapter) -> None:
-        """Close parts whose views timed out, and keep the PLC heartbeat moving."""
+        """Close parts nobody finished, and keep the PLC heartbeat moving."""
         now = time.monotonic()   # a clock correction must not stall the heartbeat or a part deadline
-        for verdict in self.part_fuser.expired(now):
+        for verdict in self.part_fuser.expired(now) + self._unseen_parts(time.time()):
             self._publish_part_verdict(verdict)
         if adapter is None:
             return

@@ -20,9 +20,11 @@ dataset:
     0: "defect"
 
 inference:
-  # Frame-level detector. yolov8s-seg.pt is a generic COCO model (it detects everyday
-  # objects, not defects), so its detections are ignored unless defect_classes lists the
-  # classes of a trained defect model, e.g. ["scratch", "crack"].
+  # Optional frame-level detector, off by default: parts are judged by the inspection models.
+  # To use one, train a defect model, point model_path at it and either list its classes in
+  # defect_classes or set frame_detector: true. It runs on Ultralytics (AGPL-3.0):
+  #   pip install -r requirements-yolo.txt
+  frame_detector: false
   model_path: "yolov8s-seg.pt"
   defect_classes: []
   yolo_yaml: "data/processed/active_recipe.yaml"
@@ -262,6 +264,13 @@ inspection:
   # A camera silent for longer than this stops the PLC heartbeat. Raise it for hardware-triggered
   # cameras, which send no frames between parts.
   max_frame_age_s: 5.0
+  # A part stuck in inspection for this long stops the heartbeat. Parts waiting beyond the
+  # backlog limit are reported as not inspected at once, rather than queued without limit.
+  max_inspect_s: 10.0
+  max_inspection_backlog: 64
+  # On "time"-linked stations every machine cycle must produce a part; a cycle that no camera
+  # saw is reported as not inspected. Turn off if the machine makes shots that skip the station.
+  expect_part_per_cycle: true
   audit:
     enabled: true
     dir: "data/audit"
