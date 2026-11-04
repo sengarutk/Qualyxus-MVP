@@ -180,11 +180,14 @@ class CycleSource:
     def _run_safe(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
+            started = time.monotonic()
             try:
                 self._run()
                 return
             except Exception as e:
-                logger.error("[%s] Source failed: %s. Reconnecting in %.0fs.", self.name, e)
+                if time.monotonic() - started > 60.0:  # it was healthy: this is a new outage
+                    backoff = 1.0
+                logger.error("[%s] Source failed: %s. Reconnecting in %.0fs.", self.name, e, backoff)
                 if self._stop.wait(backoff):
                     return
                 backoff = min(backoff * 2.0, 30.0)

@@ -1266,14 +1266,16 @@ class CameraManager:
         detections seen while the part was in view. Any of them failing the part fails it.
         A shadow stack, when registered, judges the same part without affecting the verdict.
         """
-        cycle_id = None
+        cycle_id = part_key = None
         try:
             frame = part.best_frame
             service = self.process_service
             if service is not None and service.aligner.link_for(state.camera_id) is None:
                 service = None  # camera not linked to a machine: no process label to record
             alignment = service.aligner.align(state.camera_id, part.ts) if service is not None else None
-            cycle_id = alignment.cycle_id if alignment else None
+            cycle_id = part_key = alignment.cycle_id if alignment else None
+            if cycle_id is not None and service.aligner.link_for(state.camera_id).parts_per_cycle > 1:
+                part_key = f"{cycle_id}#{alignment.cavity}"   # each cavity is its own part
             recipe = self._recipe_for(state.camera_id, cycle_id)
             stack, shadow = self.stack_provider.get(recipe)
 
@@ -1308,15 +1310,15 @@ class CameraManager:
             normalized = judged.normalized_score
             self._inspection_faulted = not_inspected
             if failed:
-                self._report_view(state, cycle_id, self._part_severity(anomaly, top, confidence))
+                self._report_view(state, part_key, self._part_severity(anomaly, top, confidence))
             elif not_inspected:
-                self._report_view(state, cycle_id, PLC_FLAG_NOT_INSPECTED)
+                self._report_view(state, part_key, PLC_FLAG_NOT_INSPECTED)
                 if not state.not_inspected_logged:
                     state.not_inspected_logged = True
                     logger.error("[%s] No inspection model is loaded for recipe '%s': parts are recorded as "
                                  "not_inspected until one is available.", state.camera_id, recipe)
             else:
-                self._report_view(state, cycle_id, PLC_PASS)
+                self._report_view(state, part_key, PLC_PASS)
             image_sha = None
             if self.audit_log is not None or shadow is not None or self.review_queue is not None:
                 from src.inference.audit_log import image_sha256
@@ -1387,7 +1389,7 @@ class CameraManager:
             logger.error("[%s] Part inspection failed: %s", state.camera_id, e, exc_info=True)
             state.parts_not_inspected += 1
             self._inspection_faulted = True
-            self._report_view(state, cycle_id, PLC_FLAG_NOT_INSPECTED)
+            self._report_view(state, part_key, PLC_FLAG_NOT_INSPECTED)
 
     @staticmethod
     def _part_severity(anomaly, top, confidence: float | None) -> int:
@@ -1395,8 +1397,8 @@ class CameraManager:
             return 3 if anomaly.normalized_score >= 2.0 else (2 if anomaly.normalized_score >= 1.3 else 1)
         return severity_from_conf(confidence or 0.5)
 
-    def _report_view(self, state: CameraWorkerState, cycle_id: str | None, flag: int) -> None:
-        verdict = self.part_fuser.add(cycle_id, state.camera_id, int(flag), time.time())
+    def _report_view(self, state: CameraWorkerState, part_key: str | None, flag: int) -> None:
+        verdict = self.part_fuser.add(part_key, state.camera_id, int(flag), time.time())
         if verdict is not None:
             self._publish_part_verdict(verdict)
 

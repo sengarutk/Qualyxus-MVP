@@ -182,6 +182,8 @@ process:
     min_train_samples: 300
     min_train_positives: 20
     min_promotion_auc: 0.65
+    # Vision labels linked to a cycle less confidently than this do not train the risk model.
+    min_label_confidence: 0.5
   prescriptions:
     enabled: true            # issued as approval-gated actions; never written to the PLC
     max_step_fraction: 0.08

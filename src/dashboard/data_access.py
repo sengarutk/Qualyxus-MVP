@@ -471,7 +471,8 @@ def fetch_vision_overview(status_path: str, process_db_path: str, registry_dir: 
             out["parts"] = {"total": len(parts), **{str(k): int(v) for k, v in counts.items()},
                             "multi_view": sum(1 for p in parts if len(p["views"]) > 1)}
             out["recent_parts"] = [
-                {"part": p["cycle_id"], "verdict": p["verdict"], "views_seen": len(p["views"]),
+                {"part": p["cycle_id"] or "not linked to a cycle", "cavity": p["cavity"], "verdict": p["verdict"],
+                 "views_seen": len(p["views"]),
                  "failed_views": ", ".join(c for c, v in p["views"].items() if v == "fail"),
                  "missing_views": ", ".join(p["missing_views"]),
                  "defect": ", ".join(sorted(set(p["defect_types"])))}

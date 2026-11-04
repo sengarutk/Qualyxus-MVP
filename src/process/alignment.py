@@ -37,12 +37,16 @@ class StationLink:
     transport_delay_s: float = 0.0
     tolerance_s: float = 5.0
     fifo_offset: int = 0              # parts between the machine and the camera
+    parts_per_cycle: int = 1          # cavities: one shot makes this many parts
 
     @classmethod
     def from_config(cls, camera_id: str, payload: dict) -> "StationLink":
         mode = str(payload.get("mode", "time")).lower()
         if mode not in {"time", "fifo", "part_id"}:
             raise ValueError(f"Unknown alignment mode '{mode}' for camera {camera_id}")
+        parts_per_cycle = max(1, int(payload.get("parts_per_cycle", 1)))
+        if parts_per_cycle > 1 and mode == "fifo":
+            raise ValueError(f"Camera {camera_id}: fifo alignment assumes one part per cycle; use mode: time")
         return cls(
             camera_id=camera_id,
             machine_id=str(payload.get("machine_id", "imm_1")),
@@ -50,6 +54,7 @@ class StationLink:
             transport_delay_s=float(payload.get("transport_delay_s", 0.0)),
             tolerance_s=max(0.05, float(payload.get("tolerance_s", 5.0))),
             fifo_offset=max(0, int(payload.get("fifo_offset", 0))),
+            parts_per_cycle=parts_per_cycle,
         )
 
 
@@ -59,6 +64,7 @@ class AlignmentResult:
     confidence: float
     method: str
     timing_error_s: float | None = None
+    cavity: int = 0                   # which part of this cycle, in inspection order
 
 
 class CycleAligner:
@@ -96,15 +102,18 @@ class CycleAligner:
         )
         if not candidates:
             return AlignmentResult(None, 0.0, "time_no_candidate")
-        # Each physical part is inspected once per camera: prefer cycles not yet linked.
-        already = self.store.linked_cycle_ids(camera_id, [c for c, _ in candidates])
+        # Each cycle makes parts_per_cycle parts, each inspected once per camera: prefer
+        # cycles that still have a part left to link.
+        counts = self.store.link_counts(camera_id, [c for c, _ in candidates])
+        already = {c for c, n in counts.items() if n >= link.parts_per_cycle}
         free = [(c, t) for c, t in candidates if c not in already] or candidates
         cycle_id, end_ts = min(free, key=lambda item: abs(item[1] - expected_end))
         error = end_ts - expected_end
         confidence = max(0.0, 1.0 - abs(error) / link.tolerance_s)
         if cycle_id in already:
             confidence *= 0.5  # every candidate was already linked: ambiguous
-        return AlignmentResult(cycle_id, round(confidence, 4), "time", round(error, 4))
+        cavity = counts.get(cycle_id, 0) % link.parts_per_cycle
+        return AlignmentResult(cycle_id, round(confidence, 4), "time", round(error, 4), cavity)
 
 
 def estimate_transport_delay(

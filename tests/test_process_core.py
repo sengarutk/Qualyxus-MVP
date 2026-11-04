@@ -295,3 +295,85 @@ def test_opcua_source_reads_live_server():
     thread.join(timeout=10)
     assert len(cycles) >= 2
     assert np.all(np.diff(cycles[-1].curves["pressure"]) >= 0)
+
+
+def _store_with_cycle(tmp_path, end_ts=100.0):
+    from src.process.models import ProcessCycle
+
+    s = ProcessStore(tmp_path / "links.db")
+    s.save_cycle(ProcessCycle(cycle_id="c1", machine_id="m", sequence=1, start_ts=end_ts - 20, end_ts=end_ts,
+                              setpoints={}, scalars={}, curves={}, sample_rate_hz=20.0), {"x": 1.0})
+    return s
+
+
+def test_multi_cavity_shot_links_every_part_to_the_same_cycle(tmp_path):
+    from src.process.alignment import CycleAligner, StationLink
+    from src.process.models import InspectionRecord
+
+    store = _store_with_cycle(tmp_path)
+    aligner = CycleAligner(store, [StationLink("cam", "m", transport_delay_s=4.0, tolerance_s=2.0, parts_per_cycle=4)])
+    cavities = []
+    for i in range(4):
+        result = aligner.align("cam", 104.0 + i * 0.1)
+        assert result.cycle_id == "c1" and result.confidence > 0.5
+        cavities.append(result.cavity)
+        store.save_inspection(InspectionRecord("", "cam", 104.0 + i * 0.1, "fail" if i == 2 else "pass",
+                                               cycle_id="c1", cavity=result.cavity))
+    assert cavities == [0, 1, 2, 3]
+    assert aligner.align("cam", 104.5).confidence < 0.5   # a fifth part from a 4-cavity shot is suspect
+    parts = store.part_verdicts(0, 1e9)
+    assert sorted(p["verdict"] for p in parts) == ["fail", "pass", "pass", "pass"]
+
+
+def test_fifo_alignment_refuses_multi_cavity(tmp_path):
+    from src.process.alignment import StationLink
+
+    with pytest.raises(ValueError):
+        StationLink.from_config("cam", {"mode": "fifo", "parts_per_cycle": 2})
+
+
+def test_low_confidence_links_do_not_train_the_risk_model(tmp_path):
+    from src.process.models import InspectionRecord
+
+    store = _store_with_cycle(tmp_path)
+    store.save_inspection(InspectionRecord("", "cam", 104.0, "fail", cycle_id="c1", alignment_confidence=0.2))
+    assert store.labelled_dataset(min_confidence=0.0)[0]["label"] == 1
+    assert store.labelled_dataset(min_confidence=0.5) == []
+
+
+def test_failed_part_with_no_cycle_link_is_still_reported(tmp_path):
+    from src.process.models import InspectionRecord
+
+    store = _store_with_cycle(tmp_path)
+    store.save_inspection(InspectionRecord("", "cam", 104.0, "fail", defect_type="flash"))
+    parts = store.part_verdicts(0, 1e9)
+    assert [p["verdict"] for p in parts] == ["fail"] and parts[0]["cycle_id"] is None
+
+
+def test_stationary_part_is_one_part_until_it_leaves():
+    from src.camera.part_inspection import PartPresenceTracker
+
+    tracker = PartPresenceTracker("cam", max_visit_frames=300)
+    frame = np.full((48, 64, 3), 90, np.uint8)
+    closed = sum(tracker.update(frame, True, i / 30, i) is not None for i in range(3000))
+    assert closed == 1
+    for i in range(3000, 3004):
+        tracker.update(frame, False, i / 30, i)
+    assert sum(tracker.update(frame, True, i / 30, i) is not None for i in range(3004, 3320)) == 1
+
+
+def test_source_failure_logs_its_reason_and_retries(caplog):
+    from src.process.sources import CycleSource
+
+    class Failing(CycleSource):
+        name = "flaky"
+        calls = 0
+
+        def _run(self):
+            type(self).calls += 1
+            self._stop.set()
+            raise ConnectionError("PLC unplugged")
+
+    with caplog.at_level("ERROR"):
+        Failing()._run_safe()
+    assert "PLC unplugged" in caplog.text and "Reconnecting in 1s" in caplog.text

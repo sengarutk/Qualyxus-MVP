@@ -122,6 +122,7 @@ class PartPresenceTracker:
         self._present_run = 0
         self._absent_run = 0
         self._visit: dict | None = None
+        self._await_removal = False   # a visit hit the length cap; the same part is still here
 
     def update(self, frame: np.ndarray, present: bool, ts: float, frame_id: int,
                defect_event_ids: list[str] | None = None, defect_types: list[str] | None = None) -> CompletedPart | None:
@@ -131,6 +132,11 @@ class PartPresenceTracker:
         else:
             self._absent_run += 1
             self._present_run = 0
+
+        if self._await_removal:
+            if self._absent_run < self.off_frames:
+                return None
+            self._await_removal = False
 
         if self._visit is None:
             if present and self._present_run >= self.on_frames:
@@ -149,7 +155,10 @@ class PartPresenceTracker:
         visit["events"].extend(defect_event_ids or [])
         visit["types"].extend(defect_types or [])
 
-        if (not present and self._absent_run >= self.off_frames) or visit["n"] >= self.max_visit_frames:
+        if not present and self._absent_run >= self.off_frames:
+            return self._close()
+        if visit["n"] >= self.max_visit_frames:
+            self._await_removal = True
             return self._close()
         return None
 

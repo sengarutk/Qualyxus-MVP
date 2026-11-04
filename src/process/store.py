@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS inspections (
     source        TEXT NOT NULL DEFAULT 'vision',
     pos_x         REAL,
     pos_y         REAL,
-    pos_angle     REAL
+    pos_angle     REAL,
+    cavity        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_inspections_cycle ON inspections(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_inspections_ts ON inspections(ts);
@@ -112,6 +113,8 @@ class ProcessStore:
         for column in ("pos_x", "pos_y", "pos_angle"):
             if column not in columns:
                 self._conn.execute(f"ALTER TABLE inspections ADD COLUMN {column} REAL")
+        if "cavity" not in columns:
+            self._conn.execute("ALTER TABLE inspections ADD COLUMN cavity INTEGER NOT NULL DEFAULT 0")
         self._conn.commit()
 
     def close(self) -> None:
@@ -218,33 +221,38 @@ class ProcessStore:
             """
             INSERT OR REPLACE INTO inspections (
                 inspection_id, camera_id, ts, verdict, defect_type, anomaly_score, event_id,
-                cycle_id, alignment_confidence, source, pos_x, pos_y, pos_angle
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cycle_id, alignment_confidence, source, pos_x, pos_y, pos_angle, cavity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.inspection_id, record.camera_id, float(record.ts), record.verdict,
                 record.defect_type, record.anomaly_score, record.event_id, record.cycle_id,
                 record.alignment_confidence, record.source, record.pos_x, record.pos_y, record.pos_angle,
+                record.cavity,
             ),
         )
         return record
 
-    def linked_cycle_ids(self, camera_id: str, cycle_ids: Iterable[str]) -> set[str]:
+    def link_counts(self, camera_id: str, cycle_ids: Iterable[str]) -> dict[str, int]:
+        """Parts this camera has already linked to each cycle."""
         ids = list(cycle_ids)
         if not ids:
-            return set()
+            return {}
         marks = ",".join("?" for _ in ids)
         rows = self._query(
-            f"SELECT DISTINCT cycle_id FROM inspections WHERE camera_id = ? AND cycle_id IN ({marks})",
+            f"SELECT cycle_id, COUNT(*) AS n FROM inspections WHERE camera_id = ? AND cycle_id IN ({marks}) "
+            "GROUP BY cycle_id",
             [camera_id, *ids],
         )
-        return {r["cycle_id"] for r in rows}
+        return {r["cycle_id"]: int(r["n"]) for r in rows}
 
-    def labelled_dataset(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def labelled_dataset(self, limit: int | None = None, *, min_confidence: float = 0.0) -> list[dict[str, Any]]:
         """One row per cycle with features and a quality label from its inspections.
 
         A cycle is labelled FAIL if any linked vision inspection or audit failed. Audits
-        override vision verdicts for the same cycle (they are the ground truth).
+        override vision verdicts for the same cycle (they are the ground truth). A vision
+        result linked below ``min_confidence`` may belong to another cycle, so it is left
+        out rather than teaching the risk model a wrong label.
         """
         sql = """
             SELECT c.cycle_id, c.end_ts, c.features,
@@ -253,13 +261,14 @@ class ProcessStore:
                    MAX(CASE WHEN i.source = 'vision' AND i.verdict = 'fail' THEN 1 ELSE 0 END) AS vision_fail,
                    GROUP_CONCAT(CASE WHEN i.verdict = 'fail' THEN i.defect_type END) AS defect_types
             FROM process_cycles c JOIN inspections i ON i.cycle_id = c.cycle_id
+                 AND (i.source = 'audit' OR i.alignment_confidence IS NULL OR i.alignment_confidence >= ?)
             GROUP BY c.cycle_id
             ORDER BY c.end_ts
         """
         if limit:
             sql += f" LIMIT {int(limit)}"
         out = []
-        for r in self._query(sql):
+        for r in self._query(sql, (float(min_confidence),)):
             label = int(r["audit_fail"]) if int(r["has_audit"]) else int(r["vision_fail"])
             types = [t for t in (r["defect_types"] or "").split(",") if t]
             out.append({
@@ -273,20 +282,22 @@ class ProcessStore:
 
     def part_verdicts(self, ts_from: float, ts_to: float, *,
                       required_cameras: Iterable[str] | None = None) -> list[dict[str, Any]]:
-        """One verdict per physical part (cycle), fused over every camera view of it.
+        """One verdict per physical part (cycle + cavity), fused over every camera view of it.
 
         A part fails if any view (or an audit) failed it; an audit overrides vision. With
         ``required_cameras`` a part not yet seen by every required view is ``incomplete``:
-        a passed part with a missing view has not actually been fully inspected.
+        a passed part with a missing view has not actually been fully inspected. An
+        inspection with no linked cycle is still a part, so a failure can never disappear.
         """
         required = sorted(set(required_cameras or []))
         rows = self._query(
-            "SELECT cycle_id, camera_id, verdict, defect_type, source, ts FROM inspections "
-            "WHERE cycle_id IS NOT NULL AND ts BETWEEN ? AND ? ORDER BY ts", (ts_from, ts_to))
-        parts: dict[str, dict[str, Any]] = {}
+            "SELECT inspection_id, cycle_id, cavity, camera_id, verdict, defect_type, source, ts FROM inspections "
+            "WHERE ts BETWEEN ? AND ? ORDER BY ts", (ts_from, ts_to))
+        parts: dict[Any, dict[str, Any]] = {}
         for r in rows:
-            p = parts.setdefault(r["cycle_id"], {"cycle_id": r["cycle_id"], "ts": float(r["ts"]), "views": {},
-                                                  "audit": None, "defect_types": []})
+            key = (r["cycle_id"], r["cavity"]) if r["cycle_id"] else (r["inspection_id"], None)
+            p = parts.setdefault(key, {"cycle_id": r["cycle_id"], "cavity": r["cavity"], "ts": float(r["ts"]),
+                                       "views": {}, "audit": None, "defect_types": []})
             if r["source"] == "audit":
                 p["audit"] = r["verdict"]
             else:
@@ -301,7 +312,8 @@ class ProcessStore:
             verdict = p["audit"] or vision
             if verdict == "pass" and missing and p["audit"] is None:
                 verdict = "incomplete"
-            out.append({"cycle_id": p["cycle_id"], "ts": p["ts"], "verdict": verdict, "views": p["views"],
+            out.append({"cycle_id": p["cycle_id"], "cavity": p["cavity"], "ts": p["ts"], "verdict": verdict,
+                        "views": p["views"],
                         "missing_views": missing, "audited": p["audit"] is not None,
                         "defect_types": sorted(set(p["defect_types"]))})
         return out

@@ -55,6 +55,7 @@ class InspectionRecord:
     pos_x: float | None = None        # part centre in the frame, pixels
     pos_y: float | None = None
     pos_angle: float | None = None    # degrees
+    cavity: int = 0
 
 
 @dataclass

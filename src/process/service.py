@@ -80,6 +80,7 @@ class ProcessIntelligenceService:
         self.min_train_samples = int(model_cfg.get("min_train_samples", 300))
         self.min_train_positives = int(model_cfg.get("min_train_positives", 20))
         self.min_promotion_auc = float(model_cfg.get("min_promotion_auc", 0.65))
+        self.min_label_confidence = float(model_cfg.get("min_label_confidence", 0.5))
         self.min_regime_good = int(model_cfg.get("regime_min_good_cycles", 30))
         self.hybrid_deviation = bool(model_cfg.get("hybrid_deviation", False))
         spec = cfg.get("spec_limits")
@@ -307,6 +308,7 @@ class ProcessIntelligenceService:
             pos_x=position[0] if position else None,
             pos_y=position[1] if position else None,
             pos_angle=position[2] if position else None,
+            cavity=alignment.cavity,
         ))
         if alignment.cycle_id:
             with self._lock:
@@ -366,7 +368,7 @@ class ProcessIntelligenceService:
             if golden is not None:
                 extractor = CycleFeatureExtractor(golden)
 
-            rows = self.store.labelled_dataset()
+            rows = self.store.labelled_dataset(min_confidence=self.min_label_confidence)
             if golden is not None:
                 # Re-extract with the verified golden so features match what will be served.
                 for row in rows:
