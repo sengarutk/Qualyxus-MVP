@@ -6,6 +6,7 @@ import json
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -15,6 +16,8 @@ import torch
 
 from src.inference.anomaly.base import AnomalyDetector
 from src.process.synthetic_parts import BACKGROUND, render_part
+
+DASHBOARD_APP = Path(__file__).resolve().parents[1] / "src" / "dashboard" / "app.py"
 
 
 def _jitter(img: np.ndarray, angle: float, dx: float, dy: float, *, interp=cv2.INTER_LINEAR) -> np.ndarray:
@@ -705,7 +708,7 @@ def test_dashboard_needs_a_login_once_accounts_exist(tmp_path, monkeypatch):
     config.write_text(f"logging: {{sqlite_path: {tmp_path}/events.db}}\ndashboard: {{users_file: {users}}}\n")
     monkeypatch.setenv("CONFIG_PATH", str(config))
 
-    at = AppTest.from_file("src/dashboard/app.py", default_timeout=30).run()
+    at = AppTest.from_file(str(DASHBOARD_APP), default_timeout=30).run()
     assert not at.exception and at.subheader[0].value == "Sign in" and not at.metric
     at.text_input[0].set_value("ravi")
     at.text_input[1].set_value("wrong password!")
@@ -743,7 +746,7 @@ def test_dashboard_renders_machine_health_and_position_from_real_records(tmp_pat
                       f"esg_params: {{enabled: false}}\n")
     monkeypatch.setenv("CONFIG_PATH", str(config))
 
-    at = AppTest.from_file("src/dashboard/app.py", default_timeout=60).run()
+    at = AppTest.from_file(str(DASHBOARD_APP), default_timeout=60).run()
     assert not at.exception, [e.message for e in at.exception]
     assert any("/100" in str(m.value) for m in at.metric)
     assert "**Part-position drift**" in [m.value for m in at.markdown]
