@@ -110,7 +110,7 @@ def main():
                 "independent_logs": True
             }
         ],
-        "vibration_analysis": {"kap_db_path": "data/knowledge/knowledge_base.db"},
+        "vibration_analysis": {"enabled": True, "kap_db_path": "data/knowledge/knowledge_base.db"},
         "watchdog": {
             "heartbeat_timeout": 2.0,
             "frame_drop_threshold": 100,

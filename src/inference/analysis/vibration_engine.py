@@ -196,12 +196,17 @@ class VibrationAnalyzer:
         foundation_type: str = "Rigid",
         pixel_to_mm_scale: float = 1.0,
         camera_id: str = "cam_unknown",
+        calibrated: bool = True,
     ) -> None:
         self.buffer_size       = buffer_size
         self.machine_group     = machine_group
         self.foundation_type   = foundation_type
         self.pixel_to_mm_scale = pixel_to_mm_scale
         self.camera_id         = camera_id
+        # ISO 10816 limits are in mm/s of a physical vibration velocity. Uncalibrated input
+        # (e.g. raw pixel displacement) is analysed spectrally but never classified into
+        # ISO zones and never allowed to trigger a PLC emergency stop.
+        self.calibrated        = bool(calibrated)
         self.buffer_lock = threading.Lock()
         self.buffer: collections.deque[tuple[float, float, float]] = collections.deque(
             maxlen=buffer_size
@@ -463,7 +468,8 @@ class VibrationAnalyzer:
             # Use self.buffer_size (not len(sig)) to ensure the bin width is
             # always N/f_s regardless of any edge truncation.
             freqs = np.fft.rfftfreq(self.buffer_size, d=1.0 / f_s)
-            mask  = (freqs >= 0.5) & (freqs <= 60.0)
+            # Frequencies above Nyquist (f_s / 2) are aliases, not machine harmonics.
+            mask  = (freqs >= 0.5) & (freqs <= min(60.0, 0.5 * f_s))
             if not np.any(mask):
                 diag_result["status"] = "NO_SIGNAL_IN_BAND"
                 return diag_result
@@ -505,7 +511,7 @@ class VibrationAnalyzer:
 
             # Emit CRITICAL BEFORE DB lookup — Reflex never gated on Brain latency.
             plc_trigger = False
-            if spike and not self.ignore_vibration:
+            if spike and not self.ignore_vibration and self.calibrated:
                 self._emit_vibration_critical_fast(
                     dominant_freq=diag_result["dominant_freq"],
                     psd_peak=diag_result["psd_peak"],
@@ -520,6 +526,12 @@ class VibrationAnalyzer:
                 diag_result["iso_status"]    = "ZONE_A_B"
                 diag_result["causal_link"]   = "SURFACE_INSPECTION_ACTIVE"
                 diag_result["justification"] = "Mechanical DSP ignored; tracking visual anomalies."
+            elif not self.calibrated:
+                diag_result["iso_status"]    = "UNCALIBRATED"
+                diag_result["causal_link"]   = "N/A"
+                diag_result["justification"] = (
+                    "Signal is not calibrated to mm/s; spectral trend only, no ISO 10816 zone."
+                )
             else:
                 try:
                     iso_status, causal_link, just_str = self.get_forensic_context(
@@ -537,7 +549,7 @@ class VibrationAnalyzer:
                     diag_result["justification"] = "DB_ERROR"
 
             # Phase 7: Check PLC constraints
-            if diag_result["iso_status"] == "ZONE_D" and not self.ignore_vibration:
+            if diag_result["iso_status"] == "ZONE_D" and not self.ignore_vibration and self.calibrated:
                 plc_res = self.plc.execute_emergency_stop()
                 if "MOCK" not in plc_res.get("status", "") and "SUCCESS" not in plc_res.get("status", ""):
                     pass # Handled internally by warning

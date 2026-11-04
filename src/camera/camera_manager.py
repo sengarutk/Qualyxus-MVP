@@ -22,6 +22,7 @@ try:
 except ImportError:
     _psutil = None
 
+from src.camera.part_inspection import CompletedPart, PartPresenceTracker
 from src.config.config import Config
 from src.core.factory_manager import FactoryManager
 from src.inference.analysis.geometry_engine import GeometryEngine
@@ -91,6 +92,9 @@ def is_part_present(frame: np.ndarray, std_dev_threshold: float = 2.2) -> bool:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.shape[2] == 3 else frame[:, :, 0]
     else:
         gray = frame
+    # Denoise first: the Laplacian amplifies per-pixel sensor noise, which otherwise makes an
+    # empty, noisy background look like a textured part.
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
     std_dev = float(np.std(gray))
     if std_dev >= std_dev_threshold:
         return True
@@ -216,6 +220,8 @@ class CameraWorkerState:
     last_geometry_log_ts: float = 0.0
     geometry_inflight: int = 0
     tracker: Any = None
+    parts_inspected: int = 0
+    parts_failed: int = 0
     pool: list = field(default_factory=list)
     pool_write_index: int = 0
     prev_centroid: tuple[float, float] | None = None
@@ -320,6 +326,12 @@ class CameraManager:
         self.vlm_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm-reasoner")
         vibration_cfg = self.raw_config.get("vibration_analysis", {}) or {}
         self._kap_db_path: str = str(vibration_cfg.get("kap_db_path", "data/knowledge/knowledge_base.db"))
+        # Optical "vibration" is centroid motion of detections sampled at the camera frame
+        # rate: it only resolves < fps/2 Hz and is not a mm/s velocity unless calibrated.
+        # Off by default; a real accelerometer feed is the proper vibration source.
+        self.vibration_enabled = bool(vibration_cfg.get("enabled", False))
+        scale = vibration_cfg.get("pixel_to_mm_scale")
+        self.vibration_scale = float(scale) if scale else None
 
         vlm_cfg = self.raw_config.get("vlm_reasoning", {}) or {}
         self.vlm_enabled = bool(vlm_cfg.get("enabled", True))
@@ -341,6 +353,45 @@ class CameraManager:
         # result would be discarded before it arrives.
         default_timeout = 0.033 if self.multiplexer.device == "cuda" else 0.5
         self.result_timeout_sec = float(inference_cfg.get("result_timeout_sec") or default_timeout)
+        self.defect_class_ids = self._resolve_defect_classes(inference_cfg.get("defect_classes"))
+
+        # Per-part inspection: one pass/fail record per physical part (labels for the
+        # process model), judged by the good-parts-only anomaly detector.
+        inspection_cfg = self.raw_config.get("inspection", {}) or {}
+        self.inspection_enabled = bool(inspection_cfg.get("enabled", True))
+        self.presence_std_threshold = float(inspection_cfg.get("presence_std_threshold", 2.2))
+        self._presence_on_frames = int(inspection_cfg.get("on_frames", 2))
+        self._presence_off_frames = int(inspection_cfg.get("off_frames", 2))
+        self.part_trackers: dict[str, PartPresenceTracker] = {}
+        self.inspection_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="part-inspection")
+        # Models per recipe (registry-versioned with shadow + hot reload, or explicit config paths).
+        from src.inference.inspection_stack import StackProvider
+
+        self.stack_provider = StackProvider(inspection_cfg)
+        self.camera_recipes = {str(c.get("id")): c.get("recipe") for c in (self.raw_config.get("cameras") or [])
+                               if c.get("id") is not None and c.get("recipe")}
+        self.recipe_from_scalar = inspection_cfg.get("recipe_from_scalar")
+        self.stack_provider.get()  # load the default recipe's models at start-up, not on the first part
+        self._health_cfg = inspection_cfg.get("health", {}) or {}
+        self.model_health: dict[Any, Any] = {}
+        self.retrain_on_drift = bool(self._health_cfg.get("request_retrain", True))
+        review_cfg = inspection_cfg.get("review", {}) or {}
+        self.review_queue = None
+        if review_cfg.get("enabled", True):
+            from src.inference.anomaly.monitoring import ReviewQueue
+
+            self.review_queue = ReviewQueue(review_cfg.get("dir", "data/review"),
+                                            band=tuple(review_cfg.get("band", (0.8, 1.25))))
+        audit_cfg = inspection_cfg.get("audit", {}) or {}
+        self.audit_log = None
+        if audit_cfg.get("enabled", True):
+            from src.inference.audit_log import InspectionAuditLog
+
+            self.audit_log = InspectionAuditLog(audit_cfg.get("dir", "data/audit"))
+        self._pool_cfg = inspection_cfg.get("good_pool", {}) or {}
+        self._good_pools: dict[str, Any] = {}
+        self.process_service = None
+        self._part_feeds: dict[str, Any] = {}
 
         if not FactoryManager().get_instance("EventLogger"):
             logging_cfg = self.raw_config.get("logging", {}) or {}
@@ -349,6 +400,116 @@ class CameraManager:
             event_logger = EventLogger(sqlite_path=base_sqlite, csv_path=base_csv)
             FactoryManager().register_instance("EventLogger", event_logger)
         FactoryManager().register_instance("CameraManager", self)
+
+    def _resolve_defect_classes(self, configured) -> set[int] | None:
+        """Which frame-detector classes are defects. None = every class; empty = none.
+
+        A generic COCO model detects everyday objects, not defects: unless defect classes
+        are configured explicitly, its detections must never be logged as defects.
+        """
+        names = getattr(self.multiplexer, "class_names", {}) or {}
+        if configured:
+            wanted = {str(c) for c in configured}
+            ids = {i for i, n in names.items() if n in wanted or str(i) in wanted}
+            missing = wanted - {names.get(i, str(i)) for i in ids} - {str(i) for i in ids}
+            if missing:
+                logger.warning("[Inference] Configured defect classes not in the model: %s", sorted(missing))
+            return ids
+        if "person" in names.values() and len(names) >= 80:
+            logger.warning(
+                "[Inference] %s is a generic COCO detector; frame-level defect events are disabled. "
+                "Train a defect model or set inference.defect_classes. Parts are still judged by the "
+                "good-parts-only anomaly detector.", self.config.get("inference", "model_path"),
+            )
+            return set()
+        return None
+
+    def _filter_defect_detections(self, boxes: np.ndarray, xyxy: np.ndarray, conf: np.ndarray):
+        if self.defect_class_ids is None or len(boxes) == 0:
+            return boxes, xyxy, conf
+        if boxes.ndim < 2 or boxes.shape[1] <= 5:
+            return boxes, xyxy, conf  # no class column (synthetic/mock boxes)
+        keep = np.isin(boxes[:, 5].astype(int), list(self.defect_class_ids))
+        return boxes[keep], xyxy[keep], conf[keep]
+
+    # Default-recipe models (status display, backwards compatibility).
+    @property
+    def anomaly_detector(self):
+        return self.stack_provider.get()[0].anomaly
+
+    @property
+    def segmenter(self):
+        return self.stack_provider.get()[0].segmenter
+
+    @property
+    def type_classifier(self):
+        return self.stack_provider.get()[0].typer
+
+    def set_recipe(self, camera_id: str, recipe: str | None) -> None:
+        """Switch the product/recipe a camera inspects (models load on its next part)."""
+        if recipe:
+            self.camera_recipes[camera_id] = recipe
+        else:
+            self.camera_recipes.pop(camera_id, None)
+        logger.info("[Inspection] %s now inspects recipe '%s'", camera_id, recipe or self.stack_provider.default_recipe)
+
+    def _recipe_for(self, camera_id: str, cycle_id: str | None) -> str:
+        """Recipe from the producing cycle's machine data (e.g. mold id), else the camera's, else default."""
+        if self.recipe_from_scalar and cycle_id and self.process_service is not None:
+            try:
+                cycle = self.process_service.store.get_cycle(cycle_id)
+                value = (cycle.scalars or {}).get(self.recipe_from_scalar) if cycle else None
+                if value:
+                    return str(value)
+            except Exception as e:
+                logger.debug("[Inspection] recipe lookup for %s failed: %s", cycle_id, e)
+        return self.camera_recipes.get(camera_id) or self.stack_provider.default_recipe
+
+    def _good_pool(self, recipe: str):
+        if not self._pool_cfg.get("enabled", True):
+            return None
+        pool = self._good_pools.get(recipe)
+        if pool is None:
+            from src.inference.good_pool import GoodPartPool
+
+            pool = self._good_pools.setdefault(recipe, GoodPartPool(
+                self._pool_cfg.get("dir", "data/good_pool"), recipe,
+                every_n=int(self._pool_cfg.get("every_n", 5)), max_items=int(self._pool_cfg.get("max_items", 3000)),
+                max_score=self._pool_cfg.get("max_score", 0.8)))
+        return pool
+
+    def attach_process_service(self, service) -> None:
+        """Link inspections to machine cycles; render simulated parts for synthetic scenes."""
+        self.process_service = service
+        source = getattr(service, "source", None)
+        if source is None or not hasattr(source, "outcomes_ended_between"):
+            return
+        from src.process.synthetic_parts import SyntheticPartFeed
+
+        for cam in self.raw_config.get("cameras", []) or []:
+            if str(cam.get("synthetic_scene", "")).lower() != "process":
+                continue
+            link = service.aligner.link_for(str(cam.get("id")))
+            delay = link.transport_delay_s if link else 4.0
+            self._part_feeds[str(cam.get("id"))] = SyntheticPartFeed(
+                source, transport_delay_s=delay, dwell_s=float(cam.get("part_dwell_s", 0.6)),
+            )
+
+    def _telemetry_context(self, camera_id: str, ts: float | None = None, cycle_id: str | None = None):
+        """Telemetry of the cycle that produced the part in view (falls back to live values)."""
+        ctx = self.telemetry.get_telemetry(camera_id)
+        service = self.process_service
+        if service is None:
+            return ctx
+        try:
+            if cycle_id is None:
+                cycle_id = service.aligner.align(camera_id, ts if ts is not None else time.time()).cycle_id
+            overrides = {k: v for k, v in service.telemetry_for(cycle_id).items() if v is not None}
+            known = {f.name for f in dataclasses.fields(ctx)}
+            return dataclasses.replace(ctx, **{k: v for k, v in overrides.items() if k in known})
+        except Exception as e:
+            logger.debug("[%s] Cycle telemetry unavailable: %s", camera_id, e)
+            return ctx
 
     # ------------------------------------------------------------------
     # Disk persistence
@@ -472,12 +633,14 @@ class CameraManager:
 
         # Analyzers survive worker restarts: re-creating them would discard the vibration
         # history and reload the golden template on every watchdog respawn.
-        if camera_id not in self.vibration_analyzers:
+        if self.vibration_enabled and camera_id not in self.vibration_analyzers:
             self.vibration_analyzers[camera_id] = VibrationAnalyzer(
                 buffer_size=512,
                 kap_db_path=self._kap_db_path,
                 fast_queue=self.fast_queue,
                 camera_id=camera_id,
+                pixel_to_mm_scale=self.vibration_scale or 1.0,
+                calibrated=self.vibration_scale is not None,
             )
 
         if camera_id not in self.geometry_engines:
@@ -562,6 +725,7 @@ class CameraManager:
                 t.join(timeout=5.0)
 
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.inspection_executor.shutdown(wait=True, cancel_futures=True)
         self.vlm_executor.shutdown(wait=True, cancel_futures=True)
         self.runtime_metrics.stop()
         self.disk_monitor.stop()
@@ -611,6 +775,10 @@ class CameraManager:
                     "inference_alive": bool(state.inference_thread and state.inference_thread.is_alive()),
                     "logger_alive": logger_alive,
                     "last_geometric_diagnostic": dict(state.last_geometric_diagnostic or {}),
+                    "parts_inspected": state.parts_inspected,
+                    "parts_failed": state.parts_failed,
+                    "recipe": self.camera_recipes.get(camera_id) or self.stack_provider.default_recipe,
+                    "model_health": dict(getattr(self, "_health_status", {}).get(camera_id, {})),
                 }
             return out
 
@@ -693,7 +861,6 @@ class CameraManager:
 
         frame_interval = 1.0 / max(1.0, fps)
         frame_id = 0
-        manager = FactoryManager()
 
         try:
             while not self.shutdown_event.is_set() and not state.stop_event.is_set():
@@ -712,6 +879,24 @@ class CameraManager:
                     if synthetic_fail_after is not None and state.restarts == 0 and frame_id >= int(synthetic_fail_after):
                         raise RuntimeError("Synthetic capture failure injected")
                     slot = state.pool[state.pool_write_index % _POOL_SLOTS]
+                    part_feed = self._part_feeds.get(state.camera_id)
+                    if part_feed is not None:
+                        rendered, _ = part_feed.render(time.time(), width, height)
+                        np.copyto(slot.frame, rendered)
+                        frame = slot.frame
+                        state.pool_write_index += 1
+                        if not sync_mgr.sync_barrier(state.camera_id, frame_id, timeout_sec=0.05, pts=time.perf_counter()):
+                            state.sync_misses += 1
+                        frame_id += 1
+                        state.frames_captured = frame_id
+                        state.last_capture_ts = time.perf_counter()
+                        state.last_heartbeat_ts = state.last_capture_ts
+                        self._dispatch_frame(state, camera_cfg, frame, frame_id, save_every, is_synthetic=True,
+                                             mock=mock_inference_cfg or state.force_mock_inference)
+                        elapsed = time.perf_counter() - loop_start
+                        if elapsed < frame_interval and not self._interruptible_sleep(frame_interval - elapsed, state):
+                            break
+                        continue
                     slot.frame[:] = (40, 40, 40)
 
                     # Render dynamic synthetic part geometry with high-contrast borders and text overlay
@@ -792,47 +977,8 @@ class CameraManager:
                 state.last_capture_ts = time.perf_counter()
                 state.last_heartbeat_ts = state.last_capture_ts
 
-                if not (mock_inference_cfg or state.force_mock_inference):
-                    self._maybe_save_raw_frame(state.camera_id, frame, frame_id, save_every)
-                    try:
-                        multiplexer = manager.get_instance("InferenceMultiplexer")
-                        result = None
-                        if multiplexer:
-                            try:
-                                request_id = multiplexer.submit_frame(state.camera_id, frame, block=False, timeout=None)
-                                result = multiplexer.retrieve_result(request_id, timeout_sec=self.result_timeout_sec)
-                            except queue.Full:
-                                state.backpressure_warnings += 1
-                                result = None
-
-                        if result is None:
-                            if not is_synthetic:
-                                state.dropped_frames += 1
-                        else:
-                            boxes, _masks, xyxy, conf = result
-                            self._handle_inference_result(
-                                state, frame, frame_id, boxes, xyxy, conf,
-                                defect_type="anomaly",
-                                severity_fn=severity_from_conf,
-                            )
-                    except Exception as e:
-                        logger.error("[%s] Multiplexer handoff failed: %s", state.camera_id, e, exc_info=True)
-                else:
-                    packet = FramePacket(
-                        camera_id=state.camera_id,
-                        session_id=state.session_id,
-                        frame_id=frame_id,
-                        timestamp_ms=int(time.time() * 1000),
-                        frame=frame.copy(),
-                        full_image_path="",
-                    )
-                    try:
-                        state.frame_queue.put_nowait(packet)
-                        state.queue_overflow_streak = 0
-                    except queue.Full:
-                        state.queue_overflow_streak += 1
-                        if not is_synthetic:
-                            state.dropped_frames += 1
+                self._dispatch_frame(state, camera_cfg, frame, frame_id, save_every, is_synthetic=is_synthetic,
+                                     mock=mock_inference_cfg or state.force_mock_inference)
 
                 elapsed = time.perf_counter() - loop_start
                 if elapsed < frame_interval:
@@ -849,7 +995,59 @@ class CameraManager:
             if cap is not None:
                 cap.release()
 
+    def _dispatch_frame(self, state: CameraWorkerState, camera_cfg: dict, frame: np.ndarray, frame_id: int,
+                        save_every: int, *, is_synthetic: bool, mock: bool) -> None:
+        """Route a captured frame to live batched inference, or to the mock-inference worker."""
+        if not mock:
+            self._maybe_save_raw_frame(state.camera_id, frame, frame_id, save_every)
+            new_events: tuple[list[str], list[str]] = ([], [])
+            try:
+                multiplexer = FactoryManager().get_instance("InferenceMultiplexer")
+                result = None
+                if multiplexer:
+                    try:
+                        request_id = multiplexer.submit_frame(state.camera_id, frame, block=False, timeout=None)
+                        result = multiplexer.retrieve_result(request_id, timeout_sec=self.result_timeout_sec)
+                    except queue.Full:
+                        state.backpressure_warnings += 1
+                        result = None
+
+                if result is None:
+                    if not is_synthetic:
+                        state.dropped_frames += 1
+                else:
+                    boxes, _masks, xyxy, conf = result
+                    boxes, xyxy, conf = self._filter_defect_detections(boxes, xyxy, conf)
+                    new_events = self._handle_inference_result(
+                        state, frame, frame_id, boxes, xyxy, conf,
+                        defect_type="anomaly",
+                        severity_fn=severity_from_conf,
+                    )
+            except Exception as e:
+                logger.error("[%s] Multiplexer handoff failed: %s", state.camera_id, e, exc_info=True)
+            self._track_part(state, frame, frame_id, *new_events)
+            return
+
+        packet = FramePacket(
+            camera_id=state.camera_id,
+            session_id=state.session_id,
+            frame_id=frame_id,
+            timestamp_ms=int(time.time() * 1000),
+            frame=frame.copy(),
+            full_image_path="",
+        )
+        try:
+            state.frame_queue.put_nowait(packet)
+            state.queue_overflow_streak = 0
+        except queue.Full:
+            state.queue_overflow_streak += 1
+            if not is_synthetic:
+                state.dropped_frames += 1
+
     def _mock_inference_loop(self, state: CameraWorkerState, camera_cfg: dict):
+        # Process-driven synthetic scenes render real defects; injected mock boxes would
+        # contaminate the labels, so they are only used for plain synthetic streams.
+        process_scene = state.camera_id in self._part_feeds
         mock_event_every = max(1, int(camera_cfg.get("mock_event_every", 10) or 10))
         save_every = int(self._camera_setting(camera_cfg, "save_every", 10))
         manager = FactoryManager()
@@ -879,22 +1077,25 @@ class CameraManager:
                     is_synthetic = isinstance(state.source, str) and state.source.startswith("synthetic://")
                     if not is_synthetic:
                         state.dropped_frames += 1
+                    self._track_part(state, packet.frame, packet.frame_id, [], [])
                     self._interruptible_sleep(0.01, state)
                     continue
 
                 boxes, _masks, xyxy, conf = result
-                if len(boxes) == 0 and packet.frame_id % mock_event_every == 0:
+                boxes, xyxy, conf = self._filter_defect_detections(boxes, xyxy, conf)
+                if not process_scene and len(boxes) == 0 and packet.frame_id % mock_event_every == 0:
                     offset = (packet.frame_id % 10) * 100.0
                     x1, y1, x2, y2 = 10.0 + offset, 10.0, 90.0 + offset, 90.0
                     boxes = np.array([[x1, y1, x2, y2, 0.99, 0.0]], dtype=np.float32)
                     xyxy = np.array([[x1, y1, x2, y2]], dtype=np.float32)
                     conf = np.array([0.99], dtype=np.float32)
 
-                self._handle_inference_result(
+                new_events = self._handle_inference_result(
                     state, packet.frame, packet.frame_id, boxes, xyxy, conf,
                     defect_type="mock_defect",
                     severity_fn=lambda _c: 3,
                 )
+                self._track_part(state, packet.frame, packet.frame_id, *new_events)
         except Exception as e:
             state.failed = True
             state.failure_reason = f"{type(e).__name__}: {str(e)}"
@@ -916,7 +1117,8 @@ class CameraManager:
         *,
         defect_type: str,
         severity_fn,
-    ) -> None:
+    ) -> tuple[list[str], list[str]]:
+        """Track detections, log new defects; returns (new event ids, their defect types)."""
         state.frames_inferred += 1
         state.last_infer_ts = time.perf_counter()
 
@@ -928,9 +1130,11 @@ class CameraManager:
             detections[:, 5] = boxes[:, 5] if boxes.shape[1] > 5 else 0.0
 
         tracks = state.tracker.update(detections) if state.tracker is not None else []
+        new_ids: list[str] = []
+        new_types: list[str] = []
 
         if num_boxes > 0:
-            telemetry_ctx = self.telemetry.get_telemetry(state.camera_id)
+            telemetry_ctx = self._telemetry_context(state.camera_id)
             for idx in range(num_boxes):
                 c_conf = float(conf[idx]) if idx < len(conf) else 0.99
                 if idx < len(tracks):
@@ -940,13 +1144,17 @@ class CameraManager:
                     event_id = EventLogger.new_event_id()
                     tx1, ty1, tx2, ty2 = (float(v) for v in xyxy[idx])
                 if is_new:
-                    self._record_new_defect(
+                    logged = self._record_new_defect(
                         state, frame, frame_id, event_id, c_conf, (tx1, ty1, tx2, ty2),
                         telemetry_ctx, defect_type=defect_type, severity=int(severity_fn(c_conf)),
                     )
+                    if logged:
+                        new_ids.append(event_id)
+                        new_types.append(defect_type)
             self._process_vibration_flow(state, xyxy)
 
         self._submit_geometry_check(state, frame)
+        return new_ids, new_types
 
     def _record_new_defect(
         self,
@@ -960,13 +1168,24 @@ class CameraManager:
         *,
         defect_type: str,
         severity: int,
-    ) -> None:
+        overlay: np.ndarray | None = None,
+    ) -> bool:
         # The defect snapshot is the evidence image referenced by the event record.
-        evidence_path = ""
+        evidence_path, overlay_path, crop_path = "", None, None
+        h, w = frame.shape[:2]
+        x1_c = int(np.clip(bbox[0], 0, w - 1))
+        y1_c = int(np.clip(bbox[1], 0, h - 1))
+        x2_c = int(np.clip(bbox[2], 0, w))
+        y2_c = int(np.clip(bbox[3], 0, h))
+        crop_matrix = frame[y1_c:y2_c, x1_c:x2_c].copy()
         if self.disk_monitor.allow_defect_save():
-            defect_path = self.defect_dir / state.camera_id / f"{state.camera_id}_defect_{event_id}_frame_{frame_id:04d}.png"
-            if self.enqueue_disk_write(defect_path, frame):
-                evidence_path = str(defect_path.resolve())
+            base = self.defect_dir / state.camera_id / f"{state.camera_id}_defect_{event_id}_frame_{frame_id:04d}"
+            if self.enqueue_disk_write(base.with_suffix(".png"), frame):
+                evidence_path = str(base.with_suffix(".png").resolve())
+            if overlay is not None and self.enqueue_disk_write(Path(f"{base}_overlay.png"), overlay):
+                overlay_path = str(Path(f"{base}_overlay.png").resolve())
+            if crop_matrix.size and self.enqueue_disk_write(Path(f"{base}_crop.png"), crop_matrix):
+                crop_path = str(Path(f"{base}_crop.png").resolve())
 
         event = DefectEvent(
             event_id=event_id,
@@ -986,23 +1205,176 @@ class CameraManager:
             speed=telemetry_ctx.speed,
             lot_id=telemetry_ctx.lot_id,
             full_image_path=evidence_path,
-            overlay_path=None,
-            crop_path=None,
+            overlay_path=overlay_path,
+            crop_path=crop_path,
         )
 
         event_logger = FactoryManager().get_instance("EventLogger")
         if not self._dispatch_event(event_logger, event):
-            return
+            return False
         state.events_logged += 1
         state.last_log_ts = time.time()
-
-        h, w = frame.shape[:2]
-        x1_c = int(np.clip(bbox[0], 0, w - 1))
-        y1_c = int(np.clip(bbox[1], 0, h - 1))
-        x2_c = int(np.clip(bbox[2], 0, w))
-        y2_c = int(np.clip(bbox[3], 0, h))
-        crop_matrix = frame[y1_c:y2_c, x1_c:x2_c].copy()
         self._submit_vlm_reasoning(crop_matrix, event_id, event_logger)
+        return True
+
+    # ------------------------------------------------------------------
+    # Per-part inspection
+    # ------------------------------------------------------------------
+
+    def _track_part(self, state: CameraWorkerState, frame: np.ndarray, frame_id: int,
+                    event_ids: list[str], defect_types: list[str]) -> None:
+        if not self.inspection_enabled:
+            return
+        tracker = self.part_trackers.get(state.camera_id)
+        if tracker is None:
+            tracker = self.part_trackers.setdefault(state.camera_id, PartPresenceTracker(
+                state.camera_id, on_frames=self._presence_on_frames, off_frames=self._presence_off_frames,
+            ))
+        present = is_part_present(frame, self.presence_std_threshold)
+        completed = tracker.update(frame, present, time.time(), frame_id, event_ids, defect_types)
+        if completed is not None:
+            try:
+                self.inspection_executor.submit(self._inspect_part, state, completed)
+            except RuntimeError:
+                pass  # shutting down
+
+    def _inspect_part(self, state: CameraWorkerState, part: CompletedPart) -> None:
+        """Final verdict for one physical part, recorded against its producing cycle.
+
+        Decision stack (per recipe): good-parts-only anomaly model (catches anything unusual)
+        + supervised segmenter (names and delineates known defect types) + frame-level
+        detections seen while the part was in view. Any of them failing the part fails it.
+        A shadow stack, when registered, judges the same part without affecting the verdict.
+        """
+        try:
+            frame = part.best_frame
+            service = self.process_service
+            if service is not None and service.aligner.link_for(state.camera_id) is None:
+                service = None  # camera not linked to a machine: no process label to record
+            alignment = service.aligner.align(state.camera_id, part.ts) if service is not None else None
+            cycle_id = alignment.cycle_id if alignment else None
+            recipe = self._recipe_for(state.camera_id, cycle_id)
+            stack, shadow = self.stack_provider.get(recipe)
+
+            judged = stack.judge(frame, frame_defect_types=list(part.defect_types or []))
+            failed = judged.failed or bool(part.defect_event_ids)
+            anomaly, top = judged.anomaly, judged.top
+            defect_type, bbox, confidence = judged.defect_type, judged.bbox, judged.confidence
+            event_id = part.defect_event_ids[0] if part.defect_event_ids else None
+            h, w = frame.shape[:2]
+
+            if failed and event_id is None:
+                # No frame-level event exists for this part: log one with part-level evidence.
+                event_id = EventLogger.new_event_id()
+                overlay = None
+                if top is not None and top.mask is not None:
+                    overlay = frame.copy()
+                    overlay[top.mask] = (0.5 * overlay[top.mask] + 0.5 * np.array([0, 0, 255])).astype(np.uint8)
+                    cv2.rectangle(overlay, top.bbox[:2], top.bbox[2:], (0, 0, 255), 2)
+                elif anomaly is not None and anomaly.is_anomalous:
+                    overlay = stack.anomaly.heatmap_overlay(frame, anomaly, stack.anomaly.threshold)
+                if anomaly is not None and anomaly.is_anomalous and top is None:
+                    severity = 3 if anomaly.normalized_score >= 2.0 else (2 if anomaly.normalized_score >= 1.3 else 1)
+                else:
+                    severity = severity_from_conf(confidence or 0.5)
+                ctx = self._telemetry_context(state.camera_id, part.ts, cycle_id)
+                if not self._record_new_defect(
+                    state, frame, part.best_frame_id, event_id, float(confidence or 0.5), bbox or (0, 0, w, h), ctx,
+                    defect_type=defect_type or "anomaly", severity=severity, overlay=overlay,
+                ):
+                    event_id = None
+
+            verdict = "fail" if failed else "pass"
+            normalized = judged.normalized_score
+            image_sha = None
+            if self.audit_log is not None or shadow is not None or self.review_queue is not None:
+                from src.inference.audit_log import image_sha256
+
+                image_sha = image_sha256(frame)
+
+            shadow_record = None
+            if shadow is not None and not shadow.empty:
+                try:
+                    sj = shadow.judge(frame, frame_defect_types=list(part.defect_types or []))
+                    shadow_record = {
+                        "ts": part.ts, "camera_id": state.camera_id, "cycle_id": cycle_id, "image_sha": image_sha,
+                        "active_version": stack.versions.get("anomaly", {}).get("version"),
+                        "shadow_version": shadow.versions.get("anomaly", {}).get("version"),
+                        "active_verdict": verdict, "shadow_verdict": "fail" if (sj.failed or part.defect_event_ids) else "pass",
+                        "active_score": normalized, "shadow_score": sj.normalized_score,
+                        "active_type": defect_type, "shadow_type": sj.defect_type,
+                    }
+                    if self.stack_provider.registry is not None:
+                        self.stack_provider.registry.log_shadow(recipe, "anomaly", shadow_record)
+                except Exception as e:
+                    logger.warning("[%s] Shadow model failed on a part: %s", state.camera_id, e)
+
+            self._update_model_health(state.camera_id, recipe, stack, normalized, failed)
+            if self.review_queue is not None and self.review_queue.should_review(normalized):
+                self.review_queue.add(
+                    state.camera_id, frame, normalized_score=normalized, verdict=verdict,
+                    cycle_id=cycle_id, event_id=event_id,
+                    overlay=stack.anomaly.heatmap_overlay(frame, anomaly, stack.anomaly.threshold),
+                    bbox=bbox if failed else (anomaly.bbox if anomaly is not None else None),
+                    predicted_type=defect_type, image_sha=image_sha, recipe=recipe,
+                )
+            elif not failed:
+                pool = self._good_pool(recipe)
+                if pool is not None:
+                    pool.offer(frame, verdict=verdict, normalized_score=normalized, camera_id=state.camera_id,
+                               image_sha=image_sha)
+
+            if self.audit_log is not None:
+                self.audit_log.append({
+                    "ts": part.ts, "camera_id": state.camera_id, "recipe": recipe, "cycle_id": cycle_id,
+                    "verdict": verdict, "defect_type": defect_type if failed else None,
+                    "normalized_score": normalized, "raw_score": anomaly.score if anomaly is not None else None,
+                    "threshold": stack.anomaly.threshold if stack.anomaly is not None else None,
+                    "models": stack.versions, "image_sha256": image_sha, "event_id": event_id,
+                    "frame_event_ids": list(part.defect_event_ids or []),
+                    "shadow": None if shadow_record is None else {
+                        "version": shadow_record["shadow_version"], "verdict": shadow_record["shadow_verdict"],
+                        "score": shadow_record["shadow_score"]},
+                })
+
+            if service is not None:
+                service.record_inspection(
+                    state.camera_id, part.ts, verdict,
+                    defect_type=defect_type,
+                    anomaly_score=normalized,
+                    event_id=event_id,
+                    alignment=alignment,
+                )
+            state.parts_inspected += 1
+            if failed:
+                state.parts_failed += 1
+        except Exception as e:
+            logger.error("[%s] Part inspection failed: %s", state.camera_id, e, exc_info=True)
+
+    def _update_model_health(self, camera_id: str, recipe: str, stack, normalized: float | None, failed: bool) -> None:
+        det = stack.anomaly
+        version = (stack.versions.get("anomaly") or {}).get("digest")
+        key = (camera_id, recipe, version)   # a new model version starts a fresh health baseline
+        monitor = self.model_health.get(key)
+        if monitor is None:
+            from src.inference.anomaly.monitoring import ModelHealthMonitor
+
+            monitor = self.model_health.setdefault(key, ModelHealthMonitor(
+                calibration=getattr(det, "calibration", None), threshold=getattr(det, "threshold", None),
+                window=int(self._health_cfg.get("window", 300)),
+                drift_ratio=float(self._health_cfg.get("drift_ratio", 1.5)),
+                expected_reject_rate=float(self._health_cfg.get("expected_reject_rate", 0.05)),
+            ))
+        status = monitor.update(normalized, failed)
+        status["recipe"] = recipe
+        status["models"] = {r: v.get("version") for r, v in stack.versions.items()}
+        self._health_status = getattr(self, "_health_status", {})
+        self._health_status[camera_id] = status
+        registry = self.stack_provider.registry
+        if (self.retrain_on_drift and registry is not None and det is not None
+                and status.get("score_drift") and status["score_drift"] > monitor.drift_ratio):
+            registry.request_retrain(recipe, camera_id=camera_id, since_ts=time.time(),
+                                     reason=f"score drift {status['score_drift']:.2f}x on {camera_id}")
 
     def _dispatch_event(self, event_logger, event: DefectEvent) -> bool:
         """Hand a DefectEvent to the EventLogger (async batch path when an event loop is running)."""

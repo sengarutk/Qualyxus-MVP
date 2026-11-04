@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import io
 import json
@@ -10,6 +9,7 @@ from typing import Any
 import torch
 
 from src.config.config import Config
+from src.training.federated_crypto import load_key, seal
 
 
 class FederatedClient:
@@ -60,24 +60,25 @@ class FederatedClient:
         return buffer.getvalue()
 
     @staticmethod
-    def _simulate_aes256_encrypt(payload: bytes, key_material: str) -> str:
-        digest = hashlib.sha256(key_material.encode("utf-8")).digest()
-        encrypted = bytes(payload[i] ^ digest[i % len(digest)] for i in range(len(payload)))
-        return base64.b64encode(encrypted).decode("utf-8")
+    def _associated_data(node_id: str, version: str, sha256: str) -> bytes:
+        return f"{node_id}|{version}|{sha256}".encode("utf-8")
 
     def export_secure_payload(self, model, version: str = "v1") -> dict[str, Any]:
         extracted = self.extract_trainable_weights(model)
         sanitized = self.sanitize_weights(extracted)
         payload_bytes = self._serialize_weights(sanitized)
         sha256 = hashlib.sha256(payload_bytes).hexdigest()
-        encrypted_payload = self._simulate_aes256_encrypt(payload_bytes, key_material=f"{self.node_id}:{version}:{sha256}")
+        key = load_key(self.config.get("federated_learning", "key_path", default=None))
+        nonce, ciphertext = seal(payload_bytes, key, self._associated_data(self.node_id, version, sha256))
 
         payload = {
             "node_id": self.node_id,
             "version": version,
             "privacy_level": str(self.config.get("federated_learning", "privacy_level", default="maximum")),
             "sha256": sha256,
-            "encrypted_payload": encrypted_payload,
+            "cipher": "AES-256-GCM",
+            "nonce": nonce,
+            "encrypted_payload": ciphertext,
             "tensor_count": len(sanitized),
         }
         self._record_contribution(version)

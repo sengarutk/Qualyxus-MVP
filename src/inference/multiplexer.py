@@ -27,6 +27,7 @@ class InferenceMultiplexer:
         self.lock = threading.Lock()
         self.results = {}  # request_id -> (Event, result)
         
+        self.class_names: dict[int, str] = {}
         # Load YOLO model: inference.model_path, falling back to the MODEL_ASSET_PATH
         # deployment variable (set by the Docker image / compose file) when that file is absent.
         model_path = self.config.get("inference", "model_path") or "models/checkpoints/default/best.pt"
@@ -57,6 +58,7 @@ class InferenceMultiplexer:
             try:
                 self.model = YOLO(model_path)
                 self.model.to(self.device)
+                self.class_names = {int(k): str(v) for k, v in (getattr(self.model, "names", None) or {}).items()}
             except Exception as e:
                 logger.error(f"[InferenceMultiplexer] Failed to load model: {e}. Falling back to mock mode.")
                 self.model = None

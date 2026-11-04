@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      # Pretrained backbones (torchvision ResNet/WRN, DINOv2 from Hugging Face) are cached
+      # between runs so the model tests do not re-download ~1 GB each time.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/torch
+            ~/.cache/huggingface
+          key: weights-${{ hashFiles('src/inference/anomaly/backbones.py') }}
+
+      - name: Install dependencies (CPU build of PyTorch)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q libgl1 libglib2.0-0
+          pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          grep -vE '^(--extra-index-url|torch|torchvision|torchaudio|nvidia-|triton)' requirements.txt > /tmp/requirements-ci.txt
+          pip install -r /tmp/requirements-ci.txt pytest
+
+      - name: Byte-compile
+        run: python -m compileall -q src scripts main.py
+
+      - name: Tests
+        run: python -m pytest tests -q --durations=15

@@ -1,30 +1,30 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import io
-import json
-from pathlib import Path
 from typing import Any
 
 import torch
+from cryptography.exceptions import InvalidTag
+
+from src.training.federated_crypto import load_key, open_sealed
 
 
 class FederatedServer:
     """Simple FedAvg secure aggregation coordinator for simulated factory nodes."""
 
-    @staticmethod
-    def _decrypt_payload(encrypted_payload: str, key_material: str) -> bytes:
-        digest = hashlib.sha256(key_material.encode("utf-8")).digest()
-        raw = base64.b64decode(encrypted_payload.encode("utf-8"))
-        return bytes(raw[i] ^ digest[i % len(digest)] for i in range(len(raw)))
+    def __init__(self, key: bytes | None = None, key_path: str | None = None):
+        self.key = key if key is not None else load_key(key_path)
 
-    @staticmethod
-    def load_secure_payload(client_payload: dict[str, Any]) -> dict[str, torch.Tensor]:
-        key_material = f"{client_payload['node_id']}:{client_payload['version']}:{client_payload['sha256']}"
-        payload_bytes = FederatedServer._decrypt_payload(client_payload["encrypted_payload"], key_material)
-        sha256 = hashlib.sha256(payload_bytes).hexdigest()
-        if sha256 != client_payload.get("sha256"):
+    def load_secure_payload(self, client_payload: dict[str, Any]) -> dict[str, torch.Tensor]:
+        if client_payload.get("cipher") != "AES-256-GCM":
+            raise ValueError("Unsupported or missing federated payload cipher")
+        aad = f"{client_payload['node_id']}|{client_payload['version']}|{client_payload['sha256']}".encode("utf-8")
+        try:
+            payload_bytes = open_sealed(client_payload["nonce"], client_payload["encrypted_payload"], self.key, aad)
+        except InvalidTag as exc:
+            raise ValueError("Federated payload failed authentication (wrong key or tampered)") from exc
+        if hashlib.sha256(payload_bytes).hexdigest() != client_payload.get("sha256"):
             raise ValueError("Federated payload integrity check failed")
         buffer = io.BytesIO(payload_bytes)
         # Payloads arrive from remote nodes: never unpickle arbitrary objects, tensors only.

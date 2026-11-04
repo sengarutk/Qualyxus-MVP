@@ -296,3 +296,125 @@ def fetch_system_health() -> dict:
         return payload
     except Exception:
         return {"state": "SAFE", "vitals": {}, "resource_log": []}
+
+
+@st.cache_data(ttl=10)
+def fetch_process_overview(process_db_path: str, actions_db_path: str, window_hours: float = 8.0) -> dict:
+    """Process-quality loop: KPIs, risk timeline and pending prescriptions."""
+    if not Path(process_db_path).exists():
+        return {}
+    from src.process.kpis import compute_kpis
+    from src.process.store import ProcessStore
+
+    store = ProcessStore(process_db_path)
+    now = time.time()
+    since = now - window_hours * 3600.0
+    kpis = compute_kpis(store, since, now)
+    model = store.active_model()
+
+    engine = create_engine(f"sqlite:///{process_db_path}", future=True)
+    timeline = pd.read_sql_query(
+        text(
+            """
+            SELECT p.cycle_id, p.ts, p.risk, p.decision, p.likely_defect, p.top_factors,
+                   (SELECT MAX(CASE WHEN i.verdict = 'fail' THEN 1 ELSE 0 END)
+                      FROM inspections i WHERE i.cycle_id = p.cycle_id) AS failed
+            FROM cycle_predictions p
+            WHERE p.ts >= :since
+            ORDER BY p.ts
+            """
+        ),
+        engine,
+        params={"since": since},
+    )
+    engine.dispose()
+    if not timeline.empty:
+        timeline["time"] = pd.to_datetime(timeline["ts"], unit="s")
+        timeline["factors"] = timeline["top_factors"].map(
+            lambda raw: ", ".join(f"{f['feature']} {f['direction']} normal" for f in json.loads(raw or "[]")[:3])
+        )
+
+    prescriptions: list[dict] = []
+    if Path(actions_db_path).exists():
+        from src.operations.action_tracker import ActionTracker
+
+        tracker = ActionTracker(sqlite_path=actions_db_path)
+        for status in ("open", "in_progress"):
+            for action in tracker.list_actions(status=status, limit=100):
+                payload = action.get("action_payload") or {}
+                if payload.get("action_type") == "process_prescription":
+                    prescriptions.append({
+                        "action_id": action["action_id"],
+                        "status": action["status"],
+                        "approved_by": action.get("approved_by"),
+                        "recommendation": payload.get("explanation"),
+                        "issued": action.get("timestamp"),
+                    })
+    return {"kpis": kpis, "model": model, "timeline": timeline, "prescriptions": prescriptions}
+
+
+@st.cache_data(ttl=15)
+def fetch_vision_overview(status_path: str, process_db_path: str, registry_dir: str | None, review_dir: str,
+                          audit_dir: str, window_hours: float = 8.0, required_cameras: tuple[str, ...] = ()) -> dict:
+    """Vision-model operations: health per camera, registry/shadow, review queue, defect mix, audit."""
+    out: dict = {"cameras": [], "registry": [], "requests": [], "shadow": [], "review": {}, "defect_types": [],
+                 "parts": {}, "audit": None}
+    status = _read_status(status_path)
+    cams = status.get("workers", {}) if isinstance(status, dict) else {}
+    for cam_id, cam in (cams or {}).items():
+        if not isinstance(cam, dict) or "parts_inspected" not in cam:
+            continue
+        health = cam.get("model_health") or {}
+        out["cameras"].append({
+            "camera": cam_id, "recipe": health.get("recipe") or cam.get("recipe"),
+            "models": ", ".join(f"{k}={v}" for k, v in (health.get("models") or {}).items()),
+            "parts": cam.get("parts_inspected", 0), "failed": cam.get("parts_failed", 0),
+            "reject_rate": health.get("reject_rate"), "score_drift": health.get("score_drift"),
+            "alerts": " | ".join(health.get("alerts") or []),
+        })
+    if registry_dir and Path(registry_dir).exists():
+        from src.inference.model_registry import VisionModelRegistry
+
+        reg = VisionModelRegistry(registry_dir)
+        for row in reg.overview():
+            last = row.get("last_change") or {}
+            out["registry"].append({**{k: row[k] for k in ("recipe", "role", "active", "shadow", "versions")},
+                                    "last_change": f"{last.get('action')} {last.get('version')} by {last.get('by')}"})
+            if row["shadow"] and row["role"] == "anomaly":
+                out["shadow"].append(reg.shadow_report(row["recipe"], "anomaly", review_dir=review_dir))
+        out["requests"] = [{k: r.get(k) for k in ("id", "recipe", "role", "camera_id", "reason", "status", "decided_by")}
+                           for r in reg.requests() if r["status"] in ("pending", "approved")]
+    if Path(review_dir).exists():
+        from src.inference.labeling import prioritise, review_items
+
+        everything = review_items(review_dir, include_reviewed=True)
+        pending = [i for i in everything if not (i.get("review") or {}).get("verdict")]
+        reviewed = [i for i in everything if (i.get("review") or {}).get("verdict")]
+        wrong = sum(1 for i in reviewed if i["review"]["verdict"] != i.get("model_verdict"))
+        out["review"] = {
+            "pending": len(pending), "reviewed": len(reviewed),
+            "model_agreement": round(1 - wrong / len(reviewed), 4) if reviewed else None,
+            "next": [{"id": i["id"], "camera": i.get("camera_id"), "score": i.get("normalized_score"),
+                      "model_verdict": i.get("model_verdict"), "predicted_type": i.get("predicted_type")}
+                     for i in prioritise(pending)[:15]],
+        }
+    if Path(process_db_path).exists():
+        from src.process.store import ProcessStore
+
+        store = ProcessStore(process_db_path)
+        try:
+            now = time.time()
+            parts = store.part_verdicts(now - window_hours * 3600.0, now, required_cameras=required_cameras)
+            counts = pd.Series([p["verdict"] for p in parts]).value_counts().to_dict() if parts else {}
+            out["parts"] = {"total": len(parts), **{str(k): int(v) for k, v in counts.items()},
+                            "multi_view": sum(1 for p in parts if len(p["views"]) > 1)}
+            types = pd.Series([t for p in parts if p["verdict"] == "fail" for t in (p["defect_types"] or ["unspecified"])])
+            if not types.empty:
+                out["defect_types"] = [{"defect_type": k, "parts": int(v)} for k, v in types.value_counts().items()]
+        finally:
+            store.close()
+    if Path(audit_dir).exists():
+        from src.inference.audit_log import verify_chain
+
+        out["audit"] = verify_chain(audit_dir)
+    return out

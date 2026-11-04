@@ -46,6 +46,8 @@ from src.operations.shift_handover import ShiftHandoverGenerator, ShiftHandoverI
 from src.dashboard.data_access import (
     fetch_esg_data,
     fetch_federated_status,
+    fetch_process_overview,
+    fetch_vision_overview,
     fetch_system_health,
     get_kpi_metrics,
     query_defects_by_machine,
@@ -207,6 +209,150 @@ def main():
         except Exception:
             pass
 
+    if bool(cfg.get("inspection", "enabled", default=True)):
+        _render_vision_section(cfg, status_path)
+
+    if bool(cfg.get("process", "enabled", default=False)):
+        _render_process_section(cfg, actions_db_path)
+
+    if bool(cfg.get("esg_params", "enabled", default=True)):
+        _render_esg_section(sqlite_path)
+
+    if bool(cfg.get("federated_learning", "enabled", default=False)):
+        _render_federated_section()
+
+    _render_operations(cfg, sqlite_path, actions_db_path, status_path, runtime_metrics_path,
+                       selected_role, current_user, kpis, auto_refresh)
+
+
+def _render_vision_section(cfg, status_path: str) -> None:
+    st.divider()
+    st.subheader("🔬 Vision Models & Inspection Quality")
+    required = tuple(str(c.get("id")) for c in (cfg.get("cameras", default=[]) or [])
+                     if c.get("enabled", True) and c.get("required_view"))
+    overview = fetch_vision_overview(
+        status_path,
+        str(cfg.get("process", "db_path", default="data/events/process.db")),
+        cfg.get("inspection", "registry_dir", default=None),
+        str(cfg.get("inspection", "review", "dir", default="data/review")),
+        str(cfg.get("inspection", "audit", "dir", default="data/audit")),
+        required_cameras=required,
+    )
+    parts = overview.get("parts") or {}
+    review = overview.get("review") or {}
+    audit = overview.get("audit")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Parts judged (8h)", parts.get("total", 0), help=f"{parts.get('multi_view', 0)} seen by several cameras")
+    c2.metric("Failed parts", parts.get("fail", 0))
+    c3.metric("Incomplete (missing view)", parts.get("incomplete", 0),
+              help="Passed parts not yet seen by every camera marked required_view: true")
+    agreement = review.get("model_agreement")
+    agreement_text = "n/a" if agreement is None else f"{100 * agreement:.1f}%"
+    c4.metric("Review queue", review.get("pending", 0),
+              help=f"{review.get('reviewed', 0)} reviewed; model agreed with reviewers {agreement_text}")
+    if audit is None:
+        enabled = bool(cfg.get("inspection", "audit", "enabled", default=True))
+        c5.metric("Audit trail", "no records yet" if enabled else "off")
+    else:
+        c5.metric("Audit trail", "✅ intact" if audit.get("ok") else "❌ BROKEN", help=str(audit.get("error") or
+                  f"{audit.get('records', 0)} hash-chained verdict records"))
+
+    if overview.get("cameras"):
+        st.markdown("**Model health per camera**")
+        st.dataframe(overview["cameras"], width="stretch", hide_index=True)
+        for cam in overview["cameras"]:
+            if cam.get("alerts"):
+                st.warning(f"{cam['camera']}: {cam['alerts']}")
+    left, right = st.columns(2)
+    with left:
+        if overview.get("defect_types"):
+            fig = px.bar(overview["defect_types"], x="defect_type", y="parts", title="Failed parts by defect type (8h)")
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.caption("No failed parts in the window.")
+    with right:
+        st.markdown("**Most informative parts to review next**")
+        if review.get("next"):
+            st.dataframe(review["next"], width="stretch", hide_index=True)
+            st.caption("Export a labelling batch: python -m src.inference.labeling export --out data/labeling/batch_N")
+        else:
+            st.caption("Review queue is empty.")
+    if overview.get("registry"):
+        st.markdown("**Model registry**")
+        st.dataframe(overview["registry"], width="stretch", hide_index=True)
+    for rep in overview.get("shadow") or []:
+        if not rep.get("parts"):
+            continue
+        reviewed = rep.get("reviewed") or {}
+        st.info(
+            f"Shadow {rep['shadow_version']} vs active {rep['active_version']} ({rep['recipe']}): "
+            f"{rep['parts']} parts, agreement {100 * rep['agreement']:.1f}%, reject rate "
+            f"{100 * rep['shadow_reject_rate']:.1f}% vs {100 * rep['active_reject_rate']:.1f}%"
+            + (f"; on {reviewed['parts']} reviewed parts accuracy {100 * reviewed['shadow_accuracy']:.1f}% vs "
+               f"{100 * reviewed['active_accuracy']:.1f}%, escapes {reviewed['shadow_escapes']} vs "
+               f"{reviewed['active_escapes']}" if reviewed else "")
+        )
+    if overview.get("requests"):
+        st.markdown("**Retraining requests (need approval)**")
+        st.dataframe(overview["requests"], width="stretch", hide_index=True)
+        st.caption("Approve: python -m src.inference.model_registry approve <id> --by <name>, then retrain <id>.")
+
+
+def _render_process_section(cfg, actions_db_path: str) -> None:
+    st.divider()
+    st.subheader("⚙️ Process ↔ Quality Intelligence")
+    overview = fetch_process_overview(
+        str(cfg.get("process", "db_path", default="data/events/process.db")), actions_db_path,
+    )
+    if not overview:
+        st.info("No process cycles recorded yet. Start the runtime with process.enabled: true.")
+        return
+    k = overview["kpis"]
+    model = overview.get("model") or {}
+    validation = (model.get("metrics") or {}).get("validation") or {}
+    prediction = k.get("prediction") or {}
+
+    def _pct(value):
+        return "n/a" if value is None else f"{100 * value:.1f}%"
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Parts inspected (8h)", k.get("parts_inspected", 0))
+    c2.metric("Scrap rate", _pct(k.get("scrap_rate")))
+    c3.metric("Risk model", f"{model.get('kind', 'none')}", help=str(model.get("version", "")))
+    c4.metric("Validation AUC", f"{validation['roc_auc']:.2f}" if "roc_auc" in validation else "n/a")
+    c5.metric("Median early warning", "n/a" if k.get("median_warning_cycles") is None
+              else f"{k['median_warning_cycles']:.0f} cycles")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Risk precision", _pct(prediction.get("precision")))
+    d2.metric("Risk recall", _pct(prediction.get("recall")))
+    d3.metric("False reject rate", _pct(k.get("false_reject_rate")), help="Requires audit records")
+    d4.metric("Escape rate", _pct(k.get("escape_rate")), help="Requires audit records")
+
+    timeline = overview.get("timeline")
+    if timeline is not None and not timeline.empty:
+        timeline = timeline.assign(outcome=timeline["failed"].map({1: "failed inspection", 0: "passed"}).fillna("not inspected"))
+        fig = px.scatter(
+            timeline, x="time", y="risk", color="outcome",
+            color_discrete_map={"failed inspection": "#d62728", "passed": "#2ca02c", "not inspected": "#9e9e9e"},
+            hover_data=["cycle_id", "likely_defect", "factors"], title="Predicted defect risk per cycle vs. actual outcome",
+        )
+        st.plotly_chart(fig, width="stretch")
+        high = timeline[timeline["decision"] == "high"].sort_values("ts", ascending=False).head(15)
+        if not high.empty:
+            st.markdown("**Recent high-risk cycles**")
+            st.dataframe(high[["time", "cycle_id", "risk", "likely_defect", "factors", "failed"]],
+                         width="stretch", hide_index=True)
+
+    prescriptions = overview.get("prescriptions") or []
+    st.markdown(f"**Setpoint prescriptions awaiting action ({len(prescriptions)})**")
+    if prescriptions:
+        st.caption("Approve and close them in the Operations Control Panel once the change is applied on the machine.")
+        st.dataframe(prescriptions, width="stretch", hide_index=True)
+    else:
+        st.caption("No open prescriptions.")
+
+
+def _render_esg_section(sqlite_path: str) -> None:
     esg_payload = fetch_esg_data(sqlite_path=sqlite_path)
     esg_current = esg_payload.get("current", {})
     esg_delta = esg_payload.get("delta", {})
@@ -231,6 +377,9 @@ def main():
         delta=f"{float(esg_delta.get('co2_emissions_offset_kg', 0.0)):.2f} vs prev 24h",
     )
 
+
+
+def _render_federated_section() -> None:
     fed_status = fetch_federated_status()
     st.divider()
     st.subheader("🌐 Global Intelligence Status")
@@ -239,6 +388,9 @@ def main():
     f2.metric("Global Knowledge Version", str(fed_status.get("global_knowledge_version", "n/a")))
     st.caption(str(fed_status.get("privacy_tooltip", "Qualyxus Federated Learning keeps raw data local.")))
 
+
+def _render_operations(cfg, sqlite_path, actions_db_path, status_path, runtime_metrics_path,
+                       selected_role, current_user, kpis, auto_refresh) -> None:
     try:
         rca = _load_rca(sqlite_path=sqlite_path)
     except Exception as exc:

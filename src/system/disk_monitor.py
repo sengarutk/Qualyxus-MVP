@@ -53,6 +53,7 @@ def _purge_blank_raw_frames(
             img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
             if img is None:
                 continue
+            img = cv2.GaussianBlur(img, (5, 5), 0)  # same denoising as CameraManager.is_part_present
             if float(np.std(img)) < std_dev_threshold and float(cv2.Laplacian(img, cv2.CV_64F).var()) < 6.0:
                 p.unlink(missing_ok=True)
                 purged_count += 1

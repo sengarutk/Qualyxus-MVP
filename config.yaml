@@ -20,13 +20,19 @@ dataset:
     0: "defect"
 
 inference:
+  # Frame-level detector. yolov8s-seg.pt is a generic COCO model (it detects everyday
+  # objects, not defects), so its detections are ignored unless defect_classes lists the
+  # classes of a trained defect model, e.g. ["scratch", "crack"].
   model_path: "yolov8s-seg.pt"
+  defect_classes: []
   yolo_yaml: "data/processed/active_recipe.yaml"
   conf: 0.35
   iou: 0.5
   skip_frames: 1
 
 training:
+  # Legacy Ultralytics trainer (src/training/train_yolo_seg.py, AGPL-3.0 weights). The recommended
+  # supervised path is src.inference.segmentation.train (RF-DETR-Seg, Apache-2.0).
   model: "yolov8s-seg.pt"
   epochs: 30
   imgsz: 640
@@ -67,6 +73,9 @@ vlm_reasoning:
   backend: "ollama"
 
 esg_params:
+  # Secondary reporting module; hidden on the dashboard until the core scrap-reduction
+  # loop is proven on a real line.
+  enabled: false
   material_density_kg_per_unit: 0.5
   unit_cost_usd: 12.5
   carbon_coefficient_kg_co2_per_kg: 2.5
@@ -80,9 +89,12 @@ synthetic_generation:
   output_resolution: [640, 640]
 
 federated_learning:
-  enabled: true
+  # Requires a pre-shared AES-256 key (QUALYXUS_FEDERATED_KEY or key_path); see
+  # src/training/federated_crypto.py. Disabled until a multi-site deployment exists.
+  enabled: false
   privacy_level: "maximum"
   sync_interval_hours: 24
+  key_path: "secrets/federated.key"
 
 camera_settings:
   use_gstreamer: true
@@ -147,7 +159,125 @@ camera:
   raw_dir: "data/live/raw"
   defect_dir: "data/live/defects"
 
+# Process-quality intelligence: machine cycles <-> inspected parts.
+process:
+  enabled: true
+  # simulated (development) | modbus | opcua
+  source: "simulated"
+  machine_id: "imm_1"
+  line_id: "line_A"
+  db_path: "data/events/process.db"
+  models_dir: "models/process"
+  store_curves: true
+  simulator:
+    seed: 7
+    time_scale: 1.0          # >1 runs the simulated machine faster than real time
+    disturbance_scale: 1.0
+  model:
+    golden_warmup_cycles: 50
+    retrain_every_labels: 250
+    min_train_samples: 300
+    min_train_positives: 20
+    min_promotion_auc: 0.65
+  prescriptions:
+    enabled: true            # issued as approval-gated actions; never written to the PLC
+    max_step_fraction: 0.08
+    min_risk_drop: 0.1
+    cooldown_cycles: 60
+  # Example plant connection (set source: modbus):
+  # modbus:
+  #   host: "10.0.0.50"
+  #   port: 502
+  #   unit_id: 1
+  #   poll_hz: 20
+  #   cycle_counter: {address: 100, data_type: "uint32"}
+  #   signals:
+  #     injection_pressure: {address: 200, scale: 0.1}
+  #     hold_pressure: {address: 202, scale: 0.1}
+  #     melt_temp: {address: 204, scale: 0.1}
+  #     mold_temp: {address: 206, scale: 0.1}
+  #     cushion_mm: {address: 208, scale: 0.01, kind: "scalar"}
+  #   setpoints:
+  #     hold_pressure_sp: {address: 300, scale: 0.1}
+  # Example (set source: opcua):
+  # opcua:
+  #   endpoint: "opc.tcp://10.0.0.50:4840"
+  #   poll_hz: 20
+  #   cycle_counter: {node_id: "ns=2;s=Machine.ShotCounter"}
+  #   signals:
+  #     injection_pressure: {node_id: "ns=2;s=Machine.InjectionPressure"}
+
+# Per-part inspection (one pass/fail verdict per physical part -> process labels).
+inspection:
+  enabled: true
+  # Recipe (product) a camera inspects; cameras may override with `recipe:`, and with
+  # recipe_from_scalar the producing cycle's machine value (e.g. the mold id) selects it.
+  recipe: "default"
+  recipe_from_scalar: null
+  # Versioned model registry (python -m src.inference.model_registry ...). When a recipe has
+  # registered models they take precedence over the paths below; promote/rollback are
+  # picked up live (checked every reload_check_s). Shadow models judge every part in
+  # parallel without affecting verdicts (shadow-report compares them before promotion).
+  registry_dir: "models/registry"
+  reload_check_s: 10
+  max_cached_recipes: 3
+  shadow:
+    enabled: true
+  # Per-recipe explicit models without a registry:
+  # recipes:
+  #   housing_a: {anomaly_model: models/anomaly/housing_a.pt, segmentation_model: models/segmentation/housing_a}
+  # Good-parts-only anomaly model (PatchCore or Dinomaly; WRN-50 / DINOv2 / DINOv3 backbones).
+  # Pick and train the best one for a recipe with the benchmark (reports/ shows every candidate):
+  #   python -m src.inference.anomaly.benchmark --good-dir data/raw/<recipe>/images --select --save-best models/anomaly/<recipe>.pt
+  # Simulator scene: python -m src.inference.anomaly.train --synthetic 120 --out models/anomaly/synthetic_parts.pt
+  anomaly_model: "models/anomaly/synthetic_parts.pt"
+  # Supervised defect segmentation (model directory with model_card.json), once labelled defects
+  # exist. Default architecture RF-DETR-Seg (Apache-2.0):
+  #   python -m src.inference.segmentation.train --data data/processed/active_recipe.yaml --out models/segmentation/<recipe>
+  segmentation_model: null
+  # Few-shot defect typing from operator-tagged crops:
+  #   python -m src.inference.defect_typing --crops data/labels/defect_crops --out models/typing/<recipe>.joblib
+  defect_type_model: null
+  # Model-health monitoring (no labels needed): score drift vs. calibration, reject-rate excess.
+  health:
+    window: 300
+    drift_ratio: 1.5
+    expected_reject_rate: 0.05
+    # On score drift, file a retraining request (needs human approval; trains on the good pool).
+    request_retrain: true
+  # Tamper-evident, hash-chained record of every verdict (verify: python -m src.inference.audit_log verify).
+  audit:
+    enabled: true
+    dir: "data/audit"
+  # Sampled confidently-good parts per recipe: the training set for approved retraining.
+  good_pool:
+    enabled: true
+    dir: "data/good_pool"
+    every_n: 5
+    max_items: 3000
+    max_score: 0.8
+  # Borderline parts (normalized score in band) are saved for operator review. Label them in
+  # Label Studio / CVAT via src.inference.labeling (export -> import), then ingest the reviewed
+  # items with src.inference.anomaly.monitoring.ingest_reviews (audits + typing crops).
+  review:
+    enabled: true
+    dir: "data/review"
+    band: [0.8, 1.25]
+  presence_std_threshold: 2.2
+  on_frames: 2
+  off_frames: 2
+
+# Optical "vibration" (detection-centroid motion) is off by default: it only resolves
+# frequencies below fps/2 and is not a calibrated velocity. Use a real accelerometer.
+vibration_analysis:
+  enabled: false
+  kap_db_path: "data/knowledge/knowledge_base.db"
+  # pixel_to_mm_scale: 0.1   # required before any ISO 10816 classification is attempted
+
 # ✅ BLENDER RTSP STREAM ROUTING (TOP, BOTTOM, FRONT, BACK)
+# Per camera, optionally: `recipe: <name>` (which recipe's models judge its parts) and
+# `required_view: true` (a part is only fully inspected once this view has seen it; the
+# dashboard reports parts missing a required view as incomplete).
 cameras:
   - id: "cam_0"
     enabled: true
@@ -196,3 +326,21 @@ cameras:
     frame_queue_size: 8
     event_queue_size: 64
     jpeg_quality: 90
+
+  # Inspection station downstream of the simulated molding machine: renders the parts the
+  # simulated process actually produced (development scene for the process <-> vision loop).
+  - id: "cam_process"
+    enabled: true
+    source: "synthetic://cam_process"
+    mock_inference: true
+    synthetic_scene: "process"
+    part_dwell_s: 0.6
+    independent_logs: true
+    fps: 15
+    width: 640
+    height: 480
+    process_link:
+      machine_id: "imm_1"
+      mode: "time"
+      transport_delay_s: 4.0
+      tolerance_s: 2.0

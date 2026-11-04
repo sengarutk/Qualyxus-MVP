@@ -12,6 +12,8 @@ from src.api.pulse_server import PulseServer
 from src.camera.camera_manager import CameraManager
 from src.analytics.vlm_narrator import VLMNarrator
 from src.fleet.historian import PredictiveHistorian
+from src.process.service import ProcessIntelligenceService
+from src.process.sources import build_cycle_source
 
 logger = logging.getLogger("QualyxusCore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -65,6 +67,18 @@ class CoreOrchestrator:
         self.camera_manager = CameraManager(config_data=self.config.raw)
         self.manager.register_instance("CameraManager", self.camera_manager)
         self.multiplexer = self.camera_manager.multiplexer
+
+        # Process-quality intelligence: machine cycles <-> inspected parts.
+        self.process_service = None
+        process_cfg = self.config.get("process", default={}) or {}
+        if process_cfg.get("enabled", False):
+            self.process_service = ProcessIntelligenceService(
+                process_cfg, cameras_cfg=self.config.get("cameras", default=[]) or [],
+            )
+            self.process_service.attach_source(build_cycle_source(process_cfg))
+            self.process_service.add_alert_callback(self._on_process_alert)
+            self.manager.register_instance("ProcessIntelligence", self.process_service)
+            self.camera_manager.attach_process_service(self.process_service)
         
         # Centralized lifecycle event to coordinate thread-safe shutdowns
         self.shutdown_trigger_event = asyncio.Event()
@@ -84,6 +98,9 @@ class CoreOrchestrator:
         # Pass the event loop context down natively
         loop = asyncio.get_running_loop()
         FactoryManager().register_instance("MainEventLoop", loop)
+        self._loop = loop
+        if self.process_service is not None:
+            self.process_service.start()
         await self.camera_manager.start(loop)
         
         # Spawn background execution daemons
@@ -121,6 +138,31 @@ class CoreOrchestrator:
             # Deterministic closure path ensures the teardown matrix fires under all boot/run conditions
             await self.shutdown()
 
+    def _on_process_alert(self, assessment, cycle, prescriptions):
+        """High/watch-risk cycle: publish to the plant MQTT uplink and live SSE clients."""
+        payload = {
+            "type": "process_risk",
+            "cycle_id": assessment.cycle_id,
+            "machine_id": cycle.machine_id,
+            "risk": assessment.risk,
+            "decision": assessment.decision,
+            "likely_defect": assessment.likely_defect,
+            "model_version": assessment.model_version,
+            "top_factors": assessment.top_factors,
+            "prescriptions": [p.rationale for p in prescriptions],
+            "ts": assessment.ts,
+        }
+        if assessment.decision == "high":
+            logger.warning("[Process] HIGH defect risk %.2f on %s (%s)", assessment.risk, assessment.cycle_id,
+                           ", ".join(f["feature"] for f in assessment.top_factors[:3]) or "no dominant factor")
+        self.event_logger.broadcast_to_subscribers(payload)
+        loop = getattr(self, "_loop", None)
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.hub_connector.bridge.publish_telemetry(f"qualyxus/process/risk/{cycle.machine_id}", payload),
+                loop,
+            )
+
     def _execute_blocking_plc_clear(self, plc_ip, plc_port, unit_id=1):
         """Executed inside an isolated thread worker pool to protect the async loop from GIL locks."""
         # Maintained Positive Mod: Explicit hard timeout, no reconnect storm during shutdown.
@@ -149,6 +191,8 @@ class CoreOrchestrator:
         logger.info("[Main] STAGE 1: Halting ingestion loops and freezing data generation...")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.camera_manager.stop_all_streams)
+        if self.process_service is not None:
+            await loop.run_in_executor(None, self.process_service.stop)
         
         # Ask the API server to exit gracefully; cancel it only if it does not comply.
         try:
