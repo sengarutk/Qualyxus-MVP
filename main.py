@@ -170,11 +170,11 @@ class CoreOrchestrator:
         try:
             if client.connect():
                 client.write_register(100, 0x0000, device_id=unit_id)
-                logger.info("[Main] Successfully dispatched Advisory Clear to Safety PLC (Reg 100: 0x0000).")
+                logger.info("[Main] Advisory flag cleared on the PLC (register 100 = 0).")
             else:
-                logger.error("[Main] Failed to connect to Safety PLC during shutdown.")
+                logger.error("[Main] Could not reach the PLC to clear the advisory flag during shutdown.")
         except Exception as e:
-            logger.warning("[Main] Modbus safe-state warning during cycle: %s", e)
+            logger.warning("[Main] Advisory flag clear failed: %s", e)
         finally:
             # Deterministic connection severing protects file descriptor tables from leaking
             client.close()
@@ -211,12 +211,12 @@ class CoreOrchestrator:
         # Stage 2: Safe-State Hardware (only when a physical PLC endpoint is configured)
         plc_ip = self.config.get("plc_ip", default=None) or self.config.get("telemetry", "endpoint", default=None)
         if plc_ip:
-            logger.info("[Main] STAGE 2: Safe-stating hardware layer via Modbus (%s)...", plc_ip)
-            plc_port = int(self.config.get("plc_port", default=502) or 502)
-            unit_id = int(self.config.get("plc_unit_id", default=1) or 1)
+            logger.info("[Main] STAGE 2: Clearing the advisory flag via Modbus (%s)...", plc_ip)
+            plc_port = int(self.config.get("plc_port", default=None) or self.config.get("telemetry", "port", default=502) or 502)
+            unit_id = int(self.config.get("plc_unit_id", default=None) or self.config.get("telemetry", "unit_id", default=1) or 1)
             await loop.run_in_executor(None, self._execute_blocking_plc_clear, plc_ip, plc_port, unit_id)
         else:
-            logger.info("[Main] STAGE 2: No PLC endpoint configured (plc_ip / telemetry.endpoint). Skipping Modbus safe-state.")
+            logger.info("[Main] STAGE 2: No PLC endpoint configured (plc_ip / telemetry.endpoint). Nothing to clear.")
         
         # Stage 3: Evacuate Persistence
         logger.info("[Main] STAGE 3: Evacuating persistent logger queues to SQLite/CSV...")
@@ -231,7 +231,7 @@ class CoreOrchestrator:
             await asyncio.gather(self.event_logger.worker_task, return_exceptions=True)
             
         # Stage 4: Sever Network Sockets
-        logger.info("[Main] STAGE 4: Severing mutual TLS network sockets cleanly...")
+        logger.info("[Main] STAGE 4: Closing network connections...")
         await self.hub_connector.disconnect()
         
         self.factory_manager.shutdown_singletons()

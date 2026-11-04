@@ -34,6 +34,7 @@ from src.system.disk_monitor import DiskMonitor
 from src.system.resource_monitor import ResourceGovernor
 from src.system.runtime_metrics import RuntimeMetricsLogger
 from src.system.watchdog import WatchdogManager
+from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED
 from src.telemetry.telemetry_provider import TelemetryProvider
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,8 @@ class CameraWorkerState:
     tracker: Any = None
     parts_inspected: int = 0
     parts_failed: int = 0
+    parts_not_inspected: int = 0
+    not_inspected_logged: bool = False
     pool: list = field(default_factory=list)
     pool_write_index: int = 0
     prev_centroid: tuple[float, float] | None = None
@@ -251,6 +254,8 @@ class CameraManager:
             mode=telemetry_mode,
             protocol=str(telemetry_cfg.get("protocol") or "modbus"),
             endpoint=telemetry_cfg.get("endpoint"),
+            port=int(telemetry_cfg.get("port") or 502),
+            unit_id=int(telemetry_cfg.get("unit_id") or 1),
             register_map=telemetry_cfg.get("register_map"),
         )
 
@@ -324,6 +329,8 @@ class CameraManager:
         self.geometry_engines: dict[str, GeometryEngine] = {}
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="geometry-worker")
         self.vlm_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm-reasoner")
+        # Advisory flags keep their order and never wait behind slow VLM narration.
+        self.plc_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="plc-writer")
         vibration_cfg = self.raw_config.get("vibration_analysis", {}) or {}
         self._kap_db_path: str = str(vibration_cfg.get("kap_db_path", "data/knowledge/knowledge_base.db"))
         # Optical "vibration" is centroid motion of detections sampled at the camera frame
@@ -493,6 +500,8 @@ class CameraManager:
             delay = link.transport_delay_s if link else 4.0
             self._part_feeds[str(cam.get("id"))] = SyntheticPartFeed(
                 source, transport_delay_s=delay, dwell_s=float(cam.get("part_dwell_s", 0.6)),
+                view_index=int(cam.get("view_index", 0)), n_views=int(cam.get("n_views", 1)),
+                inject_defect_every=int(cam.get("inject_defect_every", 0)),
             )
 
     def _telemetry_context(self, camera_id: str, ts: float | None = None, cycle_id: str | None = None):
@@ -727,6 +736,7 @@ class CameraManager:
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.inspection_executor.shutdown(wait=True, cancel_futures=True)
         self.vlm_executor.shutdown(wait=True, cancel_futures=True)
+        self.plc_executor.shutdown(wait=True)
         self.runtime_metrics.stop()
         self.disk_monitor.stop()
 
@@ -777,6 +787,7 @@ class CameraManager:
                     "last_geometric_diagnostic": dict(state.last_geometric_diagnostic or {}),
                     "parts_inspected": state.parts_inspected,
                     "parts_failed": state.parts_failed,
+                    "parts_not_inspected": state.parts_not_inspected,
                     "recipe": self.camera_recipes.get(camera_id) or self.stack_provider.default_recipe,
                     "model_health": dict(getattr(self, "_health_status", {}).get(camera_id, {})),
                 }
@@ -1273,10 +1284,7 @@ class CameraManager:
                     cv2.rectangle(overlay, top.bbox[:2], top.bbox[2:], (0, 0, 255), 2)
                 elif anomaly is not None and anomaly.is_anomalous:
                     overlay = stack.anomaly.heatmap_overlay(frame, anomaly, stack.anomaly.threshold)
-                if anomaly is not None and anomaly.is_anomalous and top is None:
-                    severity = 3 if anomaly.normalized_score >= 2.0 else (2 if anomaly.normalized_score >= 1.3 else 1)
-                else:
-                    severity = severity_from_conf(confidence or 0.5)
+                severity = self._part_severity(anomaly, top, confidence)
                 ctx = self._telemetry_context(state.camera_id, part.ts, cycle_id)
                 if not self._record_new_defect(
                     state, frame, part.best_frame_id, event_id, float(confidence or 0.5), bbox or (0, 0, w, h), ctx,
@@ -1284,8 +1292,19 @@ class CameraManager:
                 ):
                     event_id = None
 
-            verdict = "fail" if failed else "pass"
+            # No loaded model means nobody looked at this part, which is not a pass.
+            not_inspected = stack.empty and not failed
+            verdict = "not_inspected" if not_inspected else ("fail" if failed else "pass")
             normalized = judged.normalized_score
+            if failed:
+                self._signal_part("PART_REJECT", state, self._part_severity(anomaly, top, confidence),
+                                  cycle_id=cycle_id, defect_type=defect_type)
+            elif not_inspected:
+                self._signal_part("PART_NOT_INSPECTED", state, PLC_FLAG_NOT_INSPECTED, cycle_id=cycle_id)
+                if not state.not_inspected_logged:
+                    state.not_inspected_logged = True
+                    logger.error("[%s] No inspection model is loaded for recipe '%s': parts are recorded as "
+                                 "not_inspected until one is available.", state.camera_id, recipe)
             image_sha = None
             if self.audit_log is not None or shadow is not None or self.review_queue is not None:
                 from src.inference.audit_log import image_sha256
@@ -1318,7 +1337,7 @@ class CameraManager:
                     bbox=bbox if failed else (anomaly.bbox if anomaly is not None else None),
                     predicted_type=defect_type, image_sha=image_sha, recipe=recipe,
                 )
-            elif not failed:
+            elif verdict == "pass":
                 pool = self._good_pool(recipe)
                 if pool is not None:
                     pool.offer(frame, verdict=verdict, normalized_score=normalized, camera_id=state.camera_id,
@@ -1337,6 +1356,9 @@ class CameraManager:
                         "score": shadow_record["shadow_score"]},
                 })
 
+            if not_inspected:
+                state.parts_not_inspected += 1
+                return
             if service is not None:
                 service.record_inspection(
                     state.camera_id, part.ts, verdict,
@@ -1350,6 +1372,22 @@ class CameraManager:
                 state.parts_failed += 1
         except Exception as e:
             logger.error("[%s] Part inspection failed: %s", state.camera_id, e, exc_info=True)
+            state.parts_not_inspected += 1
+            self._signal_part("PART_NOT_INSPECTED", state, PLC_FLAG_NOT_INSPECTED)
+
+    @staticmethod
+    def _part_severity(anomaly, top, confidence: float | None) -> int:
+        if anomaly is not None and anomaly.is_anomalous and top is None:
+            return 3 if anomaly.normalized_score >= 2.0 else (2 if anomaly.normalized_score >= 1.3 else 1)
+        return severity_from_conf(confidence or 0.5)
+
+    def _signal_part(self, kind: str, state: CameraWorkerState, severity: int, **details) -> None:
+        """Queue one part's advisory PLC flag without blocking the inspection worker."""
+        try:
+            self.fast_queue.put_nowait({"type": kind, "camera_id": state.camera_id, "timestamp": time.time(),
+                                        "severity": int(severity), **details})
+        except queue.Full:
+            logger.error("[%s] Reflex queue full: %s flag dropped.", state.camera_id, kind)
 
     def _update_model_health(self, camera_id: str, recipe: str, stack, normalized: float | None, failed: bool) -> None:
         det = stack.anomaly
@@ -1511,7 +1549,7 @@ class CameraManager:
                 adapter = getattr(self.telemetry, "adapter", None)
                 if adapter is not None:
                     try:
-                        self.vlm_executor.submit(adapter.write_anomaly_interlock, signal_data)
+                        self.plc_executor.submit(adapter.write_advisory_flag, signal_data)
                     except RuntimeError:
                         pass
 

@@ -246,9 +246,7 @@
 
     <!-- PHASE 7 FOOTER -->
     <footer id="securityFooter" style="background: #111; border-top: 1px solid #333; padding: 10px; display: flex; justify-content: space-around; font-family: monospace; color: #888;">
-        <div>🔒 Vault: <span style="color:#00FF00">AES-Active</span></div>
-        <div>📡 MQTT Hub: <span style="color:#00FF00">Connected</span></div>
-        <div>⚙️ PLC Interlock: <span id="plcStatus" style="color:#00FF00">Standby</span></div>
+        <div>⚙️ PLC Advisory Flag: <span id="plcStatus" style="color:#00FF00">Clear</span></div>
     </footer>
 
     <script>
@@ -432,9 +430,9 @@
                 document.getElementById('profileBadge').innerText = data.active_profile;
             }
             
-            // 6. Phase 7 Modbus Interlock Trigger
-            if (data.plc_interlock_triggered) {
-                document.getElementById('plcStatus').innerText = "ENGAGED";
+            // 6. Advisory PLC flag
+            if (data.plc_advisory_flag) {
+                document.getElementById('plcStatus').innerText = "RAISED";
                 document.getElementById('plcStatus').style.color = "#FF0000";
                 
                 // Bold red log entry (prevent spamming via a simple check)
@@ -445,7 +443,7 @@
                     entry.style.color = "#ff0000";
                     entry.style.fontWeight = "bold";
                     entry.style.marginBottom = "8px";
-                    entry.innerHTML = "[HARDWARE] Emergency Stop Sent via Modbus/TCP";
+                    entry.innerHTML = "[PLC] Advisory flag sent via Modbus/TCP";
                     logEl.insertBefore(entry, logEl.firstChild);
                     
                     // Reset the log after 5 seconds so it can fire again 

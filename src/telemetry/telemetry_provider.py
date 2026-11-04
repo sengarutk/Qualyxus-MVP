@@ -38,6 +38,8 @@ class TelemetryProvider:
         mode: str | None = None,
         protocol: str = "modbus",
         endpoint: str | None = None,
+        port: int = 502,
+        unit_id: int = 1,
         register_map: dict[str, Any] | None = None,
     ):
         resolved_mode = mode or ("simulated" if simulation_mode else "plc")
@@ -48,6 +50,8 @@ class TelemetryProvider:
                 mode=resolved_mode,
                 protocol=protocol,
                 endpoint=endpoint,
+                port=port,
+                unit_id=unit_id,
                 register_map=register_map,
             )
         )

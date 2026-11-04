@@ -123,12 +123,20 @@ class SyntheticPartFeed:
 
     A part produced by cycle *c* arrives at the inspection station ``transport_delay_s``
     after the cycle ends and dwells there for ``dwell_s``.
+
+    With ``n_views > 1`` this feed is one face of a multi-camera station: every view sees
+    the same part, but a defect sits on a single face, so only one view can catch it.
+    ``inject_defect_every`` places a demo defect on every Nth part regardless of the process.
     """
 
-    def __init__(self, source, *, transport_delay_s: float = 4.0, dwell_s: float = 0.6):
+    def __init__(self, source, *, transport_delay_s: float = 4.0, dwell_s: float = 0.6,
+                 view_index: int = 0, n_views: int = 1, inject_defect_every: int = 0):
         self.source = source
         self.transport_delay_s = float(transport_delay_s)
         self.dwell_s = float(dwell_s)
+        self.view_index = int(view_index)
+        self.n_views = max(1, int(n_views))
+        self.inject_defect_every = int(inject_defect_every)
         self._scheduled: dict[str, _ScheduledPart] = {}
         self._lock = threading.Lock()
 
@@ -140,13 +148,21 @@ class SyntheticPartFeed:
                 with self._lock:
                     part = self._scheduled.get(cycle.cycle_id)
                     if part is None:
-                        part = _ScheduledPart(cycle.cycle_id, outcome.defect_type, appear, appear + self.dwell_s,
-                                              seed=int(cycle.sequence))
+                        part = _ScheduledPart(cycle.cycle_id, self._defect_for(cycle.sequence, outcome.defect_type),
+                                              appear, appear + self.dwell_s, seed=int(cycle.sequence))
                         self._scheduled[cycle.cycle_id] = part
                         if len(self._scheduled) > 256:
                             self._scheduled.pop(next(iter(self._scheduled)))
                 return part
         return None
+
+    def _defect_for(self, sequence: int, process_defect: str | None) -> str | None:
+        from src.process.simulator import DEFECT_TYPES
+
+        every = self.inject_defect_every
+        if every > 0 and sequence % every == 0:
+            return DEFECT_TYPES[(sequence // every) % len(DEFECT_TYPES)]
+        return process_defect
 
     def render(self, now: float, width: int, height: int) -> tuple[np.ndarray, _ScheduledPart | None]:
         part = self.part_in_view(now)
@@ -154,7 +170,8 @@ class SyntheticPartFeed:
             frame = np.full((height, width, 3), BACKGROUND, dtype=np.uint8)
             noise = np.random.default_rng(int(now * 1000) & 0xFFFFFFFF).normal(0.0, 0.6, frame.shape)
             return np.clip(frame + noise, 0, 255).astype(np.uint8), None
-        return render_part(width, height, part.defect_type, part.seed), part
+        defect = part.defect_type if part.seed % self.n_views == self.view_index else None
+        return render_part(width, height, defect, part.seed + self.view_index * 7919), part
 
 
 def export_segmentation_dataset(out_dir, *, n_train: int = 400, n_val: int = 100, width: int = 640,

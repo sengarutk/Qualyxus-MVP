@@ -59,6 +59,8 @@ telemetry:
   mode: "simulated"
   protocol: "modbus"
   endpoint: null
+  port: 502
+  unit_id: 1
   register_map: null
 
 hardware_acceleration:
@@ -277,7 +279,9 @@ vibration_analysis:
 # ✅ BLENDER RTSP STREAM ROUTING (TOP, BOTTOM, FRONT, BACK)
 # Per camera, optionally: `recipe: <name>` (which recipe's models judge its parts) and
 # `required_view: true` (a part is only fully inspected once this view has seen it; the
-# dashboard reports parts missing a required view as incomplete).
+# dashboard reports parts missing a required view as incomplete). A multi-view verdict
+# also needs a `process_link` on every view, so each one resolves the same physical part.
+# config.360.yaml runs a simulated six-view station.
 cameras:
   - id: "cam_0"
     enabled: true

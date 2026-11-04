@@ -56,11 +56,12 @@ from src.dashboard.data_access import (
     query_hourly_heatmap,
     query_live_events,
     query_severity_distribution,
+    events_table_ready,
     query_timeline_events,
 )
 
 
-st.set_page_config(page_title="QualForge AI Dashboard", layout="wide")
+st.set_page_config(page_title="Qualyxus Dashboard", layout="wide")
 
 
 def _fmt_uptime(seconds: float) -> str:
@@ -184,11 +185,14 @@ def main():
         for item in list(system_health.get("resource_log", []) or [])[:20]:
             st.write(f"- {item}")
 
+    if not events_table_ready(sqlite_path):
+        st.info("No inspection data yet. Start the edge engine, then reload this page.")
+        st.code("python main.py", language="bash")
+        st.stop()
+
     timeline_df = query_timeline_events(sqlite_path=sqlite_path, limit=300)
     if timeline_df.empty:
-        st.warning("No events in SQLite yet. Start live inference runtime.")
-        st.code("python main.py", language="bash")
-        return
+        st.success("No defects recorded yet.")
 
     kpis = get_kpi_metrics(sqlite_path=sqlite_path, status_path=status_path)
     kpi_row(
@@ -256,6 +260,10 @@ def _render_vision_section(cfg, status_path: str) -> None:
     else:
         c5.metric("Audit trail", "✅ intact" if audit.get("ok") else "❌ BROKEN", help=str(audit.get("error") or
                   f"{audit.get('records', 0)} hash-chained verdict records"))
+
+    if overview.get("recent_parts"):
+        st.markdown("**Latest parts, fused across every camera view**")
+        st.dataframe(overview["recent_parts"], width="stretch", hide_index=True)
 
     if overview.get("cameras"):
         st.markdown("**Model health per camera**")

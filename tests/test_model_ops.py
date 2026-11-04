@@ -408,3 +408,162 @@ def test_approved_retrain_trains_on_the_pool_and_registers_a_shadow(tmp_path):
     assert result["images"] == 16
     assert reg.resolve("housing", "anomaly")["shadow_version"] == result["version"]
     assert reg.requests()[0]["status"] == "done"
+
+
+
+
+def _reject_path_manager(tmp_path, stack):
+    from src.camera.camera_manager import CameraManager, CameraWorkerState
+    from src.inference.audit_log import InspectionAuditLog
+
+    class Provider:
+        registry = None
+        default_recipe = "housing"
+
+        def get(self, recipe=None):
+            return stack, None
+
+    cm = CameraManager.__new__(CameraManager)
+    cm.stack_provider = Provider()
+    cm.process_service = None
+    cm.camera_recipes, cm.recipe_from_scalar = {}, None
+    cm.audit_log = InspectionAuditLog(tmp_path / "audit")
+    cm.review_queue = None
+    cm._pool_cfg = {"dir": str(tmp_path / "pool"), "every_n": 1}
+    cm._good_pools, cm.model_health, cm._health_cfg, cm.retrain_on_drift = {}, {}, {}, False
+    cm.fast_queue = queue.Queue(maxsize=20)
+    cm._record_new_defect = lambda *a, **k: True
+    cm._telemetry_context = lambda *a, **k: None
+    return cm, CameraWorkerState("cam", "s", None, queue.Queue(), queue.Queue(), threading.Event())
+
+
+def test_failed_part_raises_the_advisory_plc_flag(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(True, "v0001", 1.4))
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    assert state.parts_failed == 1
+    signal = cm.fast_queue.get_nowait()
+    assert signal["type"] == "PART_REJECT" and 1 <= signal["severity"] <= 3
+
+
+def test_passed_part_raises_no_flag(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    assert state.parts_inspected == 1 and cm.fast_queue.empty()
+
+
+def test_part_with_no_model_is_not_passed(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+    from src.inference.inspection_stack import InspectionStack
+    from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED
+
+    empty = InspectionStack("housing", anomaly_path=tmp_path / "missing.pt")
+    assert empty.empty
+    cm, state = _reject_path_manager(tmp_path, empty)
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+
+    assert (state.parts_inspected, state.parts_failed, state.parts_not_inspected) == (0, 0, 1)
+    assert not (tmp_path / "pool").exists() or not list((tmp_path / "pool").rglob("*.png"))
+    signal = cm.fast_queue.get_nowait()
+    assert signal["type"] == "PART_NOT_INSPECTED" and signal["severity"] == PLC_FLAG_NOT_INSPECTED
+    records = [json.loads(line) for f in (tmp_path / "audit").glob("*.jsonl") for line in f.read_text().splitlines()]
+    assert [r["verdict"] for r in records] == ["not_inspected"]
+
+
+def test_inspection_crash_flags_the_part_instead_of_losing_it(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+
+    class Broken(_StubStack):
+        def judge(self, frame, frame_defect_types=None):
+            raise RuntimeError("out of memory")
+
+    cm, state = _reject_path_manager(tmp_path, Broken(False, "v0001", 0.4))
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    assert state.parts_not_inspected == 1
+    assert cm.fast_queue.get_nowait()["type"] == "PART_NOT_INSPECTED"
+
+
+def test_advisory_flag_reaches_a_real_modbus_socket():
+    """The reject flag crosses a real TCP socket as a Modbus 0x06 write, on the configured port."""
+    import socket
+    import struct
+
+    from src.telemetry.plc_adapter import PLCAdapter, PLCAdapterConfig
+
+    server = socket.create_server(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+    writes: list[tuple[int, int, int]] = []
+
+    def serve():
+        conn, _ = server.accept()
+        with conn:
+            request = conn.recv(12)
+            function, register, value = struct.unpack(">BHH", request[7:12])
+            writes.append((function, register, value))
+            conn.sendall(request)  # a Modbus 0x06 response echoes the request
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    adapter = PLCAdapter(PLCAdapterConfig(mode="plc", endpoint="127.0.0.1", port=port))
+    assert adapter.write_advisory_flag({"type": "PART_REJECT", "severity": 3}) is True
+    worker.join(timeout=2)
+    server.close()
+    assert writes == [(0x06, 100, 3)]
+
+
+def test_one_view_catches_a_defect_on_its_face_only():
+    from src.process.synthetic_parts import SyntheticPartFeed, _ScheduledPart
+
+    part = _ScheduledPart("c1", "short_shot", 0.0, 1.0, seed=8)   # 8 % 6 -> the view with index 2
+    frames = {}
+    for view in range(6):
+        feed = SyntheticPartFeed(None, n_views=6, view_index=view)
+        feed.part_in_view = lambda now: part
+        frames[view] = feed.render(0.5, 160, 120)[0]
+    clean = {}
+    for view in range(6):
+        feed = SyntheticPartFeed(None, n_views=6, view_index=view)
+        feed.part_in_view = lambda now: _ScheduledPart("c1", None, 0.0, 1.0, seed=8)
+        clean[view] = feed.render(0.5, 160, 120)[0]
+    changed = [v for v in frames if np.abs(frames[v].astype(int) - clean[v].astype(int)).max() > 40]
+    assert changed == [2]
+
+
+def test_config_extends_overlays_a_base_file(tmp_path):
+    from src.config.config import Config
+
+    (tmp_path / "base.yaml").write_text("a: {x: 1, y: 2}\ncameras: [{id: old}]\n")
+    (tmp_path / "child.yaml").write_text("extends: base.yaml\na: {y: 3}\ncameras: [{id: new}]\n")
+    raw = Config.load(config_path=str(tmp_path / "child.yaml")).raw
+    assert raw["a"] == {"x": 1, "y": 3} and raw["cameras"] == [{"id": "new"}] and "extends" not in raw
+
+
+def test_recalibration_splits_the_false_reject_budget_across_views():
+    from src.inference.anomaly.recalibrate import recalibrate
+
+    class Detector:
+        calibration: dict = {}
+
+        def _holdout_scores(self, images):
+            return list(images)
+
+        def calibrate(self, scores, target_frr):
+            self.target = target_frr
+            self.calibration = {}
+            return {"threshold": max(scores)}
+
+    det = Detector()
+    result = recalibrate(det, [0.1, 0.2], part_frr=0.012, n_views=6)
+    assert det.target == pytest.approx(0.002)
+    assert result["n_views"] == 6 and det.calibration["part_frr_target"] == 0.012
+
+
+def test_demo_defects_rotate_and_keep_real_process_defects():
+    from src.process.synthetic_parts import SyntheticPartFeed
+
+    feed = SyntheticPartFeed(None, inject_defect_every=5)
+    assert feed._defect_for(3, None) is None and feed._defect_for(3, "flash") == "flash"
+    assert len({feed._defect_for(n, None) for n in (5, 10, 15, 20)}) == 4

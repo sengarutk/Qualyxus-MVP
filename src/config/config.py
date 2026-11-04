@@ -68,6 +68,12 @@ class Config:
         if base is None:
             raise RuntimeError(f"Config YAML is empty or invalid: {resolved_config_path}")
 
+        # `extends: <file>` layers this config over another one (relative to this file).
+        extends = base.pop("extends", None)
+        if extends:
+            with open(resolved_config_path.parent / extends, "r", encoding="utf-8") as f:
+                base = _deep_update(yaml.safe_load(f), base)
+
         if overrides:
             base = _deep_update(base, overrides)
 

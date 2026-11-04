@@ -48,18 +48,6 @@ except ImportError:
     except ImportError:
         VLMNarrator = None
 
-try:
-    from src.reflex.industrial_control import IndustrialControl
-except ImportError:
-    class IndustrialControl:
-        def execute_emergency_stop(self, *args, **kwargs):
-            class AwaitableDict(dict):
-                def __await__(self):
-                    async def _async_val():
-                        return self
-                    return _async_val().__await__()
-            return AwaitableDict({"status": "MOCK_SUCCESS"})
-
 from src.fleet.historian import PredictiveHistorian
 
 logger = logging.getLogger(__name__)
@@ -205,7 +193,7 @@ class VibrationAnalyzer:
         self.camera_id         = camera_id
         # ISO 10816 limits are in mm/s of a physical vibration velocity. Uncalibrated input
         # (e.g. raw pixel displacement) is analysed spectrally but never classified into
-        # ISO zones and never allowed to trigger a PLC emergency stop.
+        # ISO zones and never allowed to raise the advisory PLC flag.
         self.calibrated        = bool(calibrated)
         self.buffer_lock = threading.Lock()
         self.buffer: collections.deque[tuple[float, float, float]] = collections.deque(
@@ -222,7 +210,6 @@ class VibrationAnalyzer:
         self._forensic_cache = {}
 
         # Phase 7: Industrial Control PLC Bridge
-        self.plc = IndustrialControl()
 
         # Phase 8: Predictive Historian
         from src.core.factory_manager import FactoryManager
@@ -548,13 +535,17 @@ class VibrationAnalyzer:
                     diag_result["causal_link"]   = "KAP_LOOKUP_FAILED"
                     diag_result["justification"] = "DB_ERROR"
 
-            # Phase 7: Check PLC constraints
+            # Advisory only: the reflex path raises a flag, and the plant's PLC decides what to do.
             if diag_result["iso_status"] == "ZONE_D" and not self.ignore_vibration and self.calibrated:
-                plc_res = self.plc.execute_emergency_stop()
-                if "MOCK" not in plc_res.get("status", "") and "SUCCESS" not in plc_res.get("status", ""):
-                    pass # Handled internally by warning
-                else:
-                    plc_trigger = True
+                if not spike:  # a spike already raised the flag above
+                    self._emit_vibration_critical_fast(
+                        dominant_freq=diag_result["dominant_freq"],
+                        psd_peak=diag_result["psd_peak"],
+                        rms=rms_current,
+                        peaks=diag_result["top_peaks"],
+                        iso_status="ZONE_D",
+                    )
+                plc_trigger = True
                     
             # Phase 8: Historian Snapshot Hook
             curr_time = time.time()
@@ -586,7 +577,7 @@ class VibrationAnalyzer:
                 "dominant_freq": diag_result["dominant_freq"],
                 "justification": diag_result["justification"],
                 "visual_defect": visual_defect,
-                "plc_interlock_triggered": plc_trigger,
+                "plc_advisory_flag": plc_trigger,
                 "trend_slope": self.historian.current_trend_slope,
                 "estimated_rul_days": self.historian.current_rul_days
             }

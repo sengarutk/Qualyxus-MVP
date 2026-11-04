@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -25,6 +26,15 @@ def get_engine(sqlite_path: str):
     # NOTE: dashboard uses its own cached engine (separate from runtime logger's cache).
     # This is intentional: Streamlit is a separate process and should manage its own pool.
     return create_engine(f"sqlite:///{sqlite_path}", future=True)
+
+
+def events_table_ready(sqlite_path: str) -> bool:
+    """False until the edge engine has created the events database."""
+    if not Path(sqlite_path).exists():
+        return False
+    with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as conn:
+        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'defect_events'").fetchone()
+    return row is not None
 
 
 def _read_status(status_path: str) -> dict:
@@ -369,6 +379,7 @@ def fetch_vision_overview(status_path: str, process_db_path: str, registry_dir: 
             "camera": cam_id, "recipe": health.get("recipe") or cam.get("recipe"),
             "models": ", ".join(f"{k}={v}" for k, v in (health.get("models") or {}).items()),
             "parts": cam.get("parts_inspected", 0), "failed": cam.get("parts_failed", 0),
+            "not_inspected": cam.get("parts_not_inspected", 0),
             "reject_rate": health.get("reject_rate"), "score_drift": health.get("score_drift"),
             "alerts": " | ".join(health.get("alerts") or []),
         })
@@ -408,6 +419,13 @@ def fetch_vision_overview(status_path: str, process_db_path: str, registry_dir: 
             counts = pd.Series([p["verdict"] for p in parts]).value_counts().to_dict() if parts else {}
             out["parts"] = {"total": len(parts), **{str(k): int(v) for k, v in counts.items()},
                             "multi_view": sum(1 for p in parts if len(p["views"]) > 1)}
+            out["recent_parts"] = [
+                {"part": p["cycle_id"], "verdict": p["verdict"], "views_seen": len(p["views"]),
+                 "failed_views": ", ".join(c for c, v in p["views"].items() if v == "fail"),
+                 "missing_views": ", ".join(p["missing_views"]),
+                 "defect": ", ".join(sorted(set(p["defect_types"])))}
+                for p in sorted(parts, key=lambda p: p["ts"], reverse=True)[:15]
+            ]
             types = pd.Series([t for p in parts if p["verdict"] == "fail" for t in (p["defect_types"] or ["unspecified"])])
             if not types.empty:
                 out["defect_types"] = [{"defect_type": k, "parts": int(v)} for k, v in types.value_counts().items()]

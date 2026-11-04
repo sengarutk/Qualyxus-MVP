@@ -1,0 +1,42 @@
+# Simulated six-view station: every face of each part is inspected, and a defect sits on a
+# single face, so a part only passes once all six views have seen it. Run with:
+#   CONFIG_PATH=config.360.yaml python main.py
+#   CONFIG_PATH=config.360.yaml streamlit run src/dashboard/app.py
+extends: config.yaml
+
+# Calibrated so false rejects hold per part across all six views, not per camera:
+#   python -m src.inference.anomaly.recalibrate --model models/anomaly/synthetic_parts.pt \
+#       --synthetic 1500 --views 6 --out models/anomaly/synthetic_parts_6view.pt
+inspection:
+  anomaly_model: "models/anomaly/synthetic_parts_6view.pt"
+
+process:
+  simulator:
+    time_scale: 3.0
+
+x-view: &view
+  enabled: true
+  required_view: true
+  source: "synthetic://view"
+  mock_inference: true
+  synthetic_scene: "process"
+  part_dwell_s: 0.6
+  independent_logs: true
+  fps: 15
+  width: 640
+  height: 480
+  n_views: 6
+  inject_defect_every: 5    # demo only: a defect on every 5th part, rotating through the faces
+  process_link:
+    machine_id: "imm_1"
+    mode: "time"
+    transport_delay_s: 4.0
+    tolerance_s: 2.0
+
+cameras:
+  - {<<: *view, id: "view_top", view_index: 0}
+  - {<<: *view, id: "view_bottom", view_index: 1}
+  - {<<: *view, id: "view_front", view_index: 2}
+  - {<<: *view, id: "view_back", view_index: 3}
+  - {<<: *view, id: "view_left", view_index: 4}
+  - {<<: *view, id: "view_right", view_index: 5}

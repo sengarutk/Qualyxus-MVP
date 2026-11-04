@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+
 import base64
 import os
 
@@ -110,15 +112,14 @@ def test_env_override_keeps_loaded_config(monkeypatch, tmp_path):
     assert out.get("severstal", "train_csv") == str(tmp_path / "train.csv")
 
 
-def test_uncalibrated_vibration_never_classifies_or_estops(tmp_path):
+def test_uncalibrated_vibration_never_classifies_or_flags(tmp_path):
     from src.inference.analysis.vibration_engine import VibrationAnalyzer
 
     vib = VibrationAnalyzer(buffer_size=64, kap_db_path=str(tmp_path / "kap.db"), camera_id="c", calibrated=False)
-    called = []
-    vib.plc.execute_emergency_stop = lambda *a, **k: called.append(1) or {"status": "SUCCESS"}
+    vib._fast_queue = queue.Queue()
     ts = 0.0
     result = None
     for i in range(64):
         ts += 1 / 30.0
         result = vib.ingest(50.0 * np.sin(i), 0.0, ts=ts)
-    assert result["iso_status"] == "UNCALIBRATED" and not called
+    assert result["iso_status"] == "UNCALIBRATED" and vib._fast_queue.empty()

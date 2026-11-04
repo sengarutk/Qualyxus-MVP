@@ -6,11 +6,17 @@ from typing import Any
 
 logger = logging.getLogger("PLCAdapter")
 
+# Advisory flag written to holding register 100. The plant's PLC logic decides what to do
+# with it: 0 = clear, 1-3 = rejected part by severity, 4 = part could not be inspected.
+PLC_FLAG_REGISTER = 100
+PLC_FLAG_NOT_INSPECTED = 4
+
 @dataclass
 class PLCAdapterConfig:
     mode: str = "simulated"
     protocol: str = "modbus"
     endpoint: str | None = None
+    port: int = 502
     unit_id: int = 1
     register_map: dict[str, Any] | None = None
 
@@ -70,11 +76,11 @@ class PLCAdapter:
             "unit_id": self.config.unit_id,
         }
 
-    def write_anomaly_interlock(self, anomaly_payload: dict[str, Any]) -> bool:
+    def write_advisory_flag(self, anomaly_payload: dict[str, Any]) -> bool:
         """
-        Maps incoming anomaly payloads to Modbus TCP Holding Register 100
-        using Function Code 0x06 (write_register) to maintain the ISO 13849
-        regulatory compliance insulation boundary.
+        Writes an advisory flag to Modbus TCP holding register 100 with function code
+        0x06 (write_register). Advisory only: the plant's PLC keeps every stop and
+        safety decision, and this class never touches a certified safety function.
         """
         # Resolve severity dynamically from both top-level keys and nested diagnostic blocks
         diagnostic = anomaly_payload.get("diagnostic", {})
@@ -88,17 +94,19 @@ class PLCAdapter:
         except (ValueError, TypeError):
             severity = 1
             
-        register_address = 100
-        logger.info(f"[Modbus] ISO 13849 Interlock: Writing holding register {register_address} with value {severity} (FC=0x06)")
+        register_address = PLC_FLAG_REGISTER
+        kind = anomaly_payload.get("type", "ADVISORY")
+        camera_id = anomaly_payload.get("camera_id", "unknown")
+        logger.info(f"[Modbus] Advisory flag {kind} from {camera_id}: register {register_address} = {severity} (FC=0x06)")
         
         if self.is_simulated:
-            logger.info("[Modbus] Simulation Mode: Write register 100 completed successfully.")
+            logger.info(f"[Modbus] Simulation mode: register {register_address} write skipped.")
             return True
             
         try:
             from pymodbus.client import ModbusTcpClient
             endpoint_ip = self.config.endpoint or "127.0.0.1"
-            client = ModbusTcpClient(endpoint_ip, timeout=1.5, retries=0)
+            client = ModbusTcpClient(endpoint_ip, port=self.config.port, timeout=1.5, retries=0)
             try:
                 if not client.connect():
                     logger.error(f"[Modbus] Connection failed to physical industrial node at: {endpoint_ip}")
