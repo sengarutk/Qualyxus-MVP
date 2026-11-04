@@ -70,13 +70,17 @@ class GoldenCycleReference:
 
     @classmethod
     def fit(cls, cycles: Iterable[ProcessCycle], min_cycles: int = 10) -> "GoldenCycleReference | None":
-        cycles = list(cycles)
+        # Cycles whose raw curves were pruned say nothing here. Too few left means no new reference,
+        # so the caller keeps the one it has instead of saving an empty one over it.
+        cycles = [c for c in cycles if c.curves]
         if len(cycles) < min_cycles:
             return None
         stacked: dict[str, list[np.ndarray]] = {}
         for cycle in cycles:
             for name, values in cycle.curves.items():
-                stacked.setdefault(name, []).append(resample(values))
+                sampled = resample(values)
+                if np.isfinite(sampled).all():   # one sensor dropout must not blind the reference
+                    stacked.setdefault(name, []).append(sampled)
         curves, scale = {}, {}
         for name, rows in stacked.items():
             matrix = np.vstack(rows)

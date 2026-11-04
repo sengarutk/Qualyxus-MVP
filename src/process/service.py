@@ -41,6 +41,8 @@ from src.process.store import ProcessStore
 
 logger = logging.getLogger("QualyxusProcessIntelligence")
 
+PRUNE_EVERY_CYCLES = 500
+
 AlertCallback = Callable[[RiskAssessment, ProcessCycle, list[Prescription]], None]
 
 # Telemetry fields carried on DefectEvent records, resolved from the producing cycle.
@@ -64,6 +66,8 @@ class ProcessIntelligenceService:
         self.store = store or ProcessStore(
             cfg.get("db_path", "data/events/process.db"), store_curves=bool(cfg.get("store_curves", True)),
         )
+        self.curve_retention_s = float(cfg.get("curve_retention_days", 30)) * 86400.0
+        self._cycles_seen = 0
         self.models_dir = Path(cfg.get("models_dir", "models/process"))
         self.models_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,6 +192,9 @@ class ProcessIntelligenceService:
                 self._bootstrap_golden(cycle)
             features = self.extractor.extract(cycle)
             self.store.save_cycle(cycle, features)
+            self._cycles_seen += 1
+            if self.curve_retention_s > 0 and self._cycles_seen % PRUNE_EVERY_CYCLES == 0:
+                self.store.prune_curves(self.curve_retention_s)
             model = self.model
             self._track_regime(cycle, features)
             reference = self._current_reference(model)

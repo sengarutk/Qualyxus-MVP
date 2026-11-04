@@ -1,9 +1,10 @@
 import asyncio
+import hmac
 import json
 import logging
-import copy
+import os
 import time
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -14,14 +15,22 @@ logger = logging.getLogger("PulseServer")
 
 app = FastAPI(title="Qualyxus Core v1 API Engine")
 
-# Activate explicit CORS bindings to enable seamless cross-origin web dashboard integrations
+# Browsers may only call this API from origins the plant lists; none by default.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in os.getenv("QUALYXUS_API_CORS_ORIGINS", "").split(",") if o.strip()],
+    allow_methods=["GET"],
+    allow_headers=["Authorization"],
 )
+
+
+def require_token(request: Request) -> None:
+    """With QUALYXUS_API_TOKEN set, the telemetry streams need that token as a bearer token."""
+    token = os.getenv("QUALYXUS_API_TOKEN")
+    sent = request.headers.get("authorization", "").encode()
+    if token and not hmac.compare_digest(sent, f"Bearer {token}".encode()):
+        raise HTTPException(status_code=401, detail="Missing or wrong API token")
+
 
 class TelemetryBroadcaster:
     """
@@ -88,7 +97,7 @@ class TelemetryBroadcaster:
 
 broadcaster = TelemetryBroadcaster()
 
-@app.get("/api/v1/stream/telemetry")
+@app.get("/api/v1/stream/telemetry", dependencies=[Depends(require_token)])
 async def stream_telemetry(request: Request):
     """
     Exposes an optimized text/event-stream connection broadcasting real-time 
@@ -145,7 +154,7 @@ async def stream_telemetry(request: Request):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
 
-@app.get("/api/v1/telemetry/stream")
+@app.get("/api/v1/telemetry/stream", dependencies=[Depends(require_token)])
 async def telemetry_stream():
     """
     Asynchronous Server-Sent Events (SSE) network engine.
@@ -183,7 +192,7 @@ async def health_check():
     return {"status": "ok", "timestamp": time.time()}
 
 class PulseServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 8000):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8000):
         self.app = app
         self.host = host
         self.port = int(port)

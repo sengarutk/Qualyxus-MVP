@@ -377,3 +377,47 @@ def test_source_failure_logs_its_reason_and_retries(caplog):
     with caplog.at_level("ERROR"):
         Failing()._run_safe()
     assert "PLC unplugged" in caplog.text and "Reconnecting in 1s" in caplog.text
+
+
+def test_pruned_curves_cannot_wipe_the_golden_reference(tmp_path):
+    from src.process.features import GoldenCycleReference
+    from src.process.service import ProcessIntelligenceService
+
+    cfg = {"db_path": str(tmp_path / "p.db"), "models_dir": str(tmp_path / "m"), "curve_retention_days": 30,
+           "model": {"golden_warmup_cycles": 10, "retrain_every_labels": 10**9}}
+    service = ProcessIntelligenceService(cfg)
+    sim = InjectionMoldingSimulator(seed=3, start_ts=1_000_000.0)
+    cycles = [sim.next_cycle()[0] for _ in range(12)]
+    for cycle in cycles:
+        service.on_cycle(cycle)
+    assert GoldenCycleReference.fit([type(c)(**{**c.__dict__, "curves": {}}) for c in cycles], min_cycles=10) is None
+
+    golden = service.golden
+    assert golden is not None and golden.curves
+    service.store.prune_curves(0.0)
+    service.retrain()
+    assert service.golden is golden
+    assert ProcessIntelligenceService(cfg).golden.curves
+
+
+def test_old_curves_are_pruned_as_cycles_arrive(tmp_path, monkeypatch):
+    from src.process import service as module
+
+    monkeypatch.setattr(module, "PRUNE_EVERY_CYCLES", 5)
+    service = module.ProcessIntelligenceService(
+        {"db_path": str(tmp_path / "p.db"), "models_dir": str(tmp_path / "m"), "curve_retention_days": 1,
+         "model": {"golden_warmup_cycles": 100}})
+    sim = InjectionMoldingSimulator(seed=3, start_ts=1_000_000.0)
+    cycles = [sim.next_cycle()[0] for _ in range(5)]
+    for cycle in cycles:
+        service.on_cycle(cycle)
+    assert not service.store.get_cycle(cycles[0].cycle_id, with_curves=True).curves
+
+
+def test_sensor_dropouts_do_not_blind_the_golden_reference():
+    sim = InjectionMoldingSimulator(seed=4, start_ts=1_000_000.0)
+    cycles = [sim.next_cycle()[0] for _ in range(12)]
+    for cycle in cycles[::3]:
+        cycle.curves = {name: np.full_like(values, np.nan) for name, values in cycle.curves.items()}
+    golden = GoldenCycleReference.fit(cycles, min_cycles=5)
+    assert golden.curves and all(np.isfinite(curve).all() for curve in golden.curves.values())

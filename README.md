@@ -60,16 +60,20 @@ python -m src.operations.auth add <name> --role QA
 
 | Register | Meaning |
 |---|---|
-| 100 | Part verdict: 0 pass, 1-3 reject by severity, 4 could not be inspected |
+| 100 | Part verdict: 0 pass, 1-3 reject by severity, 4 could not be inspected (also set on a clean stop) |
 | 101 | Machine cycle counter of that part (changes with every verdict; written with 100 in one frame) |
-| 102 | Heartbeat counter: stops when inspection is unhealthy, so treat parts as not inspected |
+| 102 | Heartbeat counter: stops when a camera goes silent, a view cannot inspect, or a verdict fails to arrive (held at least 10 s), so treat parts as not inspected |
 | 103 | Machine-level alert (geometry, vibration) that belongs to no single part |
 
 Each physical part gets one verdict. On a multi-camera station a part passes only when every
 `required_view` has passed it; a view missing after `inspection.view_timeout_s` gives flag 4.
 
+**Telemetry API.** It listens on this machine only. To open it to the plant network, set
+`api.host`, and set `QUALYXUS_API_TOKEN` so the streams need a bearer token. Browser origins
+are listed in `QUALYXUS_API_CORS_ORIGINS`.
+
 **Audit trail.** Records are chained with a keyed hash, and `data/audit.anchor.json` catches
-deleted newest records. Keep `inspection.audit.key_file` away from the log on a real line, and
+deleted newest records, even across a restart. Keep `inspection.audit.key_file` away from the log on a real line, and
 copy the anchor off the box regularly.
 
 ## Vision model stack

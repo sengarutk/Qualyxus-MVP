@@ -6,6 +6,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./models:/app/models
+      - ./secrets:/app/secrets     # audit key and accounts must outlive the container
       - ./config.yaml:/app/config.yaml
     environment:
       - CONFIG_PATH=/app/config.yaml
@@ -42,6 +43,7 @@ services:
     network_mode: "host"
     volumes:
       - ./data:/app/data
+      - ./secrets:/app/secrets
       - ./config.yaml:/app/config.yaml
     environment:
       - CONFIG_PATH=/app/config.yaml

@@ -1,5 +1,4 @@
 import os
-import sys
 import importlib
 import traceback
 
@@ -42,12 +41,7 @@ def test_repository_integrity():
             traceback.print_exc()
             failed.append(mod)
             
-    if failed:
-        print(f"\nIntegration validation failed for {len(failed)} modules.")
-        sys.exit(1)
-    else:
-        print("\nAll modules loaded successfully! ZERO broken links.")
-        sys.exit(0)
+    assert not failed, f"Integration validation failed for {len(failed)} modules: {failed}"
 
 if __name__ == "__main__":
     test_repository_integrity()

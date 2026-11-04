@@ -57,7 +57,7 @@ class CoreOrchestrator:
         
         api_cfg = self.config.get("api", default={}) or {}
         self.pulse_server = PulseServer(
-            host=str(api_cfg.get("host", "0.0.0.0")),
+            host=str(api_cfg.get("host", "127.0.0.1")),
             port=int(api_cfg.get("port", 8000)),
         )
         

@@ -156,8 +156,9 @@ class PLCAdapter:
             severity = 1
         kind = anomaly_payload.get("type", "ADVISORY")
         logger.info(f"[Modbus] Machine alert {kind} from {anomaly_payload.get('camera_id', 'unknown')}: {severity}")
-        return self._send(self.registers["alert"], [severity])
+        return self._send(self.registers["alert"], [max(0, min(severity, 0xFFFF))])
 
     def clear(self) -> bool:
-        """Leave no advisory flag set when the runtime stops."""
-        return self._send(self.registers["verdict"], [PLC_PASS]) and self._send(self.registers["alert"], [PLC_PASS])
+        """Stopping: no alert stays set, and the verdict register must not read as a pass."""
+        return (self._send(self.registers["verdict"], [PLC_FLAG_NOT_INSPECTED])
+                and self._send(self.registers["alert"], [0]))

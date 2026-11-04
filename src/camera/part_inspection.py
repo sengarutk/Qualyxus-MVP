@@ -12,7 +12,6 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-import cv2
 import numpy as np
 
 from src.inference.anomaly.image_quality import sharpness
@@ -59,6 +58,13 @@ def _verdict_of(flags: list[int], complete: bool) -> tuple[str, int]:
     return "pass", PLC_PASS
 
 
+def _worst(a: int, b: int) -> int:
+    """Two results for one view of one part: a reject beats not inspected, which beats a pass."""
+    def rank(flag: int) -> tuple[bool, bool, int]:
+        return flag not in (PLC_PASS, PLC_FLAG_NOT_INSPECTED), flag == PLC_FLAG_NOT_INSPECTED, flag
+    return max(a, b, key=rank)
+
+
 class PartVerdictFuser:
     """One verdict per physical part, however many cameras judge it.
 
@@ -66,6 +72,10 @@ class PartVerdictFuser:
     the part. A required view that never reports within ``timeout_s`` makes the part
     not_inspected, so a dead camera can never let a part through as a pass. Without required
     views each camera's verdict is the part's verdict (a single-camera station).
+
+    With no cycle to match on (the process feed is down), views are grouped as they arrive, so
+    one part stays one verdict. Nothing proves they saw the same part, so such a group can
+    fail but can never pass.
     """
 
     def __init__(self, required_views: Iterable[str] = (), *, timeout_s: float = 5.0):
@@ -73,6 +83,8 @@ class PartVerdictFuser:
         self.timeout_s = float(timeout_s)
         self._open: dict[str, dict[str, Any]] = {}
         self._closed: collections.deque[str] = collections.deque(maxlen=512)
+        self._unmatched: str | None = None
+        self._unmatched_count = 0
         self._lock = threading.Lock()
 
     def add(self, cycle_id: str | None, camera_id: str, flag: int, now: float) -> dict[str, Any] | None:
@@ -80,18 +92,23 @@ class PartVerdictFuser:
         if not self.required or camera_id not in self.required:
             verdict, value = _verdict_of([flag], True)
             return {"cycle_id": cycle_id, "verdict": verdict, "flag": value, "views": {camera_id: flag}, "missing": []}
-        if cycle_id is None:  # the other views of this part can never be matched to it
-            verdict, value = _verdict_of([flag], False)
-            return {"cycle_id": None, "verdict": verdict, "flag": value, "views": {camera_id: flag},
-                    "missing": sorted(self.required - {camera_id})}
         with self._lock:
-            if cycle_id in self._closed:
+            key = self._unmatched_group(camera_id) if cycle_id is None else cycle_id
+            if key in self._closed:
                 return None  # a late view of a part that already timed out
-            part = self._open.setdefault(cycle_id, {"deadline": now + self.timeout_s, "views": {}})
-            part["views"][camera_id] = flag
+            part = self._open.setdefault(key, {"deadline": now + self.timeout_s, "views": {},
+                                               "matched": cycle_id is not None})
+            part["views"][camera_id] = _worst(part["views"].get(camera_id, PLC_PASS), flag)
             if self.required - set(part["views"]):
                 return None
-            return self._close(cycle_id)
+            return self._close(key)
+
+    def _unmatched_group(self, camera_id: str) -> str:
+        group = self._open.get(self._unmatched or "")
+        if group is None or camera_id in group["views"]:
+            self._unmatched_count += 1
+            self._unmatched = f"unmatched-{self._unmatched_count}"
+        return self._unmatched
 
     def expired(self, now: float) -> list[dict[str, Any]]:
         """Parts whose required views did not all report in time."""
@@ -103,8 +120,9 @@ class PartVerdictFuser:
         part = self._open.pop(cycle_id)
         self._closed.append(cycle_id)
         missing = sorted(self.required - set(part["views"]))
-        verdict, value = _verdict_of(list(part["views"].values()), not missing)
-        return {"cycle_id": cycle_id, "verdict": verdict, "flag": value, "views": part["views"], "missing": missing}
+        verdict, value = _verdict_of(list(part["views"].values()), part["matched"] and not missing)
+        return {"cycle_id": cycle_id if part["matched"] else None, "verdict": verdict, "flag": value,
+                "views": part["views"], "missing": missing}
 
 
 class PartPresenceTracker:

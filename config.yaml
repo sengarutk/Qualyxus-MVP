@@ -55,6 +55,12 @@ mqtt:
   reconnect_backoff_seconds: 30
   evaluation_queue_size: 128
 
+# Telemetry API. Bound to this machine only. To open it to the plant network, set host to
+# "0.0.0.0" and set QUALYXUS_API_TOKEN so the streams need a token.
+api:
+  host: "127.0.0.1"
+  port: 8000
+
 telemetry:
   mode: "simulated"
   protocol: "modbus"
@@ -164,6 +170,8 @@ camera:
 
 # Process-quality intelligence: machine cycles <-> inspected parts.
 process:
+  # Raw curves are dropped after this many days; per-cycle features are kept. 0 keeps them forever.
+  curve_retention_days: 30
   enabled: true
   # simulated (development) | modbus | opcua
   source: "simulated"
@@ -251,6 +259,9 @@ inspection:
     # On score drift, file a retraining request (needs human approval; trains on the good pool).
     request_retrain: true
   # Tamper-evident, hash-chained record of every verdict (verify: python -m src.inference.audit_log verify).
+  # A camera silent for longer than this stops the PLC heartbeat. Raise it for hardware-triggered
+  # cameras, which send no frames between parts.
+  max_frame_age_s: 5.0
   audit:
     enabled: true
     dir: "data/audit"

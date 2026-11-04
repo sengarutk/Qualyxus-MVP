@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any
 import pandas as pd
 
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from src.analytics.root_cause import RootCauseConfig, RootCauseIntelligence
 from src.analytics.esg_engine import ESGEngine
@@ -338,7 +338,7 @@ def _generate_pdf_report(
     template_dir = Path("src/compliance/templates")
     cfg = Config.load()
     template_dir = Path(cfg.get("paths", "data_dir", default="data")).resolve().parents[0] / "src" / "compliance" / "templates"
-    env = Environment(loader=FileSystemLoader(str(template_dir)))
+    env = Environment(loader=FileSystemLoader(str(template_dir)), autoescape=select_autoescape(["html"]))
     template = env.get_template("report_template.html")
     traceability_records = _prepare_traceability_records(events_df, rca_payload)
 

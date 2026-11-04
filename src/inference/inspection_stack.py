@@ -107,6 +107,8 @@ class InspectionStack:
         self.anomaly = _load_anomaly(anomaly_path)
         self.segmenter = _load_segmenter(segmentation_path)
         self.typer = _load_typer(typing_path)
+        self.model_missing = bool((anomaly_path and self.anomaly is None)
+                                  or (segmentation_path and self.segmenter is None))
         self.versions = {
             role: v for role, v in (
                 ("anomaly", _version_of(anomaly_path, versions.get("anomaly")) if self.anomaly else None),
@@ -118,7 +120,8 @@ class InspectionStack:
 
     @property
     def empty(self) -> bool:
-        return self.anomaly is None and self.segmenter is None
+        """True unless every configured inspection model loaded: part of a check is not a pass."""
+        return self.model_missing or (self.anomaly is None and self.segmenter is None)
 
     def judge(self, frame: np.ndarray, *, frame_defect_types: list[str] | None = None) -> PartJudgement:
         """Any model failing the part fails it. Type: segmenter > frame detector > classifier."""

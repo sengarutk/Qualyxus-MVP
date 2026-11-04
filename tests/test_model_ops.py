@@ -302,6 +302,22 @@ def test_labeling_export_prioritises_uncertain_parts_and_import_builds_dataset(t
 
 # ------------------------------------------------- live inspection wiring
 
+def _health_fields(cm, views=()):
+    """What the heartbeat reads; every view starts out delivering frames."""
+    from src.camera.camera_manager import CameraWorkerState
+
+    now = time.perf_counter()
+    cm._lock = threading.Lock()
+    cm._view_faults, cm._delivery_fault_until = {}, 0.0
+    cm._heartbeat_write, cm._hold_reason = None, None
+    cm.max_frame_age_s = 5.0
+    cm.workers = {}
+    for view in views or ("cam",):
+        state = CameraWorkerState(view, "s", None, queue.Queue(), queue.Queue(), threading.Event())
+        state.last_capture_ts = state.last_infer_ts = now
+        cm.workers[view] = state
+
+
 class _StubStack:
     def __init__(self, failed: bool, version: str, score: float):
         from src.inference.inspection_stack import PartJudgement
@@ -346,6 +362,7 @@ def test_inspect_part_records_shadow_audit_review_and_pool(tmp_path):
     recorded: list[Any] = []
     cm.fast_queue, cm.part_fuser = queue.Queue(), PartVerdictFuser()
     cm._part_counter, cm._inspection_faulted = 0, False
+    _health_fields(cm)
     cm._record_new_defect = lambda *a, **k: recorded.append(k) or True
     cm._telemetry_context = lambda *a, **k: None
 
@@ -442,6 +459,7 @@ def _reject_path_manager(tmp_path, stack):
     cm.fast_queue = queue.Queue(maxsize=20)
     cm.part_fuser = PartVerdictFuser()
     cm._part_counter, cm._inspection_faulted = 0, False
+    _health_fields(cm)
     cm._record_new_defect = lambda *a, **k: True
     cm._telemetry_context = lambda *a, **k: None
     return cm, CameraWorkerState("cam", "s", None, queue.Queue(), queue.Queue(), threading.Event())
@@ -525,6 +543,7 @@ def test_dead_camera_stops_the_heartbeat_and_recovery_restarts_it(tmp_path):
     cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
     cm.part_fuser = PartVerdictFuser(["top", "side"], timeout_s=0.0)
     cm.plc_executor, cm.heartbeat_s, cm._last_heartbeat = ThreadPoolExecutor(1), 0.0, 0.0
+    _health_fields(cm, ["top", "side"])
 
     state.camera_id = "top"
     cm._report_view(state, "c1", 0)                   # "side" never reports
@@ -636,8 +655,29 @@ def test_fuser_without_required_views_is_a_single_camera_station():
 def test_unlinked_view_of_a_multi_view_part_is_never_a_pass():
     from src.camera.part_inspection import PartVerdictFuser
 
-    fuser = PartVerdictFuser(["top", "side"])
-    assert fuser.add(None, "top", 0, 0.0)["verdict"] == "not_inspected"
+    fuser = PartVerdictFuser(["top", "side"], timeout_s=5.0)
+    assert fuser.add(None, "top", 0, 0.0) is None
+    assert fuser.add(None, "side", 0, 0.1)["verdict"] == "not_inspected"   # both passed, still unproven
+    assert fuser.add(None, "top", 0, 1.0) is None
+    assert fuser.expired(6.1)[0]["verdict"] == "not_inspected"
+
+
+def test_process_feed_down_keeps_one_verdict_per_part_and_rejects_still_reject():
+    from src.camera.part_inspection import PartVerdictFuser
+
+    fuser = PartVerdictFuser(["a", "b", "c"], timeout_s=5.0)
+    out = [fuser.add(None, view, 2 if view == "b" else 0, 0.0) for view in "abc"]
+    assert [o is not None for o in out] == [False, False, True]
+    assert out[-1]["verdict"] == "fail" and out[-1]["cycle_id"] is None
+
+
+def test_second_result_from_a_view_cannot_erase_a_reject():
+    from src.camera.part_inspection import PartVerdictFuser
+
+    fuser = PartVerdictFuser(["a", "b"], timeout_s=5.0)
+    fuser.add("c1", "a", 3, 0.0)
+    fuser.add("c1", "a", 0, 0.1)
+    assert fuser.add("c1", "b", 0, 0.2)["flag"] == 3
 
 
 def _audit_with(tmp_path, n=5):
@@ -912,3 +952,310 @@ def test_demo_defects_rotate_and_keep_real_process_defects():
     feed = SyntheticPartFeed(None, inject_defect_every=5)
     assert feed._defect_for(3, None) is None and feed._defect_for(3, "flash") == "flash"
     assert len({feed._defect_for(n, None) for n in (5, 10, 15, 20)}) == 4
+
+
+# ------------------------------------------------------- what the PLC is told when things break
+class _Beats:
+    def __init__(self):
+        self.n = 0
+
+    def write_heartbeat(self):
+        self.n += 1
+        return True
+
+
+def _heartbeat_manager(tmp_path, views=("top", "side")):
+    from concurrent.futures import ThreadPoolExecutor
+    from src.camera.part_inspection import PartVerdictFuser
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
+    cm.part_fuser = PartVerdictFuser(views, timeout_s=60.0)
+    _health_fields(cm, views)
+    cm.plc_executor, cm.heartbeat_s, cm._last_heartbeat = ThreadPoolExecutor(1), 0.0, 0.0
+    return cm, state
+
+
+def _beats_after_tick(cm) -> int:
+    beats = _Beats()
+    cm._reflex_tick(beats)
+    cm.plc_executor.shutdown(wait=True)
+    return beats.n
+
+
+def test_healthy_station_keeps_its_heartbeat(tmp_path):
+    cm, _ = _heartbeat_manager(tmp_path)
+    assert _beats_after_tick(cm) == 1
+
+
+@pytest.mark.parametrize("break_station", [
+    lambda cm: cm.workers.clear(),
+    lambda cm: cm.workers.pop("side"),
+    lambda cm: setattr(cm.workers["top"], "failed", True),
+    lambda cm: setattr(cm.workers["top"], "last_capture_ts", 0.0),
+    lambda cm: setattr(cm.workers["top"], "last_capture_ts", time.perf_counter() - 60),
+    lambda cm: setattr(cm.workers["side"], "last_infer_ts", time.perf_counter() - 60),
+], ids=["all-gone", "one-gone", "worker-failed", "never-started", "camera-silent", "inference-hung"])
+def test_heartbeat_stops_when_no_part_will_ever_time_out(tmp_path, break_station):
+    """With nothing reporting, no part opens, so the view timeout alone would never fire."""
+    cm, _ = _heartbeat_manager(tmp_path)
+    break_station(cm)
+    assert _beats_after_tick(cm) == 0
+
+
+def test_heartbeat_stops_on_a_single_camera_station_too(tmp_path):
+    cm, _ = _heartbeat_manager(tmp_path, ["cam"])
+    cm.part_fuser.required = frozenset()
+    cm.workers["cam"].last_capture_ts = time.perf_counter() - 60
+    assert _beats_after_tick(cm) == 0
+
+
+def test_a_good_view_does_not_clear_another_views_fault(tmp_path):
+    from src.camera import camera_manager as module
+    from src.camera.part_inspection import CompletedPart
+
+    cm, state = _heartbeat_manager(tmp_path)
+    real = module.image_fault
+    frame = render_part(160, 120, None, seed=3)
+    try:
+        state.camera_id, module.image_fault = "top", lambda f, b: "blurred"
+        cm._inspect_part(state, CompletedPart("top", 1.0, 2.0, frame, 7, 3))
+        state.camera_id, module.image_fault = "side", lambda f, b: None
+        cm._inspect_part(state, CompletedPart("side", 1.0, 2.0, frame, 8, 3))
+    finally:
+        module.image_fault = real
+    assert cm._view_faults == {"top": True, "side": False}
+    assert _beats_after_tick(cm) == 0
+
+
+def _full_disk(*args, **kwargs):
+    raise OSError(28, "No space left on device")
+
+
+def test_full_disk_cannot_cost_a_reject(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(True, "v0001", 1.4))
+    cm.audit_log.append = _full_disk
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    assert cm.fast_queue.get_nowait()["verdict"] == "fail"
+
+
+def test_timed_out_part_reaches_the_plc_with_a_full_disk(tmp_path):
+    cm, state = _heartbeat_manager(tmp_path)
+    cm.part_fuser.timeout_s = 0.0
+    state.camera_id = "top"
+    cm._report_view(state, "c1", 3)
+    cm.audit_log.append = _full_disk
+    cm._reflex_tick(_Beats())
+    cm.plc_executor.shutdown(wait=True)
+    assert cm.fast_queue.get_nowait()["flag"] == 3
+
+
+def test_failure_after_the_verdict_leaves_the_verdict_alone(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+
+    class Aligned:
+        cycle_id, cavity = "m-1", 0
+
+    class Link:
+        parts_per_cycle = 1
+
+    class Aligner:
+        link_for = staticmethod(lambda camera: Link)
+        align = staticmethod(lambda camera, ts: Aligned)
+
+    class Service:
+        aligner = Aligner
+
+        @staticmethod
+        def record_inspection(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(True, "v0001", 1.4))
+    cm.process_service = Service
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    sent = [cm.fast_queue.get_nowait() for _ in range(cm.fast_queue.qsize())]
+    assert [s["verdict"] for s in sent] == ["fail"]
+
+
+@pytest.mark.parametrize("adapter_result", [False, RuntimeError("lost")], ids=["returned-false", "raised"])
+def test_verdict_that_never_arrived_stops_the_heartbeat(tmp_path, adapter_result):
+    cm, _ = _heartbeat_manager(tmp_path)
+
+    class Plc(_Beats):
+        def write_part_verdict(self, signal):
+            if isinstance(adapter_result, Exception):
+                raise adapter_result
+            return adapter_result
+
+    cm._deliver_verdict(Plc(), {"part": 7})
+    assert _beats_after_tick(cm) == 0
+
+
+def test_verdict_dropped_from_a_full_queue_stops_the_heartbeat(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(True, "v0001", 1.4))
+    cm.fast_queue = queue.Queue(maxsize=1)
+    cm.fast_queue.put_nowait({})
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    assert cm._heartbeat_hold(time.monotonic()) == "a part verdict did not reach the PLC"
+
+
+def test_heartbeats_do_not_queue_up_behind_a_hung_plc(tmp_path):
+    cm, _ = _heartbeat_manager(tmp_path)
+    release = threading.Event()
+
+    class Hung(_Beats):
+        def write_heartbeat(self):
+            release.wait(5)
+
+    for _ in range(50):
+        cm._reflex_tick(Hung())
+    backlog = cm.plc_executor._work_queue.qsize()
+    release.set()
+    cm.plc_executor.shutdown(wait=True)
+    assert backlog == 0
+
+
+def test_clean_stop_does_not_leave_a_pass_on_the_plc():
+    from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED, PLC_REGISTERS, PLCAdapter
+
+    plc, sent = PLCAdapter(), {}
+    plc._send = lambda address, values: sent.update({address: values[0]}) or True
+    plc.clear()
+    assert sent == {PLC_REGISTERS["verdict"]: PLC_FLAG_NOT_INSPECTED, PLC_REGISTERS["alert"]: 0}
+
+
+@pytest.mark.parametrize("severity,written", [(-1, 0), (70000, 0xFFFF), (2, 2)])
+def test_alert_value_always_fits_a_register(severity, written):
+    from src.telemetry.plc_adapter import PLCAdapter
+
+    plc, sent = PLCAdapter(), []
+    plc._send = lambda address, values: sent.extend(values) or True
+    plc.write_advisory_flag({"severity": severity})
+    assert sent == [written]
+
+
+# ----------------------------------------------------------------- audit trail under real failures
+def _only_log_file(directory):
+    return next(directory.glob("*.jsonl"))
+
+
+def test_restart_cannot_bury_deleted_records(tmp_path):
+    from src.inference.audit_log import InspectionAuditLog, verify_chain
+
+    directory, _ = _audit_with(tmp_path)
+    log_file = _only_log_file(directory)
+    log_file.write_text("".join(log_file.read_text().splitlines(keepends=True)[:3]))
+    InspectionAuditLog(directory).append({"part": 9, "verdict": "pass"})
+    result = verify_chain(directory)
+    assert not result["ok"] and "2 newest records are missing" in result["error"]
+
+
+def test_restart_cannot_bury_a_deleted_anchor(tmp_path):
+    from src.inference.audit_log import InspectionAuditLog, anchor_path, verify_chain
+
+    directory, _ = _audit_with(tmp_path)
+    anchor_path(directory).unlink()
+    InspectionAuditLog(directory).append({"part": 9, "verdict": "pass"})
+    assert not verify_chain(directory)["ok"]
+
+
+def test_power_cut_mid_write_is_not_tampering_and_logging_continues(tmp_path):
+    from src.inference.audit_log import InspectionAuditLog, verify_chain
+
+    directory, _ = _audit_with(tmp_path)
+    log_file = _only_log_file(directory)
+    with open(log_file, "a") as fh:
+        fh.write('{"hash": "abc", "part": 5, "tru')
+    assert verify_chain(directory)["torn_tail"] is True
+    InspectionAuditLog(directory).append({"part": 9, "verdict": "pass"})
+    result = verify_chain(directory)
+    assert result["ok"] and result["records"] == 6 and "torn_tail" not in result
+    assert '"tru' in log_file.with_suffix(".torn").read_text()
+
+
+def test_corrupt_line_in_the_middle_is_reported_not_a_crash(tmp_path):
+    from src.inference.audit_log import verify_chain
+
+    directory, _ = _audit_with(tmp_path)
+    log_file = _only_log_file(directory)
+    lines = log_file.read_text().splitlines(keepends=True)
+    lines[2] = "not json\n"
+    log_file.write_text("".join(lines))
+    assert verify_chain(directory)["error"].endswith(":3 is not a valid record")
+
+
+def test_any_recordable_value_survives_verification(tmp_path):
+    from src.inference.audit_log import InspectionAuditLog, verify_chain
+
+    log = InspectionAuditLog(tmp_path / "audit")
+    log.append({"counts": {10: "a", 9: "b"}, "score": np.float32(0.5), "n": np.int64(3), "box": (1, 2)})
+    assert verify_chain(tmp_path / "audit")["ok"]
+
+
+# ------------------------------------------------------------------------------ exposure limits
+def test_streams_need_the_token_when_one_is_set(monkeypatch):
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from src.api.pulse_server import require_token
+
+    def request(header=None):
+        headers = [(b"authorization", header.encode())] if header else []
+        return Request({"type": "http", "headers": headers})
+
+    require_token(request())                                  # no token configured
+    monkeypatch.setenv("QUALYXUS_API_TOKEN", "s3cret")
+    require_token(request("Bearer s3cret"))
+    for wrong in (None, "Bearer nope", "s3cret"):
+        with pytest.raises(HTTPException):
+            require_token(request(wrong))
+
+
+def test_api_is_closed_by_default():
+    from src.api.pulse_server import PulseServer, app
+
+    assert PulseServer().host == "127.0.0.1"
+    cors = next(m for m in app.user_middleware if m.cls.__name__ == "CORSMiddleware")
+    assert cors.kwargs["allow_origins"] == [] and not cors.kwargs.get("allow_credentials")
+
+
+def test_report_template_escapes_recorded_text(tmp_path):
+    from jinja2 import DictLoader, Environment, select_autoescape
+
+    source = Path("src/compliance/report_generator.py").read_text(encoding="utf-8")
+    assert 'autoescape=select_autoescape(["html"])' in source
+    env = Environment(loader=DictLoader({"r.html": "{{ v }}"}), autoescape=select_autoescape(["html"]))
+    assert "<script>" not in env.get_template("r.html").render(v="<script>x</script>")
+
+
+def test_wall_clock_jumping_back_does_not_stall_the_heartbeat(tmp_path, monkeypatch):
+    cm, _ = _heartbeat_manager(tmp_path)
+    beats = _Beats()
+    cm._reflex_tick(beats)
+    cm._heartbeat_write.result()
+    monkeypatch.setattr(time, "time", lambda: 0.0)       # clock corrected far backwards
+    cm._reflex_tick(beats)
+    cm.plc_executor.shutdown(wait=True)
+    assert beats.n == 2
+
+
+def test_corrupt_audit_key_is_reported_not_a_crash(tmp_path):
+    from src.inference.audit_log import verify_chain
+
+    directory, _ = _audit_with(tmp_path)
+    directory.with_name(directory.name + ".key").write_text("not hex")
+    result = verify_chain(directory)
+    assert not result["ok"] and "unreadable" in result["error"]
+
+
+def test_model_that_failed_to_load_makes_parts_not_inspected(tmp_path):
+    from src.inference.inspection_stack import InspectionStack
+
+    bad = tmp_path / "broken.pt"
+    bad.write_bytes(b"not a model")
+    stack = InspectionStack("r", anomaly_path=bad)
+    stack.segmenter = object()                # the other model is fine: still only half a check
+    assert stack.empty
