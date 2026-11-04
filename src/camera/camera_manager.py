@@ -1414,6 +1414,8 @@ class CameraManager:
     def _publish_part_verdict(self, verdict: dict[str, Any]) -> None:
         """One physical part's final verdict: queued for the PLC and kept in the audit trail."""
         cycle_id = verdict["cycle_id"]
+        # A view that stopped reporting is unhealthy too, even if another view failed the part.
+        self._inspection_faulted = verdict["verdict"] == "not_inspected" or bool(verdict["missing"])
         tail = str(cycle_id).rsplit("-", 1)[-1] if cycle_id else ""
         self._part_counter = (self._part_counter + 1) & 0xFFFF
         part = int(tail) if tail.isdigit() else self._part_counter

@@ -511,6 +511,34 @@ def test_blurred_frame_is_a_camera_fault_not_a_reject(tmp_path):
     assert cm.fast_queue.get_nowait()["verdict"] == "not_inspected" and cm._inspection_faulted
 
 
+def test_dead_camera_stops_the_heartbeat_and_recovery_restarts_it(tmp_path):
+    from src.camera.part_inspection import PartVerdictFuser
+
+    class Adapter:
+        beats = 0
+
+        def write_heartbeat(self):
+            Adapter.beats += 1
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
+    cm.part_fuser = PartVerdictFuser(["top", "side"], timeout_s=0.0)
+    cm.plc_executor, cm.heartbeat_s, cm._last_heartbeat = ThreadPoolExecutor(1), 0.0, 0.0
+
+    state.camera_id = "top"
+    cm._report_view(state, "c1", 0)                   # "side" never reports
+    cm._reflex_tick(Adapter())
+    assert cm._inspection_faulted and Adapter.beats == 0
+
+    cm._report_view(state, "c2", 0)
+    state.camera_id = "side"
+    cm._report_view(state, "c2", 0)                   # both views report again
+    cm._reflex_tick(Adapter())
+    cm.plc_executor.shutdown(wait=True)
+    assert not cm._inspection_faulted and Adapter.beats == 1
+
+
 def test_inspection_crash_flags_the_part_instead_of_losing_it(tmp_path):
     from src.camera.part_inspection import CompletedPart
 
