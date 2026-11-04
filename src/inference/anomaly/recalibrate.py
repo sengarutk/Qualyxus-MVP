@@ -24,6 +24,8 @@ from typing import Any, Sequence
 import cv2
 import numpy as np
 
+from src.inference.anomaly.image_quality import image_quality_baseline
+
 logger = logging.getLogger("AnomalyRecalibrate")
 
 # Far outside the seeds training renders (10,000 + i), so calibration images are unseen.
@@ -36,7 +38,8 @@ def recalibrate(detector, good_images: Sequence[np.ndarray], *, part_frr: float 
     if n_views < 1:
         raise ValueError("n_views must be at least 1")
     result = detector.calibrate(detector._holdout_scores(good_images), target_frr=part_frr / n_views)
-    detector.calibration.update({"part_frr_target": part_frr, "n_views": n_views})
+    detector.calibration.update({"part_frr_target": part_frr, "n_views": n_views,
+                                 "image_quality": image_quality_baseline(good_images)})
     return {**result, "part_frr_target": part_frr, "n_views": n_views}
 
 

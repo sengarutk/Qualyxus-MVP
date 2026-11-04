@@ -481,6 +481,33 @@ def test_part_with_no_model_is_not_passed(tmp_path):
     assert {r["verdict"] for r in records} == {"not_inspected"}
 
 
+def test_image_quality_flags_blur_and_noise_but_not_good_or_defective_parts():
+    from src.inference.anomaly.image_quality import image_fault, image_quality_baseline
+    from src.process.simulator import DEFECT_TYPES
+
+    good = [render_part(640, 480, None, seed=i) for i in range(10)]
+    baseline = image_quality_baseline(good)
+    assert all(image_fault(g, baseline) is None for g in good)
+    assert all(image_fault(render_part(640, 480, d, seed=5), baseline) is None for d in DEFECT_TYPES)
+    assert "sharpness" in image_fault(cv2.GaussianBlur(good[0], (0, 0), 1.5), baseline)
+    noisy = good[0].astype(float) + np.random.default_rng(0).normal(0, 8, good[0].shape)
+    assert "noise" in image_fault(np.clip(noisy, 0, 255).astype(np.uint8), baseline)
+    assert image_fault(good[0], None) is None
+
+
+def test_blurred_frame_is_a_camera_fault_not_a_reject(tmp_path):
+    from src.camera.part_inspection import CompletedPart
+    from src.inference.anomaly.image_quality import image_quality_baseline
+
+    good = [render_part(160, 120, None, seed=i) for i in range(5)]
+    stack = _StubStack(True, "v0001", 5.0)        # the model would call this part defective
+    stack.anomaly.calibration = {"image_quality": image_quality_baseline(good)}
+    cm, state = _reject_path_manager(tmp_path, stack)
+    cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, cv2.GaussianBlur(good[0], (0, 0), 3.0), 7, 3))
+    assert (state.parts_failed, state.parts_not_inspected) == (0, 1)
+    assert cm.fast_queue.get_nowait()["verdict"] == "not_inspected" and cm._inspection_faulted
+
+
 def test_inspection_crash_flags_the_part_instead_of_losing_it(tmp_path):
     from src.camera.part_inspection import CompletedPart
 
@@ -819,6 +846,14 @@ def test_config_extends_overlays_a_base_file(tmp_path):
     assert raw["a"] == {"x": 1, "y": 3} and raw["cameras"] == [{"id": "new"}] and "extends" not in raw
 
 
+def test_patchcore_training_does_not_hold_the_raw_bank_on_the_device():
+    from src.inference.anomaly.patchcore import greedy_coreset
+
+    features = torch.randn(500, 256)
+    idx = greedy_coreset(features, 0.1, device=torch.device("cpu"))
+    assert idx.shape[0] == 50 and idx.unique().shape[0] == 50
+
+
 def test_recalibration_splits_the_false_reject_budget_across_views():
     from src.inference.anomaly.recalibrate import recalibrate
 
@@ -831,10 +866,11 @@ def test_recalibration_splits_the_false_reject_budget_across_views():
         def calibrate(self, scores, target_frr):
             self.target = target_frr
             self.calibration = {}
-            return {"threshold": max(scores)}
+            return {"threshold": 1.0}
 
     det = Detector()
-    result = recalibrate(det, [0.1, 0.2], part_frr=0.012, n_views=6)
+    frames = [np.zeros((48, 64, 3), np.uint8), np.full((48, 64, 3), 9, np.uint8)]
+    result = recalibrate(det, frames, part_frr=0.012, n_views=6)
     assert det.target == pytest.approx(0.002)
     assert result["n_views"] == 6 and det.calibration["part_frr_target"] == 0.012
 

@@ -15,6 +15,7 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 
+from src.inference.anomaly.image_quality import sharpness
 from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED, PLC_PASS
 
 
@@ -47,11 +48,6 @@ def part_pose(frame: np.ndarray) -> tuple[float, float, float] | None:
         angle += 90.0
     angle = (angle + 90.0) % 180.0 - 90.0
     return round(float(cx), 2), round(float(cy), 2), round(float(angle), 2)
-
-
-def sharpness(frame: np.ndarray) -> float:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def _verdict_of(flags: list[int], complete: bool) -> tuple[str, int]:

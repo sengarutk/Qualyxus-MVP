@@ -5,10 +5,12 @@
 extends: config.yaml
 
 # Calibrated so false rejects hold per part across all six views, not per camera:
-#   python -m src.inference.anomaly.recalibrate --model models/anomaly/synthetic_parts.pt \
-#       --synthetic 1500 --views 6 --out models/anomaly/synthetic_parts_6view.pt
+#   python -m src.inference.anomaly.train --synthetic 1200 --method patchcore --backbone dinov2_vits14 \
+#       --register --out models/anomaly/synthetic_parts_reg.pt
+#   python -m src.inference.anomaly.recalibrate --model models/anomaly/synthetic_parts_reg.pt \
+#       --synthetic 1500 --views 6 --out models/anomaly/synthetic_parts_6view_reg.pt
 inspection:
-  anomaly_model: "models/anomaly/synthetic_parts_6view.pt"
+  anomaly_model: "models/anomaly/synthetic_parts_6view_reg.pt"
 
 process:
   simulator:

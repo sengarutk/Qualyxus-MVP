@@ -27,7 +27,7 @@ logger = logging.getLogger("QualyxusPatchCore")
 
 
 def greedy_coreset(features: torch.Tensor, fraction: float, *, projection_dim: int = 128,
-                   seed: int = 0, max_size: int = 30000) -> torch.Tensor:
+                   seed: int = 0, max_size: int = 30000, device: torch.device | None = None) -> torch.Tensor:
     """Indices of an approximate k-center coreset (iterative farthest-point selection)."""
     n = features.shape[0]
     k = int(min(max_size, max(1, math.ceil(n * fraction))))
@@ -39,9 +39,10 @@ def greedy_coreset(features: torch.Tensor, fraction: float, *, projection_dim: i
         reduced = features @ proj
     else:
         reduced = features
-    selected = torch.empty(k, dtype=torch.long, device=features.device)
+    reduced = reduced.to(device or features.device)  # small enough for the GPU once projected
+    selected = torch.empty(k, dtype=torch.long, device=reduced.device)
     current = int(torch.randint(n, (1,), generator=gen).item())
-    min_dist = torch.full((n,), float("inf"), device=features.device, dtype=reduced.dtype)
+    min_dist = torch.full((n,), float("inf"), device=reduced.device, dtype=reduced.dtype)
     for i in range(k):
         selected[i] = current
         dist = torch.linalg.vector_norm(reduced - reduced[current], dim=1)
@@ -105,15 +106,15 @@ class PatchCoreDetector(AnomalyDetector):
         chunks = []
         for start in range(0, len(images), batch_size):
             feats, _ = self._patch_features(images[start:start + batch_size])
-            chunks.append(feats)
+            chunks.append(feats.cpu())  # the full bank is far larger than the final model
         bank = torch.cat(chunks, dim=0)
         finite = torch.isfinite(bank).all(dim=1)
         if not bool(finite.all()):
             logger.warning("[PatchCore] Dropping %d non-finite patch features", int((~finite).sum()))
             bank = bank[finite]
-        idx = greedy_coreset(bank, self.coreset_fraction, seed=seed)
+        idx = greedy_coreset(bank, self.coreset_fraction, seed=seed, device=self.device).to(bank.device)
         # Round to the stored fp16 precision now, so calibration sees exactly the deployed bank.
-        self.memory_bank = bank[idx].half().float().contiguous()
+        self.memory_bank = bank[idx].half().float().contiguous().to(self.device)
         logger.info("[PatchCore/%s] Memory bank: %d patches (from %d) x %d dims",
                     self.backbone_name, self.memory_bank.shape[0], bank.shape[0], self.memory_bank.shape[1])
         return {"memory_bank": int(self.memory_bank.shape[0]), "backbone": self.backbone_name}

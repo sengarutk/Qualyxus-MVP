@@ -23,6 +23,8 @@ except ImportError:
     _psutil = None
 
 from src.camera.part_inspection import CompletedPart, PartPresenceTracker, PartVerdictFuser, part_pose
+from src.inference.anomaly.image_quality import image_fault
+from src.inference.inspection_stack import PartJudgement
 from src.config.config import Config
 from src.core.factory_manager import FactoryManager
 from src.inference.analysis.geometry_engine import GeometryEngine
@@ -1279,7 +1281,12 @@ class CameraManager:
             recipe = self._recipe_for(state.camera_id, cycle_id)
             stack, shadow = self.stack_provider.get(recipe)
 
-            judged = stack.judge(frame, frame_defect_types=list(part.defect_types or []))
+            baseline = (getattr(stack.anomaly, "calibration", None) or {}).get("image_quality")
+            fault = image_fault(frame, baseline)
+            if fault:
+                judged = PartJudgement(False, None, None, None)
+            else:
+                judged = stack.judge(frame, frame_defect_types=list(part.defect_types or []))
             failed = judged.failed or bool(part.defect_event_ids)
             anomaly, top = judged.anomaly, judged.top
             defect_type, bbox, confidence = judged.defect_type, judged.bbox, judged.confidence
@@ -1305,7 +1312,7 @@ class CameraManager:
                     event_id = None
 
             # No loaded model means nobody looked at this part, which is not a pass.
-            not_inspected = stack.empty and not failed
+            not_inspected = (stack.empty or bool(fault)) and not failed
             verdict = "not_inspected" if not_inspected else ("fail" if failed else "pass")
             normalized = judged.normalized_score
             self._inspection_faulted = not_inspected
@@ -1315,9 +1322,10 @@ class CameraManager:
                 self._report_view(state, part_key, PLC_FLAG_NOT_INSPECTED)
                 if not state.not_inspected_logged:
                     state.not_inspected_logged = True
-                    logger.error("[%s] No inspection model is loaded for recipe '%s': parts are recorded as "
-                                 "not_inspected until one is available.", state.camera_id, recipe)
+                    logger.error("[%s] Parts are recorded as not_inspected: %s", state.camera_id,
+                                 fault or f"no inspection model is loaded for recipe '{recipe}'")
             else:
+                state.not_inspected_logged = False
                 self._report_view(state, part_key, PLC_PASS)
             image_sha = None
             if self.audit_log is not None or shadow is not None or self.review_queue is not None:
@@ -1360,6 +1368,7 @@ class CameraManager:
             if self.audit_log is not None:
                 self.audit_log.append({
                     "ts": part.ts, "camera_id": state.camera_id, "recipe": recipe, "cycle_id": cycle_id,
+                    "image_fault": fault,
                     "verdict": verdict, "defect_type": defect_type if failed else None,
                     "normalized_score": normalized, "raw_score": anomaly.score if anomaly is not None else None,
                     "threshold": stack.anomaly.threshold if stack.anomaly is not None else None,

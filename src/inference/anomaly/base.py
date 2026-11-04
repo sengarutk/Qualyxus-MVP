@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from src.inference.anomaly.calibration import conformal_threshold
+from src.inference.anomaly.image_quality import image_quality_baseline
 from src.inference.anomaly.preprocess import Preprocessor
 
 logger = logging.getLogger("QualyxusAnomaly")
@@ -89,7 +90,7 @@ class AnomalyDetector(ABC):
         views = [v for img in train for v in self.preprocessor.views(img)] if self.preprocessor.active else train
         info = self._train(views, **train_kwargs)
         self.calibrate(self._holdout_scores(holdout), target_frr=target_frr, confidence=confidence)
-        self.calibration.update({"n_train": len(train), **(info or {})})
+        self.calibration.update({"n_train": len(train), "image_quality": image_quality_baseline(holdout), **(info or {})})
         if self.preprocessor.active:
             self.calibration["preprocess"] = {"register": self.preprocessor.register,
                                               "tiles": self.preprocessor.tiles, **prep_info}
