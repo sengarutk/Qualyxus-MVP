@@ -3,6 +3,7 @@ import logging
 import signal
 import sys
 
+from src.system.sqlite_recovery import set_aside_if_corrupt
 from src.config.vault import ConfigVault
 from src.core.factory_manager import FactoryManager
 from src.core.hub_connector import HubConnector
@@ -46,8 +47,12 @@ class CoreOrchestrator:
         self.manager.register_instance("PredictiveHistorian", self.historian)
         
         # Persist to the same SQLite/CSV targets the dashboard and analytics read.
+        events_db = self.config.get("logging", "sqlite_path", default="data/events/events.db")
+        process_db = (self.config.get("process", default={}) or {}).get("db_path", "data/events/process.db")
+        for database in (events_db, process_db):
+            set_aside_if_corrupt(database)
         self.event_logger = EventLogger(
-            sqlite_path=self.config.get("logging", "sqlite_path", default="data/events/events.db"),
+            sqlite_path=events_db,
             csv_path=self.config.get("logging", "csv_path", default="data/events/events.csv"),
         )
         self.manager.register_instance("EventLogger", self.event_logger)

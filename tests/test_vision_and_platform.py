@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import queue
 
 import base64
@@ -123,3 +125,27 @@ def test_uncalibrated_vibration_never_classifies_or_flags(tmp_path):
         ts += 1 / 30.0
         result = vib.ingest(50.0 * np.sin(i), 0.0, ts=ts)
     assert result["iso_status"] == "UNCALIBRATED" and vib._fast_queue.empty()
+
+
+def test_damaged_database_is_set_aside_and_kept(tmp_path):
+    from src.system.sqlite_recovery import set_aside_if_corrupt
+
+    db = tmp_path / "process.db"
+    db.write_bytes(b"this is not a database" * 500)
+    (tmp_path / "process.db-wal").write_bytes(b"w")
+    moved = set_aside_if_corrupt(db)
+    assert moved is not None and moved.read_bytes().startswith(b"this is not")
+    assert not db.exists() and not (tmp_path / "process.db-wal").exists()
+
+
+def test_healthy_or_absent_database_is_left_alone(tmp_path):
+    import sqlite3
+
+    from src.system.sqlite_recovery import set_aside_if_corrupt
+
+    db = tmp_path / "ok.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE t (a)")
+    conn.close()
+    assert set_aside_if_corrupt(db) is None and db.exists()
+    assert set_aside_if_corrupt(tmp_path / "gone.db") is None

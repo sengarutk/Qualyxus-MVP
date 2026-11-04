@@ -1412,3 +1412,27 @@ def test_busy_api_port_does_not_stop_inspection(monkeypatch):
 
     monkeypatch.setattr(uvicorn.Server, "serve", cannot_bind)
     asyncio.run(PulseServer().run_async())       # returns instead of ending the process
+
+
+def test_vibration_overload_cannot_touch_waiting_verdicts(tmp_path):
+    from src.camera.camera_manager import CameraManager
+    from src.inference.analysis.vibration_engine import VibrationAnalyzer
+
+    cm, _ = _heartbeat_manager(tmp_path)
+    cm.plc_executor.shutdown()
+    cm.alert_queue = queue.Queue(maxsize=1)
+    analyzer = VibrationAnalyzer.__new__(VibrationAnalyzer)
+    analyzer._fast_queue = cm.alert_queue
+    cm.fast_queue.put_nowait({"type": "PART_VERDICT", "flag": 3})
+    for _ in range(5):                                     # alert storm against a full queue
+        analyzer._emit_vibration_critical_fast(dominant_freq=1.0, psd_peak=1.0, rms=1.0, peaks=[])
+    assert cm.alert_queue.qsize() == 1 and cm.fast_queue.qsize() == 1
+    assert CameraManager._next_reflex_signal(cm)["type"] == "PART_VERDICT"
+    assert CameraManager._next_reflex_signal(cm)["type"] == "VIBRATION_CRITICAL"
+    assert CameraManager._next_reflex_signal(cm) is None
+
+
+def test_no_runtime_path_can_command_the_machine():
+    """Advisory only: nothing here may publish a speed or setpoint command."""
+    offenders = [str(p) for p in Path("src").rglob("*.py") if "THROTTLE_SPEED" in p.read_text(encoding="utf-8")]
+    assert offenders == []

@@ -3,12 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from src.config.config import Config
-from src.operations.action_verifier import ActionVerifier
-from src.operations.action_tracker import ActionTracker
 
 
 @dataclass
@@ -262,111 +258,6 @@ def _action_record(action_type: str, score: float, s: SignalSnapshot) -> dict[st
 
 def _rank(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(records, key=lambda r: float(r.get("severity_score", 0.0)), reverse=True)
-
-
-def _window_confidence(window_payload: dict[str, Any]) -> float:
-    confidence = window_payload.get("confidence", {}) or {}
-    return float(confidence.get("overall_confidence", 0.0) or 0.0)
-
-
-def _window_severity(window_payload: dict[str, Any]) -> str:
-    for key in ("severity", "severity_label", "alert_level"):
-        value = window_payload.get(key)
-        if value is not None:
-            return str(value).upper()
-
-    anomalies = window_payload.get("anomalies", {}) or {}
-    spikes = anomalies.get("spikes", []) or []
-    threshold = float(anomalies.get("zscore_threshold", 2.0) or 2.0)
-    max_z = max([float(s.get("zscore", 0.0) or 0.0) for s in spikes], default=0.0)
-    return "CRITICAL" if max_z >= (threshold * 1.5) else "NORMAL"
-
-
-def _config_actions_db(config: Config | None = None) -> str:
-    cfg = config or Config.load()
-    events_db = str(cfg.get("logging", "sqlite_path", default="data/events/events.db"))
-    return str(Path(events_db).parent / "actions.db")
-
-
-def evaluate_agentic_response(
-    rca_payload: dict[str, Any],
-    *,
-    uns_client: Any | None = None,
-    config: Config | None = None,
-    action_tracker: ActionTracker | None = None,
-    action_verifier: ActionVerifier | None = None,
-    camera_id: str = "ipcam_1",
-) -> dict[str, Any] | None:
-    """Evaluate RCA payload and dispatch a non-blocking throttle signal when required."""
-    windows = _extract_windows(rca_payload)
-    if not windows:
-        return None
-
-    tracker = action_tracker or ActionTracker(sqlite_path=_config_actions_db(config))
-
-    for window_name, payload in windows:
-        overall_confidence = _window_confidence(payload)
-        severity = _window_severity(payload)
-        if overall_confidence <= 0.8 or severity != "CRITICAL":
-            continue
-
-        rca_reference = f"rca:{window_name}:{payload.get('window_end', datetime.now(timezone.utc).isoformat())}"
-        dispatch_payload = {
-            "title": "THROTTLE_SPEED",
-            "action_type": "agentic_control",
-            "command": "THROTTLE_SPEED",
-            "metric_name": "speed",
-            "target_value": 0.8,
-            "severity": severity,
-            "window": window_name,
-            "overall_confidence": round(overall_confidence, 4),
-            "target_system": "line_control",
-            "reason": "overall_confidence > 0.8 and severity == CRITICAL",
-            "evidence_summary": {
-                "window_end": payload.get("window_end"),
-                "event_count": payload.get("event_count", 0),
-            },
-        }
-        tracked = tracker.issue_action(
-            rca_reference=rca_reference,
-            assigned_role="production",
-            action_payload=dispatch_payload,
-            verification_status="PENDING",
-            target_value=float(dispatch_payload["target_value"]),
-            changed_by="system:agentic_gateway",
-        )
-
-        result = {
-            "action_id": tracked["action_id"],
-            "rca_reference": rca_reference,
-            "signal_type": "THROTTLE_SPEED",
-            "payload": dispatch_payload,
-        }
-
-        if uns_client is not None:
-            try:
-                uns_client.publish_signal("THROTTLE_SPEED", result)
-            except Exception:
-                # Monitor pattern: never allow MQTT failures to affect upstream runtime.
-                pass
-        if action_verifier is not None:
-            try:
-                telemetry = getattr(action_verifier, "telemetry", None)
-                if telemetry is not None and hasattr(telemetry, "register_command_target"):
-                    telemetry.register_command_target(camera_id, "speed", float(dispatch_payload["target_value"]), duration_seconds=4.0)
-                action_verifier.watch_for_change(
-                    tracked["action_id"],
-                    camera_id=camera_id,
-                    metric_name="speed",
-                    target_value=float(dispatch_payload["target_value"]),
-                    tolerance=0.1,
-                    timeout=15.0,
-                )
-            except Exception:
-                pass
-        return result
-
-    return None
 
 
 def build_actions(

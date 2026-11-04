@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
 
 concurrency:
@@ -44,4 +44,4 @@ jobs:
         run: python -m compileall -q src scripts main.py
 
       - name: Tests
-        run: python -m pytest tests -q --durations=15
+        run: python -m pytest -q --durations=15

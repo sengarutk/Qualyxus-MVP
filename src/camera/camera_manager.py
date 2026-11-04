@@ -253,7 +253,9 @@ class CameraManager:
 
         self.shutdown_event = threading.Event()
         self._stopped = False
-        self.fast_queue: queue.Queue = queue.Queue(maxsize=20)
+        # Part verdicts have their own lane: machine alerts can never crowd them out.
+        self.fast_queue: queue.Queue = queue.Queue(maxsize=256)
+        self.alert_queue: queue.Queue = queue.Queue(maxsize=20)
         self.workers: dict[str, CameraWorkerState] = {}
 
         telemetry_cfg = self.raw_config.get("telemetry", {}) or {}
@@ -677,7 +679,7 @@ class CameraManager:
             self.vibration_analyzers[camera_id] = VibrationAnalyzer(
                 buffer_size=512,
                 kap_db_path=self._kap_db_path,
-                fast_queue=self.fast_queue,
+                fast_queue=self.alert_queue,
                 camera_id=camera_id,
                 pixel_to_mm_scale=self.vibration_scale or 1.0,
                 calibrated=self.vibration_scale is not None,
@@ -1688,7 +1690,7 @@ class CameraManager:
 
                 if violation:
                     try:
-                        self.fast_queue.put_nowait({
+                        self.alert_queue.put_nowait({
                             "type": "GEOMETRIC_CRITICAL",
                             "camera_id": state.camera_id,
                             "timestamp": now,
@@ -1710,6 +1712,17 @@ class CameraManager:
     # Reflex + supervision
     # ------------------------------------------------------------------
 
+    def _next_reflex_signal(self) -> dict[str, Any] | None:
+        """Verdicts first; a machine alert waits at most one short poll."""
+        try:
+            return self.fast_queue.get(timeout=0.05)
+        except queue.Empty:
+            pass
+        try:
+            return self.alert_queue.get_nowait()
+        except queue.Empty:
+            return None
+
     def _reflex_worker(self):
         adapter = getattr(self.telemetry, "adapter", None)
         while not self.shutdown_event.is_set():
@@ -1717,9 +1730,8 @@ class CameraManager:
                 self._reflex_tick(adapter)
             except Exception as e:   # this thread carries every verdict: it must outlive any one error
                 logger.error("[Reflex] Tick failed: %s", e, exc_info=True)
-            try:
-                signal_data = self.fast_queue.get(timeout=0.25)
-            except queue.Empty:
+            signal_data = self._next_reflex_signal()
+            if signal_data is None:
                 continue
             try:
                 if adapter is not None:

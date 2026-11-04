@@ -286,8 +286,8 @@ class EventLogger:
         if not event.audit_hash:
             try:
                 event.audit_hash = self._generate_audit_hash(event)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("[EventLogger] Event saved without an audit hash: %s", e)
                 
         if not event.iso_clause:
             try:
@@ -655,8 +655,8 @@ class EventLogger:
                         try:
                             temp_ev = DefectEvent(**{k: v for k, v in item.items() if k != "frame_data"})
                             item["audit_hash"] = self._generate_audit_hash(temp_ev)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.error("[EventLogger] Event saved without an audit hash: %s", e)
                     if not item.get("iso_clause"):
                         try:
                             temp_ev = DefectEvent(**{k: v for k, v in item.items() if k != "frame_data"})

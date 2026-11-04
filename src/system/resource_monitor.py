@@ -170,8 +170,8 @@ class ResourceGovernor:
                         cb = self._emergency_callback
                         if cb is not None:
                             cb(vitals)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        LOGGER.error("[ResourceMonitor] Emergency callback failed: %s", e)
                 return self._last_state
 
             if critical_hit:

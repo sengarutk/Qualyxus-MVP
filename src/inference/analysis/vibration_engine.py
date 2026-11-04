@@ -754,11 +754,4 @@ class VibrationAnalyzer:
         try:
             self._fast_queue.put_nowait(payload)
         except queue.Full:
-            # Defect-storm protection: atomic clear + re-insert latest
-            with self._fast_queue.mutex:
-                self._fast_queue.queue.clear()
-            try:
-                self._fast_queue.put_nowait(payload)
-            except Exception:
-                pass
-            logger.warning("[VibrationEngine] REFLEX_OVERLOAD: queue cleared for VIBRATION_CRITICAL.")
+            logger.warning("[VibrationEngine] REFLEX_OVERLOAD: alert queue full, VIBRATION_CRITICAL dropped.")

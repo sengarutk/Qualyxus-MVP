@@ -31,7 +31,13 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY main.py /app/main.py
 COPY src /app/src
 COPY scripts /app/scripts
-COPY config.yaml /app/config.yaml
+COPY config.yaml config.360.yaml /app/
+
+# Run without root. Bind-mounted data/, models/ and secrets/ must be writable by uid 1000.
+RUN useradd --uid 1000 --create-home qualyxus \
+  && mkdir -p /app/data /app/models /app/secrets \
+  && chown -R qualyxus /app
+USER qualyxus
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD python -m src.healthcheck || exit 1
