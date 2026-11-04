@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import cv2
-import joblib
 import numpy as np
 import torch
+
+from src.inference import signed_model
 
 logger = logging.getLogger("QualyxusDefectTyping")
 UNKNOWN = "unknown"
@@ -108,13 +109,13 @@ class DefectTypeClassifier:
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"backbone": self.backbone, "image_size": self.image_size, "min_probability": self.min_probability,
-                     "classes": self.classes, "clf": self._clf, "bank": self._bank,
-                     "novelty_radius": self.novelty_radius}, path)
+        signed_model.save({"backbone": self.backbone, "image_size": self.image_size,
+                           "min_probability": self.min_probability, "classes": self.classes, "clf": self._clf,
+                           "bank": self._bank, "novelty_radius": self.novelty_radius}, path)
 
     @classmethod
     def load(cls, path: str | Path) -> "DefectTypeClassifier":
-        d = joblib.load(path)
+        d = signed_model.load(path)
         obj = cls(backbone=d["backbone"], image_size=d["image_size"], min_probability=d["min_probability"],
                   classes=list(d["classes"]))
         obj._clf, obj._bank, obj.novelty_radius = d["clf"], d["bank"], d["novelty_radius"]

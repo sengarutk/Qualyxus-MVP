@@ -24,9 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-import joblib
 import numpy as np
 
+from src.inference import signed_model
 from src.process.models import RiskAssessment
 
 logger = logging.getLogger("QualyxusRiskModel")
@@ -260,12 +260,12 @@ class DefectRiskModel:
     def save(self, directory: str | Path) -> str:
         path = Path(directory) / f"risk_{self.version}.joblib"
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(self, path)
+        signed_model.save(self, path)
         return str(path)
 
     @staticmethod
     def load(path: str | Path) -> "DefectRiskModel":
-        model = joblib.load(path)
+        model = signed_model.load(path)
         if not isinstance(model, DefectRiskModel):
             raise TypeError(f"{path} does not contain a DefectRiskModel")
         return model

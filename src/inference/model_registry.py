@@ -116,6 +116,8 @@ class VisionModelRegistry:
                     side = src.with_suffix(suffix)
                     if side.exists() and side != src:
                         shutil.copy2(side, target / side.name)
+                if Path(f"{src}.sig").exists():    # a signed model must stay loadable from the registry
+                    shutil.copy2(f"{src}.sig", target / f"{src.name}.sig")
             card = {}
             for name in ("model_card.json",):
                 p = target / entry / name

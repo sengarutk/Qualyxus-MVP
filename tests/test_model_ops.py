@@ -1436,3 +1436,49 @@ def test_no_runtime_path_can_command_the_machine():
     """Advisory only: nothing here may publish a speed or setpoint command."""
     offenders = [str(p) for p in Path("src").rglob("*.py") if "THROTTLE_SPEED" in p.read_text(encoding="utf-8")]
     assert offenders == []
+
+
+def _exploding_pickle(path):
+    """A file that runs code when unpickled, as a swapped model could."""
+    import os
+    import pickle
+
+    class Payload:
+        def __reduce__(self):
+            return os.mkdir, (str(path) + ".was_executed",)
+
+    path.write_bytes(pickle.dumps(Payload()))
+
+
+def test_swapped_model_file_is_refused_before_it_can_run(tmp_path):
+    from src.inference import signed_model
+
+    path = tmp_path / "risk.joblib"
+    signed_model.save({"ok": 1}, path)
+    assert signed_model.load(path) == {"ok": 1}
+    _exploding_pickle(path)
+    with pytest.raises(ValueError, match="does not match"):
+        signed_model.load(path)
+    assert not Path(f"{path}.was_executed").exists()
+
+
+def test_unsigned_model_is_refused_until_someone_signs_it(tmp_path):
+    from src.inference import signed_model
+
+    path = tmp_path / "risk.joblib"
+    _exploding_pickle(path)
+    with pytest.raises(ValueError, match="no signature"):
+        signed_model.load(path)
+    assert not Path(f"{path}.was_executed").exists()
+
+
+def test_signed_typing_model_survives_registration(tmp_path):
+    from src.inference import signed_model
+    from src.inference.model_registry import VisionModelRegistry
+
+    model = tmp_path / "typer.joblib"
+    signed_model.save({"ok": 1}, model)
+    registry = VisionModelRegistry(tmp_path / "reg")
+    version = registry.register("r", "typing", model)
+    version = version if isinstance(version, str) else version["version"]
+    assert signed_model.load(registry.path_of("r", "typing", version)) == {"ok": 1}

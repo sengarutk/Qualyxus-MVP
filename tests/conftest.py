@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+os.environ["QUALYXUS_MODEL_KEY_FILE"] = str(Path(tempfile.mkdtemp()) / "model.key")
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

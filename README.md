@@ -74,6 +74,10 @@ A machine cycle whose part no camera reported also gives flag 4 (`time`-linked s
 `api.host`, and set `QUALYXUS_API_TOKEN` so the streams need a bearer token. Browser origins
 are listed in `QUALYXUS_API_CORS_ORIGINS`.
 
+**Model files.** Joblib models can run code when loaded, so each carries a keyed signature
+and an unsigned or changed file is refused. To bring one in from another box, check where it
+came from, then run `python -m src.inference.signed_model sign <file>`.
+
 **Audit trail.** Records are chained with a keyed hash, and `data/audit.anchor.json` catches
 deleted newest records, even across a restart. Keep `inspection.audit.key_file` away from the log on a real line, and
 copy the anchor off the box regularly.
