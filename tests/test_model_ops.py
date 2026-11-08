@@ -1272,8 +1272,10 @@ class _Machine:
         link = type("Link", (), {"machine_id": "m", "mode": mode, "transport_delay_s": 4.0, "tolerance_s": 2.0,
                                  "parts_per_cycle": parts_per_cycle})
         self.aligner = type("Aligner", (), {"links": {"cam": link}})
+        self.saved = []
         self.store = type("Store", (), {"cycles_between": staticmethod(
-            lambda machine, since, until: [(c, t) for c, t in cycles if since < t <= until])})
+            lambda machine, since, until: [(c, t) for c, t in cycles if since < t <= until]),
+            "save_inspection": staticmethod(self.saved.append)})
 
 
 def _unseen_after(cm, service, wall_now=100.0):
@@ -1482,3 +1484,12 @@ def test_signed_typing_model_survives_registration(tmp_path):
     version = registry.register("r", "typing", model)
     version = version if isinstance(version, str) else version["version"]
     assert signed_model.load(registry.path_of("r", "typing", version)) == {"ok": 1}
+
+
+def test_unseen_part_is_counted_on_the_dashboard_too(tmp_path):
+    cm, _ = _heartbeat_manager(tmp_path)
+    cm.plc_executor.shutdown()
+    machine = _Machine([("m-2", 60.0)], parts_per_cycle=2)
+    _unseen_after(cm, machine)
+    assert [(r.cycle_id, r.cavity, r.verdict, r.source) for r in machine.saved] == [
+        ("m-2", 0, "not_inspected", "unseen"), ("m-2", 1, "not_inspected", "unseen")]

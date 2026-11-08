@@ -261,6 +261,7 @@ class ProcessStore:
                    MAX(CASE WHEN i.source = 'vision' AND i.verdict = 'fail' THEN 1 ELSE 0 END) AS vision_fail,
                    GROUP_CONCAT(CASE WHEN i.verdict = 'fail' THEN i.defect_type END) AS defect_types
             FROM process_cycles c JOIN inspections i ON i.cycle_id = c.cycle_id
+                 AND i.verdict IN ('pass', 'fail')
                  AND (i.source = 'audit' OR i.alignment_confidence IS NULL OR i.alignment_confidence >= ?)
             GROUP BY c.cycle_id
             ORDER BY c.end_ts
@@ -302,13 +303,15 @@ class ProcessStore:
                 p["audit"] = r["verdict"]
             else:
                 prev = p["views"].get(r["camera_id"])
-                p["views"][r["camera_id"]] = "fail" if "fail" in (prev, r["verdict"]) else r["verdict"]
+                worst = [v for v in ("fail", "not_inspected", "pass") if v in (prev, r["verdict"])]
+                p["views"][r["camera_id"]] = worst[0] if worst else r["verdict"]
             if r["verdict"] == "fail" and r["defect_type"]:
                 p["defect_types"].append(r["defect_type"])
         out = []
         for p in parts.values():
             missing = [c for c in required if c not in p["views"]]
-            vision = "fail" if "fail" in p["views"].values() else "pass"
+            seen = set(p["views"].values())
+            vision = "fail" if "fail" in seen else ("not_inspected" if "not_inspected" in seen else "pass")
             verdict = p["audit"] or vision
             if verdict == "pass" and missing and p["audit"] is None:
                 verdict = "incomplete"

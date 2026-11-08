@@ -421,3 +421,32 @@ def test_sensor_dropouts_do_not_blind_the_golden_reference():
         cycle.curves = {name: np.full_like(values, np.nan) for name, values in cycle.curves.items()}
     golden = GoldenCycleReference.fit(cycles, min_cycles=5)
     assert golden.curves and all(np.isfinite(curve).all() for curve in golden.curves.values())
+
+
+def test_part_nobody_could_judge_is_stored_but_never_a_training_label(tmp_path):
+    from src.process.models import NOT_INSPECTED
+    from src.process.service import ProcessIntelligenceService
+
+    service = ProcessIntelligenceService({"db_path": str(tmp_path / "p.db"), "models_dir": str(tmp_path / "m"),
+                                          "model": {"golden_warmup_cycles": 100}},
+                                         cameras_cfg=[{"id": "cam", "process_link": {"machine_id": "imm_1",
+                                                       "mode": "time", "transport_delay_s": 3.0, "tolerance_s": 2.0}}])
+    sim = InjectionMoldingSimulator(seed=2, start_ts=1_000_000.0)
+    cycles = [sim.next_cycle()[0] for _ in range(3)]
+    for cycle in cycles:
+        service.on_cycle(cycle)
+    service.record_inspection("cam", cycles[0].end_ts + 3.0, NOT_INSPECTED)   # camera fault: used to raise
+    service.record_inspection("cam", cycles[1].end_ts + 3.0, PASS)
+    labelled = {r["cycle_id"] for r in service.store.labelled_dataset()}
+    assert labelled == {cycles[1].cycle_id}
+    verdicts = {p["cycle_id"]: p["verdict"] for p in service.store.part_verdicts(0, 2e9)}
+    assert verdicts[cycles[0].cycle_id] == "not_inspected" and verdicts[cycles[1].cycle_id] == "pass"
+
+
+def test_a_failed_view_still_beats_a_view_that_could_not_judge(tmp_path):
+    from src.process.models import NOT_INSPECTED
+
+    store = ProcessStore(tmp_path / "p.db")
+    for camera, verdict in (("top", NOT_INSPECTED), ("side", FAIL), ("front", PASS)):
+        store.save_inspection(InspectionRecord("", camera, 10.0, verdict, cycle_id="m-1"))
+    assert store.part_verdicts(0, 100)[0]["verdict"] == "fail"

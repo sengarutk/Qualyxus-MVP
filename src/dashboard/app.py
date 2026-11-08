@@ -280,8 +280,9 @@ def _render_vision_section(cfg, status_path: str) -> None:
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Parts judged (8h)", parts.get("total", 0), help=f"{parts.get('multi_view', 0)} seen by several cameras")
     c2.metric("Failed parts", parts.get("fail", 0))
-    c3.metric("Incomplete (missing view)", parts.get("incomplete", 0),
-              help="Passed parts not yet seen by every camera marked required_view: true")
+    c3.metric("Not fully inspected", parts.get("not_inspected", 0) + parts.get("incomplete", 0),
+              help=f"{parts.get('not_inspected', 0)} could not be judged (camera fault, no model, or no camera "
+                   f"saw the part); {parts.get('incomplete', 0)} passed but missed a required view")
     agreement = review.get("model_agreement")
     agreement_text = "n/a" if agreement is None else f"{100 * agreement:.1f}%"
     c4.metric("Review queue", review.get("pending", 0),

@@ -22,6 +22,7 @@ try:
 except ImportError:
     _psutil = None
 
+from src.process.models import NOT_INSPECTED, InspectionRecord
 from src.camera.part_inspection import CompletedPart, PartPresenceTracker, PartVerdictFuser, part_pose
 from src.inference.anomaly.image_quality import image_fault
 from src.inference.inspection_stack import PartJudgement
@@ -1537,7 +1538,16 @@ class CameraManager:
             for cycle_id, _end_ts in service.store.cycles_between(machine_id, since, until):
                 keys += ([f"{cycle_id}#{i}" for i in range(link.parts_per_cycle)]
                          if link.parts_per_cycle > 1 else [cycle_id])
-            verdicts += self.part_fuser.unseen(keys)
+            unseen = self.part_fuser.unseen(keys)
+            for verdict in unseen:   # so the dashboard counts them, not only the PLC and audit trail
+                cycle_id, _, cavity = verdict["cycle_id"].partition("#")
+                try:
+                    service.store.save_inspection(InspectionRecord(
+                        inspection_id="", camera_id="unseen", ts=wall_now, verdict=NOT_INSPECTED,
+                        cycle_id=cycle_id, source="unseen", cavity=int(cavity or 0)))
+                except Exception as e:
+                    logger.error("[Inspection] Could not record unseen part %s: %s", verdict["cycle_id"], e)
+            verdicts += unseen
         return verdicts
 
     def _reflex_tick(self, adapter) -> None:

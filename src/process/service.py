@@ -25,7 +25,7 @@ from typing import Any, Callable
 from src.process.alignment import AlignmentResult, CycleAligner, StationLink
 from src.process.features import CycleFeatureExtractor, GoldenCycleReference
 from src.process.kpis import compute_kpis
-from src.process.models import FAIL, PASS, InspectionRecord, ProcessCycle, RiskAssessment
+from src.process.models import FAIL, InspectionRecord, NOT_INSPECTED, PASS, ProcessCycle, RiskAssessment
 from src.process.prescriptions import Prescription, PrescriptionEngine
 from src.process.risk_model import (
     DefectRiskModel,
@@ -297,8 +297,8 @@ class ProcessIntelligenceService:
         alignment: AlignmentResult | None = None,
         position: tuple[float, float, float] | None = None,
     ) -> InspectionRecord:
-        if verdict not in (PASS, FAIL):
-            raise ValueError(f"verdict must be '{PASS}' or '{FAIL}', got {verdict!r}")
+        if verdict not in (PASS, FAIL, NOT_INSPECTED):
+            raise ValueError(f"verdict must be '{PASS}', '{FAIL}' or '{NOT_INSPECTED}', got {verdict!r}")
         if alignment is None:
             alignment = self.aligner.align(camera_id, ts, part_id=part_id)
         record = self.store.save_inspection(InspectionRecord(
@@ -317,7 +317,7 @@ class ProcessIntelligenceService:
             pos_angle=position[2] if position else None,
             cavity=alignment.cavity,
         ))
-        if alignment.cycle_id:
+        if alignment.cycle_id and verdict != NOT_INSPECTED:   # an unjudged part teaches nothing
             with self._lock:
                 self._labels_since_train += 1
                 features = self._regime_pending.pop(alignment.cycle_id, None)

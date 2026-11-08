@@ -15,6 +15,7 @@ import numpy as np
 
 PASS = "pass"
 FAIL = "fail"
+NOT_INSPECTED = "not_inspected"   # nobody could judge this part: never a pass, never a training label
 
 
 @dataclass
