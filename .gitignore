@@ -35,3 +35,10 @@ __pycache__/
 # Local environment secrets
 .env
 /secrets/
+
+# Outdated pitch material: kept on this computer only. Older decks state projections as facts.
+/QUALYXUS_Pitch deck.pdf
+/QUALYXUS_Pitch_deck_v2.*
+/QUALYXUS_Pitch_deck_8min.*
+/QUALYXUS_Pitch_Deck_1517.*
+/old_decks/

@@ -1,0 +1,43 @@
+{
+  "run_metadata": {
+    "run_timestamp": "2026-10-20T00:20:03.591187",
+    "hostname": "LAPTOP-JPJH7SR6",
+    "git_commit": "85ccc68"
+  },
+  "summary": {
+    "total_scenarios": 4,
+    "passed": 4,
+    "failed": 0,
+    "avg_execution_time_seconds": 8.0
+  },
+  "results": [
+    {
+      "scenario": "camera_drop",
+      "failure_type": "camera_disconnect",
+      "outcome": "pass",
+      "execution_time_seconds": 10.91,
+      "recovered_cleanly": true
+    },
+    {
+      "scenario": "db_lock",
+      "failure_type": "database_lock",
+      "outcome": "pass",
+      "execution_time_seconds": 6.53,
+      "recovered_cleanly": true
+    },
+    {
+      "scenario": "disk_full",
+      "failure_type": "disk_exhaustion",
+      "outcome": "pass",
+      "execution_time_seconds": 4.02,
+      "recovered_cleanly": true
+    },
+    {
+      "scenario": "network_delay",
+      "failure_type": "network_latency",
+      "outcome": "pass",
+      "execution_time_seconds": 10.56,
+      "recovered_cleanly": true
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "config": {
+    "learn": 2500,
+    "evaluate": 2500,
+    "seed": 11,
+    "vision": "patchcore",
+    "transport_delay": 4.0,
+    "jitter": 0.3,
+    "operator_delay": 5,
+    "retrain_every": 500,
+    "out": "reports/closed_loop_report.json",
+    "keep_workdir": false
+  },
+  "vision": {
+    "precision": 0.97539,
+    "recall": 1.0,
+    "false_reject_rate": 0.00241
+  },
+  "alignment_accuracy": 1.0,
+  "risk_model": {
+    "active": "supervised",
+    "validation": {
+      "n": 1125,
+      "base_rate": 0.00889,
+      "precision": 0.11111,
+      "recall": 0.1,
+      "brier": 0.01398,
+      "roc_auc": 0.78744,
+      "average_precision": 0.03965
+    },
+    "evaluation_phase_auc_vs_ground_truth": 0.8034,
+    "median_warning_cycles": 0.0,
+    "defect_episodes_with_warning": "16/60"
+  },
+  "scrap": {
+    "learning_phase_rate": 0.1468,
+    "evaluation_baseline_rate": 0.1336,
+    "evaluation_closed_loop_rate": 0.0276,
+    "relative_reduction": 0.7934,
+    "defect_mix": {
+      "controlled": {
+        "none": 2431,
+        "burn_mark": 14,
+        "sink_mark": 39,
+        "flash": 2,
+        "short_shot": 14
+      },
+      "baseline": {
+        "none": 2166,
+        "burn_mark": 110,
+        "short_shot": 60,
+        "sink_mark": 162,
+        "flash": 2
+      }
+    }
+  },
+  "throughput": {
+    "baseline_cycle_time_s": 18.4,
+    "closed_loop_cycle_time_s": 18.561,
+    "baseline_good_parts_per_hour": 169.51,
+    "closed_loop_good_parts_per_hour": 188.6
+  },
+  "prescriptions": {
+    "issued": 15,
+    "applied": {
+      "injection_speed_sp": 2,
+      "hold_pressure_sp": 1,
+      "melt_temp_sp": 1,
+      "mold_temp_sp": 1
+    }
+  },
+  "retrains": [
+    {
+      "labelled": 2500,
+      "positives": 373,
+      "incumbent_auc_same_window": 0.6274386173132558,
+      "promoted": true,
+      "active_version": "supervised-20261020000453-970b85"
+    },
+    {
+      "labelled": 3000,
+      "positives": 392,
+      "incumbent_auc_same_window": 0.9483215637077355,
+      "promoted": false,
+      "active_version": "supervised-20261020000453-970b85"
+    },
+    {
+      "labelled": 3500,
+      "positives": 421,
+      "incumbent_auc_same_window": 0.7037199508685735,
+      "promoted": false,
+      "active_version": "supervised-20261020000453-970b85"
+    },
+    {
+      "labelled": 4000,
+      "positives": 424,
+      "incumbent_auc_same_window": 0.8259943181818181,
+      "promoted": true,
+      "active_version": "supervised-20261020000603-79ed6b"
+    },
+    {
+      "labelled": 4500,
+      "positives": 431,
+      "incumbent_auc_same_window": 0.5799103139013453,
+      "promoted": true,
+      "active_version": "supervised-20261020000627-0976e7"
+    }
+  ],
+  "runtime_s": 204.6
+}
