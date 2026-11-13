@@ -115,7 +115,7 @@ Qualyxus: AI that catches bad parts on the factory floor and tells the plant why
 |---|---|---|
 | GradCapital | **Submitted** | $1k–$5k grant; the $60k grant was declined earlier |
 | 1517 Medici | To do | Record the Loom first (4–5 minutes, face and screen) |
-| Emergent Ventures | To do | Founder writes alone, AI may only proofread. Apply at mercatus.tfaforms.net/5099527 and choose region **India**. Proposal under 1,500 words: (1) background, (2) a mainstream view you agree with, (3) the idea, (4) budget, (5) time and supporters. No PDF or PowerPoint uploads; images are fine |
+| Emergent Ventures | **Submitted** (13 Nov 2026) | Asked $35,000 in two parts: $17k core (test rig, 3 pilot stations, engineer, installs) + $18k extension (360° inspector, 6 months' living costs after graduation, engineer months 7–12). Attachment: QUALYXUS_EmergentVentures.docx; demo video in the Multimedia URL |
 | Magnificent Grants | To do | Age 25 or under, $10k+, no need to leave college. Check its AI policy first |
 | Inflection Grants (Edge City) | To do | Under 25, $2k, rolling. Check its AI policy first |
 | Bagel Fund, Narisetti Grants | Optional | Small, quick |
