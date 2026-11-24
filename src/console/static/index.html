@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qualyxus Console</title>
+<link rel="stylesheet" href="/static/console.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="mark" aria-hidden="true"></span><b>QUALYXUS</b><span id="where" class="muted"></span></div>
+  <nav id="nav" role="tablist" aria-label="Views"></nav>
+  <div class="top-right">
+    <span id="sim" class="chip"></span>
+    <span id="link" class="chip"></span>
+    <time id="clock"></time>
+    <button id="theme" class="icon" aria-label="Switch light or dark theme" title="Theme">◐</button>
+  </div>
+</header>
+<main id="view" tabindex="-1"></main>
+<div id="tip" role="status"></div>
+<script src="/static/console.js"></script>
+</body>
+</html>

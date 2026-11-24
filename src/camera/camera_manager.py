@@ -22,6 +22,7 @@ try:
 except ImportError:
     _psutil = None
 
+from src.camera.view_store import ViewStore
 from src.process.models import NOT_INSPECTED, InspectionRecord
 from src.camera.part_inspection import CompletedPart, PartPresenceTracker, PartVerdictFuser, part_pose
 from src.inference.anomaly.image_quality import image_fault
@@ -36,6 +37,7 @@ from src.logging.schema import DefectEvent, SystemState
 from src.system.disk_monitor import DiskMonitor
 from src.system.resource_monitor import ResourceGovernor
 from src.system.runtime_metrics import RuntimeMetricsLogger
+from src.system.station_clock import station_time
 from src.system.watchdog import WatchdogManager
 from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED, PLC_PASS
 from src.telemetry.telemetry_provider import TelemetryProvider
@@ -397,6 +399,10 @@ class CameraManager:
         self._delivery_fault_until = 0.0
         self._heartbeat_write = None
         self._hold_reason: str | None = None
+        self._last_verdict: dict[str, Any] | None = None
+        views_cfg = (self.raw_config.get("inspection") or {}).get("view_store") or {}
+        self.view_store = (ViewStore(views_cfg.get("dir", "data/live/parts"), int(views_cfg.get("keep_parts", 200)))
+                           if views_cfg.get("enabled", True) else None)
         self.frame_detector_missing = bool(getattr(self.multiplexer, "load_failed", False))
         inspect_cfg = self.raw_config.get("inspection") or {}
         self.max_inspect_s = float(inspect_cfg.get("max_inspect_s", 10.0))
@@ -926,7 +932,7 @@ class CameraManager:
                     slot = state.pool[state.pool_write_index % _POOL_SLOTS]
                     part_feed = self._part_feeds.get(state.camera_id)
                     if part_feed is not None:
-                        rendered, _ = part_feed.render(time.time(), width, height)
+                        rendered, _ = part_feed.render(station_time(), width, height)
                         np.copyto(slot.frame, rendered)
                         frame = slot.frame
                         state.pool_write_index += 1
@@ -1276,7 +1282,7 @@ class CameraManager:
                 state.camera_id, on_frames=self._presence_on_frames, off_frames=self._presence_off_frames,
             ))
         present = is_part_present(frame, self.presence_std_threshold)
-        completed = tracker.update(frame, present, time.time(), frame_id, event_ids, defect_types)
+        completed = tracker.update(frame, present, station_time(), frame_id, event_ids, defect_types)
         state.last_infer_ts = time.perf_counter()   # this frame made it through the part pipeline
         if completed is not None:
             if not self._inspection_slots.acquire(blocking=False):
@@ -1359,6 +1365,7 @@ class CameraManager:
                     else PLC_FLAG_NOT_INSPECTED if not_inspected else PLC_PASS)
             reported = True    # anything failing from here on must not change this view's result
             self._report_view(state, part_key, flag)
+            self._save_view(state.camera_id, part_key, frame, stack, anomaly)
             if not_inspected:
                 if not state.not_inspected_logged:
                     state.not_inspected_logged = True
@@ -1420,6 +1427,8 @@ class CameraManager:
 
             if not_inspected:
                 state.parts_not_inspected += 1
+                if service is not None:
+                    service.record_inspection(state.camera_id, part.ts, NOT_INSPECTED, alignment=alignment)
                 return
             if service is not None:
                 service.record_inspection(
@@ -1439,6 +1448,17 @@ class CameraManager:
                 state.parts_not_inspected += 1
                 self._view_faults[state.camera_id] = True
                 self._report_view(state, part_key, PLC_FLAG_NOT_INSPECTED)
+
+    def _save_view(self, camera_id: str, part_key: str | None, frame: np.ndarray, stack, anomaly) -> None:
+        store = getattr(self, "view_store", None)
+        if store is None or part_key is None:
+            return
+        try:
+            heat = (stack.anomaly.heatmap_overlay(frame, anomaly, stack.anomaly.threshold)
+                    if anomaly is not None and anomaly.is_anomalous else None)
+            store.save(part_key, camera_id, frame, heat)
+        except Exception as e:
+            logger.warning("[%s] View of part %s not stored: %s", camera_id, part_key, e)
 
     @staticmethod
     def _part_severity(anomaly, top, confidence: float | None) -> int:
@@ -1462,6 +1482,7 @@ class CameraManager:
         signal = {**verdict, "type": "PART_VERDICT", "part": part & 0xFFFF, "timestamp": time.time()}
         if verdict["verdict"] != "pass" and verdict["missing"]:
             logger.warning("[Inspection] Part %s %s: no result from %s", part, verdict["verdict"], verdict["missing"])
+        self._last_verdict = {k: signal[k] for k in ("part", "cycle_id", "verdict", "flag", "timestamp")}
         # The PLC comes first: a broken log or a full disk must never cost a verdict.
         try:
             self.fast_queue.put_nowait(signal)
@@ -1553,7 +1574,7 @@ class CameraManager:
     def _reflex_tick(self, adapter) -> None:
         """Close parts nobody finished, and keep the PLC heartbeat moving."""
         now = time.monotonic()   # a clock correction must not stall the heartbeat or a part deadline
-        for verdict in self.part_fuser.expired(now) + self._unseen_parts(time.time()):
+        for verdict in self.part_fuser.expired(now) + self._unseen_parts(station_time()):
             self._publish_part_verdict(verdict)
         if adapter is None:
             return
@@ -1780,7 +1801,12 @@ class CameraManager:
 
     def _publish_runtime_status(self) -> None:
         """Export the camera status consumed by the healthcheck/dashboard and the guardian vitals."""
-        self._atomic_write_json(self.status_path, {"timestamp": time.time(), "workers": self.get_status_snapshot()})
+        adapter = getattr(self.telemetry, "adapter", None)
+        self._atomic_write_json(self.status_path, {
+            "timestamp": time.time(), "workers": self.get_status_snapshot(),
+            "plc": {"simulated": bool(getattr(adapter, "is_simulated", True)), "hold_reason": self._hold_reason,
+                    "write_failures": int(getattr(adapter, "write_failures", 0)), "last_verdict": self._last_verdict},
+        })
         try:
             state = self._current_policy_state()
             vitals = dataclasses.asdict(self.governor.get_vitals())

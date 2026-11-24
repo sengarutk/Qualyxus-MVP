@@ -82,7 +82,7 @@ class PartVerdictFuser:
         self.required = frozenset(required_views)
         self.timeout_s = float(timeout_s)
         self._open: dict[str, dict[str, Any]] = {}
-        self._closed: collections.deque[str] = collections.deque(maxlen=512)
+        self._closed: collections.OrderedDict[str, frozenset[str]] = collections.OrderedDict()
         self._seen: collections.deque[str] = collections.deque(maxlen=4096)
         self._unmatched: str | None = None
         self._unmatched_count = 0
@@ -99,7 +99,12 @@ class PartVerdictFuser:
         with self._lock:
             key = self._unmatched_group(camera_id) if cycle_id is None else cycle_id
             if key in self._closed:
-                return None  # a late view of a part that already timed out
+                if camera_id not in self._closed[key]:
+                    return None  # a late view of a part that already timed out
+                # This camera already judged that part, so this is another one with no cycle of
+                # its own (lost machine data, a repeated id). It may fail; it can never pass.
+                cycle_id = None
+                key = self._unmatched_group(camera_id)
             part = self._open.setdefault(key, {"deadline": now + self.timeout_s, "views": {},
                                                "matched": cycle_id is not None})
             part["views"][camera_id] = _worst(part["views"].get(camera_id, PLC_PASS), flag)
@@ -121,7 +126,7 @@ class PartVerdictFuser:
             for key in part_keys:
                 if key not in self._seen:
                     self._seen.append(key)
-                    self._closed.append(key)   # a very late view must not reopen it
+                    self._remember(key, frozenset())   # a very late view must not reopen it
                     out.append({"cycle_id": key, "verdict": "not_inspected", "flag": PLC_FLAG_NOT_INSPECTED,
                                 "views": {}, "missing": sorted(self.required) or ["station"]})
         return out
@@ -132,9 +137,14 @@ class PartVerdictFuser:
             late = [c for c, part in self._open.items() if part["deadline"] <= now]
             return [self._close(c) for c in late]
 
+    def _remember(self, key: str, cameras: frozenset[str]) -> None:
+        self._closed[key] = cameras
+        while len(self._closed) > 512:
+            self._closed.popitem(last=False)
+
     def _close(self, cycle_id: str) -> dict[str, Any]:
         part = self._open.pop(cycle_id)
-        self._closed.append(cycle_id)
+        self._remember(cycle_id, frozenset(part["views"]))
         missing = sorted(self.required - set(part["views"]))
         verdict, value = _verdict_of(list(part["views"].values()), part["matched"] and not missing)
         return {"cycle_id": cycle_id if part["matched"] else None, "verdict": verdict, "flag": value,

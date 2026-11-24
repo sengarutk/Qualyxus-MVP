@@ -26,6 +26,7 @@ import numpy as np
 
 from src.process.models import ProcessCycle
 from src.process.simulator import InjectionMoldingSimulator, SimulatedOutcome
+from src.system.station_clock import station_time
 
 logger = logging.getLogger("QualyxusCycleSources")
 
@@ -214,13 +215,13 @@ class SimulatedCycleSource(CycleSource):
         self._lock = threading.Lock()
 
     def _run(self) -> None:
-        next_start = time.time()
+        next_start = station_time()
         while not self._stop.is_set():
             cycle, outcome = self.simulator.next_cycle(start_ts=0.0)
             duration = cycle.duration_s / self.time_scale
             cycle.start_ts = next_start
             cycle.end_ts = next_start + duration
-            if self._stop.wait(max(0.0, cycle.end_ts - time.time())):
+            if self._stop.wait(max(0.0, cycle.end_ts - station_time())):
                 return
             with self._lock:
                 self.outcomes[cycle.cycle_id] = (cycle, outcome)
@@ -307,7 +308,7 @@ class ModbusCycleSource(CycleSource):
                 tick = time.monotonic()
                 values = {s.name: self._read(client, s) for s in self.signals + self.setpoints}
                 counter = int(self._read(client, self.counter))
-                cycle = self.assembler.feed(time.time(), values, counter)
+                cycle = self.assembler.feed(station_time(), values, counter)
                 if cycle is not None:
                     self._emit(cycle)
                 self._stop.wait(max(0.0, self.poll_interval - (time.monotonic() - tick)))
@@ -362,7 +363,7 @@ class OpcUaCycleSource(CycleSource):
                 raw = await client.read_values(nodes)
                 values = {s.name: float(v) * s.scale + s.offset for s, v in zip(specs, raw)}
                 counter = int(values.pop(self.counter.name))
-                cycle = self.assembler.feed(time.time(), values, counter)
+                cycle = self.assembler.feed(station_time(), values, counter)
                 if cycle is not None:
                     self._emit(cycle)
                 await asyncio.sleep(max(0.0, self.poll_interval - (time.monotonic() - tick)))
@@ -381,6 +382,10 @@ def build_cycle_source(process_cfg: dict[str, Any]) -> CycleSource:
             disturbance_scale=float(sim_cfg.get("disturbance_scale", 1.0)),
             line_id=line_id,
         )
+        scenario = sim_cfg.get("scenario") or {}
+        if scenario:
+            simulator.load_scenario(scenario.get("state"), scenario.get("drift_per_cycle"),
+                                    int(scenario.get("start_sequence", 0)))
         return SimulatedCycleSource(simulator, time_scale=float(sim_cfg.get("time_scale", 1.0)))
 
     conn = process_cfg.get(kind, {}) or {}
