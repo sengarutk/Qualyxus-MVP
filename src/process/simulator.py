@@ -140,7 +140,20 @@ class InjectionMoldingSimulator:
         self.lot_index = 0
         self.lot_moisture = 0.05         # % water content of the current material lot
         self.dryer_fault = 0.0           # extra moisture during dryer fault episodes
+        self.drift_per_cycle: dict[str, float] = {}   # scenario: wear added on top of the normal dynamics
         self._new_lot()
+
+    def load_scenario(self, state: dict[str, float] | None = None, drift: dict[str, float] | None = None,
+                      start_sequence: int = 0) -> None:
+        """Start from a known hidden state and wear it on purpose; the physics decides what fails."""
+        allowed = {"heater_offset", "check_ring_wear", "cooling_fouling", "lot_moisture"}
+        unknown = (set(state or {}) | set(drift or {})) - allowed
+        if unknown:
+            raise ValueError(f"Unknown simulator state: {sorted(unknown)}")
+        for name, value in (state or {}).items():
+            setattr(self, name, float(value))
+        self.drift_per_cycle = {k: float(v) for k, v in (drift or {}).items()}
+        self.sequence = int(start_sequence)
 
     # ------------------------------------------------------------------ control
 
@@ -180,6 +193,8 @@ class InjectionMoldingSimulator:
         self.cooling_fouling += float(abs(rng.normal(0.008, 0.004))) * s
         if self.cooling_fouling > 10.0 or rng.random() < 0.0008:
             self.cooling_fouling = 0.0
+        for name, step in self.drift_per_cycle.items():
+            setattr(self, name, getattr(self, name) + step)
         # Material lots and dryer faults.
         if self.sequence % 300 == 0:
             self._new_lot()

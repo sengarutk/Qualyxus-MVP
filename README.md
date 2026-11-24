@@ -70,6 +70,19 @@ Each physical part gets one verdict. On a multi-camera station a part passes onl
 A machine cycle whose part no camera reported also gives flag 4 (`time`-linked stations, see
 `inspection.expect_part_per_cycle`). A multi-cavity shot uses a running count in register 101.
 
+**Operations console.** A read-only page for the line: live views of every face, a trace from a
+rejected part to its machine cycle and the signals that moved, control charts, machine health
+and the audit trail. It needs no internet and listens on this machine only (set
+`QUALYXUS_API_TOKEN` before opening it with `--host`):
+
+```bash
+CONFIG_PATH=config.360.yaml python -m src.console       # beside a running main.py
+python scripts/console_demo.py                          # a simulated shift in its own folder
+```
+
+**Clock.** Cycles and parts share one clock that never runs backwards, so a time correction
+cannot link a part to the wrong cycle.
+
 **Telemetry API.** It listens on this machine only. To open it to the plant network, set
 `api.host`, and set `QUALYXUS_API_TOKEN` so the streams need a bearer token. Browser origins
 are listed in `QUALYXUS_API_CORS_ORIGINS`.

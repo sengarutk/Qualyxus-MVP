@@ -1493,3 +1493,74 @@ def test_unseen_part_is_counted_on_the_dashboard_too(tmp_path):
     _unseen_after(cm, machine)
     assert [(r.cycle_id, r.cavity, r.verdict, r.source) for r in machine.saved] == [
         ("m-2", 0, "not_inspected", "unseen"), ("m-2", 1, "not_inspected", "unseen")]
+
+
+def test_blurred_part_is_stored_as_not_inspected_with_its_picture(tmp_path):
+    """The inspection path itself, end to end: it used to return before saving anything."""
+    from src.camera import camera_manager as module
+    from src.camera.part_inspection import CompletedPart
+    from src.camera.view_store import ViewStore
+
+    saved = []
+
+    class Aligned:
+        cycle_id, cavity = "m-1", 0
+
+    class Aligner:
+        link_for = staticmethod(lambda camera: type("Link", (), {"parts_per_cycle": 1}))
+        align = staticmethod(lambda camera, ts: Aligned)
+
+    class Service:
+        aligner = Aligner
+        record_inspection = staticmethod(lambda camera, ts, verdict, **k: saved.append((camera, verdict)))
+
+    cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
+    cm.process_service, cm.view_store = Service, ViewStore(tmp_path / "views")
+    real = module.image_fault
+    module.image_fault = lambda f, b: "blurred"
+    try:
+        cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
+    finally:
+        module.image_fault = real
+    assert saved == [("cam", "not_inspected")] and state.parts_not_inspected == 1
+    assert (tmp_path / "views" / "m-1" / "cam.jpg").exists()
+
+
+def test_part_linked_to_a_finished_cycle_still_gets_a_verdict():
+    """Machine data for its own cycle was lost, so it linked to the part before it."""
+    from src.camera.part_inspection import PartVerdictFuser
+
+    fuser = PartVerdictFuser(["a", "b"], timeout_s=5.0)
+    assert [fuser.add("m-7", cam, 0, 1.0) for cam in "ab"][1]["verdict"] == "pass"
+    second = [fuser.add("m-7", cam, 3 if cam == "b" else 0, 20.0) for cam in "ab"][1]
+    assert second["verdict"] == "fail" and second["cycle_id"] is None
+    third = [fuser.add("m-7", cam, 0, 40.0) for cam in "ab"][1]
+    assert third["verdict"] == "not_inspected"          # nothing proves which part this was
+
+
+def test_late_view_of_a_timed_out_part_is_still_ignored():
+    from src.camera.part_inspection import PartVerdictFuser
+
+    fuser = PartVerdictFuser(["a", "b"], timeout_s=5.0)
+    fuser.add("m-1", "a", 0, 0.0)
+    assert fuser.expired(6.0)[0]["verdict"] == "not_inspected"
+    assert fuser.add("m-1", "b", 0, 7.0) is None
+
+
+def test_station_clock_never_runs_backwards_and_still_follows_real_time():
+    from src.system.station_clock import StationClock
+
+    state = {"wall": 1000.0, "mono": 0.0}
+    clock = StationClock(lambda: state["wall"], lambda: state["mono"])
+    seen = [clock.time()]
+    for step in range(1, 12001):                      # ten minutes, monotonic 2% fast
+        state["mono"] += 0.05
+        state["wall"] += 0.05
+        if step % 640 == 0:
+            state["wall"] -= 0.65                     # stepped back every 32 s, as measured
+        seen.append(clock.time())
+    steps = np.diff(seen)
+    assert steps.min() > 0 and steps.max() < 0.06
+    assert abs(seen[-1] - state["wall"]) < 0.7
+    state["wall"] += 3600                             # clock set at boot
+    assert abs(clock.time() - state["wall"]) < 1.0
