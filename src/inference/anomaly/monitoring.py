@@ -94,13 +94,21 @@ class ModelHealthMonitor:
         return status
 
 
+def _shrink(image: np.ndarray, long_side: int = 1600) -> np.ndarray:
+    scale = long_side / max(image.shape[:2])
+    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1.0 else image
+
+
 class ReviewQueue:
     """Borderline parts saved for operator review (active learning)."""
 
-    def __init__(self, directory: str | Path, *, band: tuple[float, float] = (0.8, 1.25), max_items: int = 5000):
+    def __init__(self, directory: str | Path, *, band: tuple[float, float] = (0.8, 1.25), max_items: int = 5000,
+                 max_gb: float | None = None):
         self.directory = Path(directory)
         self.band = (float(band[0]), float(band[1]))
         self.max_items = int(max_items)
+        self.max_bytes = None if max_gb is None else int(max_gb * 1e9)
+        self._full_logged: set[str] = set()
 
     def should_review(self, normalized_score: float | None) -> bool:
         return normalized_score is not None and self.band[0] <= normalized_score <= self.band[1]
@@ -111,12 +119,19 @@ class ReviewQueue:
             image_sha: str | None = None, recipe: str | None = None) -> Path | None:
         target = self.directory / camera_id
         target.mkdir(parents=True, exist_ok=True)
-        if len(list(target.glob("*.json"))) >= self.max_items:
+        files = list(target.iterdir())
+        # Nothing waiting for a person is thrown away to make room: the queue says it is full.
+        if (sum(f.suffix == ".json" for f in files) >= self.max_items
+                or self.max_bytes is not None and sum(f.stat().st_size for f in files) >= self.max_bytes):
+            if camera_id not in self._full_logged:
+                self._full_logged.add(camera_id)
+                logger.error("[Review] The review queue of %s is full: label or remove parts in %s.", camera_id, target)
             return None
+        self._full_logged.discard(camera_id)
         item_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        cv2.imwrite(str(target / f"{item_id}.png"), image)
+        cv2.imwrite(str(target / f"{item_id}.png"), image, [cv2.IMWRITE_PNG_COMPRESSION, 1])
         if overlay is not None:
-            cv2.imwrite(str(target / f"{item_id}_overlay.png"), overlay)
+            cv2.imwrite(str(target / f"{item_id}_overlay.jpg"), _shrink(overlay))
         meta = {"id": item_id, "camera_id": camera_id, "ts": time.time(), "normalized_score": normalized_score,
                 "model_verdict": verdict, "cycle_id": cycle_id, "event_id": event_id,
                 "bbox": list(bbox) if bbox else None, "predicted_type": predicted_type,

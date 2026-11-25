@@ -44,6 +44,8 @@ training:
 logging:
   sqlite_path: "data/events/events.db"
   csv_path: "data/events/events.csv"
+  retention_days: 730          # defect events
+  tracking_retention_days: 30  # per-frame tracking and geometry rows
 
 mqtt:
   agentic_enabled: false
@@ -183,6 +185,8 @@ camera:
 process:
   # Raw curves are dropped after this many days; per-cycle features are kept. 0 keeps them forever.
   curve_retention_days: 30
+  # Cycles and inspections older than this are deleted (0 keeps them). Baseline cycles always stay.
+  retention_days: 730
   enabled: true
   # simulated (development) | modbus | opcua
   source: "simulated"
@@ -235,6 +239,11 @@ process:
   # opcua:
   #   endpoint: "opc.tcp://10.0.0.50:4840"
   #   poll_hz: 20
+  #   security_policy: "Basic256Sha256"     # with certificate and private_key files
+  #   certificate: "secrets/opcua_cert.der"
+  #   private_key: "secrets/opcua_key.pem"
+  #   username: "qualyxus"
+  #   password_env: "QUALYXUS_OPCUA_PASSWORD"
   #   cycle_counter: {node_id: "ns=2;s=Machine.ShotCounter"}
   #   signals:
   #     injection_pressure: {node_id: "ns=2;s=Machine.InjectionPressure"}
@@ -304,6 +313,7 @@ inspection:
     # ones go to the review queue and must be labelled before retraining.
     calibration_every_n: 20
     calibration_max_items: 2000
+    max_gb: 5.0              # per recipe, whatever the image size
   # Borderline parts (normalized score in band) are saved for operator review. Label them in
   # Label Studio / CVAT via src.inference.labeling (export -> import), then ingest the reviewed
   # items with src.inference.anomaly.monitoring.ingest_reviews (audits + typing crops).
@@ -311,9 +321,20 @@ inspection:
     enabled: true
     dir: "data/review"
     band: [0.8, 1.25]
+    max_gb: 5.0              # per camera
   # A part is not_inspected if a required_view has not reported this long after the first one.
   view_timeout_s: 5.0
-  presence_std_threshold: 2.2
+  # A part is whatever stands out from the light on the empty station. Give a camera a reference
+  # (python -m src.camera.presence learn ...) when the background has a pattern or the part
+  # reaches the edge of the frame. Per camera: presence: {reference: data/templates/empty_top.png}
+  presence:
+    min_contrast: 4.0        # grey levels
+    min_area: 0.004          # share of the frame
+  # Let the PLC say when a part is in position (it adds 1 to the trigger register).
+  trigger:
+    enabled: false
+    frames: 3
+    delay_s: 0.05
   on_frames: 2
   off_frames: 2
 

@@ -53,6 +53,7 @@ def main(argv=None) -> dict[str, Any]:
     src.add_argument("--synthetic", type=int, help="Render N unseen simulated good parts")
     parser.add_argument("--views", type=int, required=True, help="Cameras that judge each part")
     parser.add_argument("--part-frr", type=float, default=0.01, help="Target false rejects per part")
+    parser.add_argument("--face", type=int, default=0, choices=range(6), help="Synthetic: which face of the part")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--out", required=True)
@@ -64,7 +65,7 @@ def main(argv=None) -> dict[str, Any]:
     if args.synthetic:
         from src.process.synthetic_parts import render_part
 
-        images = [render_part(args.width, args.height, None, seed=SYNTHETIC_HOLDOUT_SEED + i)
+        images = [render_part(args.width, args.height, None, seed=SYNTHETIC_HOLDOUT_SEED + i, face=args.face)
                   for i in range(args.synthetic)]
     else:
         paths = sorted(p for p in Path(args.images).rglob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"})

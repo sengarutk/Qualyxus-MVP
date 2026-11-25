@@ -2,6 +2,7 @@
 trail, good-part pool, multi-view verdicts, labelling loop and the live inspection wiring."""
 from __future__ import annotations
 
+import collections
 import json
 import queue
 import threading
@@ -315,6 +316,8 @@ def _health_fields(cm, views=()):
     cm.max_frame_age_s, cm.max_inspect_s = 5.0, 10.0
     cm.frame_detector_missing, cm._inspecting_since = False, None
     cm._inspection_slots = threading.Semaphore(4)
+    cm._pending_parts, cm._backlog_bytes, cm._backlog_lock = collections.deque(), 0, threading.Lock()
+    cm.trigger, cm.presence, cm._trigger_numbers = None, {}, collections.OrderedDict()
     cm.expect_part_per_cycle, cm._cycles_checked_to, cm._next_unseen_check = True, {}, 0.0
     cm.workers = {}
     for view in views or ("cam",):
@@ -1096,7 +1099,7 @@ def test_failure_after_the_verdict_leaves_the_verdict_alone(tmp_path):
 
     class Aligner:
         link_for = staticmethod(lambda camera: Link)
-        align = staticmethod(lambda camera, ts: Aligned)
+        align = align_view = staticmethod(lambda camera, ts: Aligned)
 
     class Service:
         aligner = Aligner
@@ -1363,7 +1366,7 @@ def test_slow_box_reports_overflow_parts_instead_of_queueing_forever(tmp_path):
     cm.plc_executor.shutdown()
     cm.part_fuser = PartVerdictFuser()
     cm.inspection_enabled = True
-    cm.presence_std_threshold, cm._presence_on_frames, cm._presence_off_frames = 3.0, 1, 1
+    cm._presence_on_frames, cm._presence_off_frames = 1, 1
     cm.inspection_executor = type("Busy", (), {"submit": staticmethod(lambda *a: None)})
     cm._inspection_slots = threading.Semaphore(0)
     part, empty = render_part(160, 120, None, seed=3), np.full((120, 160, 3), 40, np.uint8)
@@ -1540,7 +1543,7 @@ def test_blurred_part_is_stored_as_not_inspected_with_its_picture(tmp_path):
 
     class Aligner:
         link_for = staticmethod(lambda camera: type("Link", (), {"parts_per_cycle": 1}))
-        align = staticmethod(lambda camera, ts: Aligned)
+        align = align_view = staticmethod(lambda camera, ts: Aligned)
 
     class Service:
         aligner = Aligner

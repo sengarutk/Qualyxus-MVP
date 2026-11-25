@@ -11,6 +11,9 @@ import cv2
 import numpy as np
 
 
+VIEW_SIDE = 1600
+
+
 def part_folder(part_key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", part_key)
 
@@ -36,6 +39,9 @@ class ViewStore:
 
     @staticmethod
     def _write(path: Path, image: np.ndarray) -> None:
+        scale = VIEW_SIDE / max(image.shape[:2])      # for looking at; the evidence keeps full size
+        if scale < 1.0:
+            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         ok, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])
         if ok:
             tmp = path.with_suffix(".tmp")

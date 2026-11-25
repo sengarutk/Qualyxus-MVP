@@ -28,6 +28,7 @@ class CompletedPart:
     n_frames: int
     defect_event_ids: list[str] = field(default_factory=list)
     defect_types: list[str] = field(default_factory=list)
+    trigger_key: str | None = None
 
     @property
     def ts(self) -> float:
@@ -221,7 +222,7 @@ class PartPresenceTracker:
             visit["last_ts"] = ts
             visit["n"] += 1
             score = sharpness(frame)
-            if score > visit["best_score"]:
+            if score > 1.02 * visit["best_score"]:     # copying a large frame for a hair's difference costs time
                 visit["best_score"], visit["best"], visit["best_id"] = score, frame.copy(), frame_id
         visit["events"].extend(defect_event_ids or [])
         visit["types"].extend(defect_types or [])

@@ -74,8 +74,12 @@ class ConsoleData:
         self.views_dir = Path((inspection.get("view_store") or {}).get("dir", "data/live/parts"))
         audit = inspection.get("audit") or {}
         self.audit_dir, self.audit_key = audit.get("dir", "data/audit"), audit.get("key_file")
-        self.model_path = inspection.get("anomaly_model")
         cameras = [c for c in cfg.get("cameras") or [] if c.get("enabled", True)]
+        recipes, default = inspection.get("recipes") or {}, str(inspection.get("recipe") or "default")
+        names = [f"{c.get('recipe') or default}-{c['model_view']}" if c.get("model_view") else c.get("recipe") or default
+                 for c in cameras]
+        paths = [(recipes.get(n) or ({} if n != default else inspection)).get("anomaly_model") for n in names]
+        self.model_paths = list(dict.fromkeys(p for p in paths if p))
         self.cameras = [str(c["id"]) for c in cameras]
         self.required = required_views(cameras) or self.cameras
         machines = [str(m["machine_id"]) for m in process.get("machines") or []]
@@ -329,25 +333,38 @@ class ConsoleData:
                 "scores": {"edges": edges.tolist(), "counts": counts, "n": len(scores)}}
 
     def model(self) -> dict[str, Any]:
+        """The vision model, or a summary of the models when each view has its own."""
         if self._model_cache is None:
-            out: dict[str, Any] = {"path": self.model_path, "loaded": False}
-            if self.model_path and Path(self.model_path).exists():
-                from src.inference.model_registry import file_digest
-
-                card = _read_json(Path(self.model_path).with_suffix(".card.json"))
-                calibration = card.get("calibration") or {}
-                if not calibration:
-                    import torch
-
-                    payload = torch.load(self.model_path, map_location="cpu", weights_only=True)
-                    calibration = payload.get("calibration") or {}
-                    card = {**card, **{k: payload.get(k) for k in ("kind", "threshold") if payload.get(k) is not None}}
-                out = {"loaded": True, "name": Path(self.model_path).stem, "digest": file_digest(self.model_path),
-                       "kind": card.get("kind"), "backbone": card.get("backbone"), "threshold": card.get("threshold"),
-                       "part_frr_target": calibration.get("part_frr_target"), "n_views": calibration.get("n_views"),
-                       "guaranteed": calibration.get("frr_guaranteed"), "n_holdout": calibration.get("n_holdout")}
+            found = [m for m in (self._one_model(p) for p in self.model_paths) if m]
+            out: dict[str, Any] = {"path": self.model_paths[0] if self.model_paths else None, "loaded": False}
+            if found and len(found) == len(self.model_paths):
+                out = dict(found[0])
+                if len(found) > 1:      # what holds for the station is what holds for its weakest model
+                    out.update(name=f"{len(found)} view models", threshold=None,
+                               guaranteed=all(m["guaranteed"] for m in found),
+                               n_holdout=min(m["n_holdout"] or 0 for m in found),
+                               digest=" ".join(m["digest"][:6] for m in found))
             self._model_cache = out
         return self._model_cache
+
+    @staticmethod
+    def _one_model(path: str) -> dict[str, Any] | None:
+        if not Path(path).exists():
+            return None
+        from src.inference.model_registry import file_digest
+
+        card = _read_json(Path(path).with_suffix(".card.json"))
+        calibration = card.get("calibration") or {}
+        if not calibration:
+            import torch
+
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            calibration = payload.get("calibration") or {}
+            card = {**card, **{k: payload.get(k) for k in ("kind", "threshold") if payload.get(k) is not None}}
+        return {"loaded": True, "name": Path(path).stem, "digest": file_digest(path),
+                "kind": card.get("kind"), "backbone": card.get("backbone"), "threshold": card.get("threshold"),
+                "part_frr_target": calibration.get("part_frr_target"), "n_views": calibration.get("n_views"),
+                "guaranteed": calibration.get("frr_guaranteed"), "n_holdout": calibration.get("n_holdout")}
 
     # --------------------------------------------------------------------------------- audit
 

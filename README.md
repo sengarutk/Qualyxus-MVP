@@ -67,6 +67,7 @@ python -m src.operations.auth add <name> --role QA
 | 104 | Sequence, 1 to 65535: **act when this changes.** It changes with every verdict and is written last. Register 101 can repeat |
 | 105 | Acknowledge, written by the PLC: copy 104 here once the verdict is taken (needed with `telemetry.require_ack`) |
 | 106 | Cavity of that part, on multi-cavity stations only |
+| 107 | Trigger, written by the PLC (only with `inspection.trigger`): add 1 when a part is in position. Register 101 then holds this number |
 
 A verdict stays at least `min_verdict_hold_s` (or, with `require_ack`, until acknowledged) and is
 never written later than `max_verdict_age_s`; one that could not be delivered stops the heartbeat
@@ -189,6 +190,19 @@ python -m src.process.baseline reset --machine imm_1 --process-change --by NAME 
 
 Machine values listed in `process.baseline_reset_on` (a mould id, say) do the second one by
 themselves. Several machines go under `process.machines`; each has its own baseline and model.
+
+## On a real station
+
+* **Is a part there?** Whatever stands out from the light on the empty station. With a patterned
+  background, or a part that reaches the frame edge, learn the empty station first
+  (`python -m src.camera.presence learn --source rtsp://... --out data/templates/empty_top.png`) and set
+  `presence: {reference: ...}` on that camera. Or let the PLC say so: `inspection.trigger` (polled, so for
+  parts at rest; a moving part needs a camera wired to the sensor).
+* **One model per face:** give each camera `model_view` and a model for `<recipe>-<view>` (see `config.360.yaml`).
+* **Bad images are not bad parts:** light, glare, covering, position, focus, noise and compression are compared
+  with the calibration images; outside them the part is *not inspected*. Recalibrate old models to get this.
+* **Keeping it running:** `process.retention_days`, `logging.retention_days`, `good_pool.max_gb`, `review.max_gb`.
+  Move old audit days out with `python -m src.inference.audit_log archive --before 2027-01-01 --to /mnt/archive --key-file ...`.
 
 ## Setup
 

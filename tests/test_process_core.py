@@ -411,7 +411,11 @@ def test_old_curves_are_pruned_as_cycles_arrive(tmp_path, monkeypatch):
     cycles = [sim.next_cycle()[0] for _ in range(5)]
     for cycle in cycles:
         service.on_cycle(cycle)
-    assert not service.store.get_cycle(cycles[0].cycle_id, with_curves=True).curves
+    # The oldest 100 cycles are the healthy baseline: theirs stay.
+    assert service.store.get_cycle(cycles[0].cycle_id, with_curves=True).curves
+    for cycle in [sim.next_cycle()[0] for _ in range(100)]:
+        service.on_cycle(cycle)
+    assert not service.store.get_cycle(cycle.cycle_id, with_curves=True).curves
 
 
 def test_sensor_dropouts_do_not_blind_the_golden_reference():

@@ -52,9 +52,11 @@ def backfill(cfg: dict, work: Path) -> dict:
 
     cameras = [c for c in cfg["cameras"] if c.get("enabled", True)]
     inspection = cfg["inspection"]
-    stack, _ = StackProvider(inspection).get()
-    if stack.empty:
-        sys.exit("The inspection model did not load; see config.360.yaml for how to build it.")
+    provider = StackProvider(inspection)
+    provider.max_cached = len(cameras)
+    stacks = {c["id"]: provider.get(f"{inspection.get('recipe') or 'default'}-{c['model_view']}")[0] for c in cameras}
+    if any(stack.empty for stack in stacks.values()):
+        sys.exit("The inspection models did not load; see config.360.yaml for how to build it.")
     service = ProcessIntelligenceService(cfg["process"], cameras_cfg=cameras)
     audit = InspectionAuditLog(inspection["audit"]["dir"], inspection["audit"].get("key_file"))
     views = ViewStore(keep=400)
@@ -76,7 +78,8 @@ def backfill(cfg: dict, work: Path) -> dict:
         part_failed = False
         for index, camera in enumerate(cameras):
             defect = outcome.defect_type if cycle.sequence % len(cameras) == index else None
-            frame = render_part(camera["width"], camera["height"], defect, cycle.sequence + index * 7919)
+            frame = render_part(camera["width"], camera["height"], defect, cycle.sequence + index * 7919, face=index)
+            stack = stacks[camera["id"]]
             judged = stack.judge(frame)
             verdict = "fail" if judged.failed else "pass"
             part_failed |= judged.failed

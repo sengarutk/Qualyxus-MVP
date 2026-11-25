@@ -26,7 +26,8 @@ import numpy as np
 
 class GoodPartPool:
     def __init__(self, directory: str | Path, recipe: str, *, every_n: int = 5, max_items: int = 3000,
-                 max_score: float | None = 0.8, calibration_every_n: int = 20, calibration_max_items: int = 2000):
+                 max_score: float | None = 0.8, calibration_every_n: int = 20, calibration_max_items: int = 2000,
+                 max_gb: float | None = None):
         self.dir = Path(directory) / recipe
         self.every_n = max(1, int(every_n))
         self.max_items = int(max_items)
@@ -34,6 +35,9 @@ class GoodPartPool:
         self.calibration_dir = self.dir / "calibration"
         self.calibration_every_n = max(1, int(calibration_every_n))
         self.calibration_max_items = int(calibration_max_items)
+        # The calibration sample matters more per image, so it gets the larger share of the space.
+        self.max_bytes = None if max_gb is None else int(max_gb * 1e9 * 0.4)
+        self.calibration_max_bytes = None if max_gb is None else int(max_gb * 1e9 * 0.6)
         self._seen = 0
         self._parts = 0
         self._lock = threading.Lock()
@@ -50,7 +54,7 @@ class GoodPartPool:
             if self._seen % self.every_n:
                 return None
             path = self._write(self.dir, image, camera_id, normalized_score=normalized_score, image_sha=image_sha)
-            self._evict(self.dir, self.max_items)
+            self._evict(self.dir, self.max_items, self.max_bytes)
             return path
 
     def sample(self, image: np.ndarray, *, verdict: str, normalized_score: float | None, camera_id: str,
@@ -64,7 +68,7 @@ class GoodPartPool:
                                               or normalized_score <= self.max_score)
             self._write(self.calibration_dir, image, camera_id, normalized_score=normalized_score,
                         image_sha=image_sha, accepted=accepted)
-            self._evict(self.calibration_dir, self.calibration_max_items)
+            self._evict(self.calibration_dir, self.calibration_max_items, self.calibration_max_bytes)
             return "accepted" if accepted else "needs_review"
 
     def calibration_set(self, labels: dict[str, str], *, since_ts: float | None = None
@@ -98,7 +102,7 @@ class GoodPartPool:
         sidecar = path.with_suffix(".json")
         try:
             sidecar.write_text(json.dumps({"ts": ts, "camera_id": camera_id, **meta}), encoding="utf-8")
-            if not cv2.imwrite(str(path), image):
+            if not cv2.imwrite(str(path), image, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
                 raise OSError(f"could not write {path}")
         except OSError:
             path.unlink(missing_ok=True)
@@ -107,9 +111,17 @@ class GoodPartPool:
         return path
 
     @staticmethod
-    def _evict(directory: Path, max_items: int) -> None:
+    def _evict(directory: Path, max_items: int, max_bytes: int | None = None) -> None:
         images = sorted(directory.glob("*.png"))
-        for old in images[: max(0, len(images) - max_items)]:
+        keep = min(len(images), max_items)
+        if max_bytes is not None:
+            total = 0
+            for k, path in enumerate(reversed(images)):     # newest first
+                total += path.stat().st_size
+                if total > max_bytes:
+                    keep = min(keep, k)
+                    break
+        for old in images[: len(images) - keep]:
             old.unlink(missing_ok=True)
             old.with_suffix(".json").unlink(missing_ok=True)
 

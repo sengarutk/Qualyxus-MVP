@@ -536,5 +536,37 @@ class ProcessStore:
     def prune_curves(self, older_than_s: float) -> int:
         """Drop raw curves (keep features) for cycles older than the given age."""
         cutoff = time.time() - float(older_than_s)
-        cur = self._execute("UPDATE process_cycles SET curves = NULL WHERE end_ts < ? AND curves IS NOT NULL", (cutoff,))
+        marks, keep = self._baseline_cycles()
+        cur = self._execute("UPDATE process_cycles SET curves = NULL WHERE end_ts < ? AND curves IS NOT NULL "
+                            f"AND cycle_id NOT IN ({marks})", (cutoff, *keep))
         return int(cur.rowcount)
+
+    def _baseline_cycles(self, limit: int = 100) -> tuple[str, list[str]]:
+        """The cycles each machine's healthy baseline is made of. They are never dropped."""
+        keep: list[str] = []
+        for machine in self.machines():
+            keep += [r["cycle_id"] for r in self.cycle_rows(limit=limit, newest=False, machine_id=machine,
+                                                            since_ts=self.baseline_start(machine))]
+        return ",".join("?" for _ in keep), keep
+
+    def prune(self, older_than_s: float, *, batch: int = 5000) -> dict[str, int]:
+        """Delete cycles, inspections, predictions and gaps older than the given age, in short steps.
+
+        The freed pages are used again, so the file stops growing.
+        """
+        cutoff = time.time() - float(older_than_s)
+        marks, keep = self._baseline_cycles()
+        done = {}
+        for table, column, guard, params in (
+                ("inspections", "ts", f"AND (cycle_id IS NULL OR cycle_id NOT IN ({marks}))", keep),
+                ("cycle_predictions", "ts", f"AND cycle_id NOT IN ({marks})", keep),
+                ("process_cycles", "end_ts", f"AND cycle_id NOT IN ({marks})", keep),
+                ("cycle_gaps", "ts", "", [])):
+            done[table] = 0
+            while True:     # inspections use the machine's lock only for a moment at a time
+                n = self._execute(f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {column} < ? "
+                                  f"{guard} LIMIT ?)", (cutoff, *params, int(batch))).rowcount
+                done[table] += n
+                if n < batch:
+                    break
+        return done

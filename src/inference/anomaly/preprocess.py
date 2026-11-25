@@ -32,6 +32,8 @@ import numpy as np
 logger = logging.getLogger("QualyxusPreprocess")
 
 _TEMPLATE_SIZE = 64
+FIND_PART_SIDE = 1024
+MAP_SIDE = 1024
 
 
 @dataclass
@@ -58,6 +60,15 @@ def _border_background(img: np.ndarray, width: int = 6) -> np.ndarray:
 
 def find_part(img: np.ndarray, min_area_fraction: float = 0.01) -> tuple[tuple[float, float], tuple[float, float], float] | None:
     """Minimum-area rectangle ((cx, cy), (w, h), angle) of the dominant foreground object."""
+    scale = FIND_PART_SIDE / max(img.shape[:2])
+    if scale < 1.0:     # a big frame adds cost, not certainty, to finding an outline
+        small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        rect = find_part(small, min_area_fraction)
+        if rect is None:
+            return None
+        sx, sy = img.shape[1] / small.shape[1], img.shape[0] / small.shape[0]
+        (cx, cy), (w, h), angle = rect
+        return (cx * sx, cy * sy), (w * sx, h * sx), angle
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     bg = _border_background(img.astype(np.float32))
@@ -212,6 +223,12 @@ class Preprocessor:
         score = float(max(s for s, _ in results))
         if prepared.warp is not None:
             fh, fw = prepared.frame_shape
+            if max(fh, fw) > 2 * MAP_SIDE:      # warp a small map, then enlarge it
+                k = MAP_SIDE / max(fh, fw)
+                shrink = np.diag([k, k]) @ cv2.invertAffineTransform(prepared.warp)
+                small = cv2.warpAffine(canvas, shrink, (round(fw * k), round(fh * k)), flags=cv2.INTER_LINEAR,
+                                       borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+                return score, cv2.resize(small, (fw, fh), interpolation=cv2.INTER_LINEAR)
             canvas = cv2.warpAffine(canvas, prepared.warp, (fw, fh), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
         return score, canvas

@@ -108,6 +108,27 @@ def anchor_path(directory: str | Path) -> Path:
     return path.with_name(path.name + ".anchor.json")
 
 
+def base_path(directory: str | Path) -> Path:
+    """Where the log starts once its oldest days were archived."""
+    path = Path(directory)
+    return path.with_name(path.name + ".base.json")
+
+
+def _base(directory: str | Path, key: bytes) -> tuple[int, str, str | None]:
+    """(records archived before this log, hash it continues from, problem)."""
+    path = base_path(directory)
+    if not path.exists():
+        return 0, GENESIS, None
+    try:
+        base = json.loads(path.read_text(encoding="utf-8"))
+        records, head = int(base["records"]), str(base["head"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0, GENESIS, "archive marker is unreadable"
+    if not hmac.compare_digest(_anchor_mac(records, "base:" + head, key), str(base.get("mac"))):
+        return 0, GENESIS, "archive marker was altered"
+    return records, head, None
+
+
 def _key_path(directory: str | Path, key_file: str | Path | None) -> Path:
     if key_file or os.getenv("QUALYXUS_AUDIT_KEY_FILE"):
         return Path(key_file or os.environ["QUALYXUS_AUDIT_KEY_FILE"])
@@ -137,7 +158,7 @@ class InspectionAuditLog:
         return self._key
 
     def _restore_tail(self, key: bytes) -> None:
-        self._last_hash, self._records = GENESIS, 0
+        self._records, self._last_hash, base_problem = _base(self.dir, key)
         files = sorted(self.dir.glob("*.jsonl"))
         if files and _set_aside_torn_line(files[-1]):
             logger.warning("[Audit] Last line of %s was cut off mid-write; kept in its .torn file.", files[-1].name)
@@ -147,7 +168,7 @@ class InspectionAuditLog:
                 self._records += count
                 self._last_hash = json.loads(last)["hash"]
                 self._last_file = f.stem
-        problem = _anchor_problem(self._records, self._last_hash, self.anchor, key)
+        problem = base_problem or _anchor_problem(self._records, self._last_hash, self.anchor, key)
         if problem:
             logger.critical("[Audit] Log does not match its anchor: %s", problem)
             self._write({"ts": time.time(), "record": AUDIT_GAP, "problem": problem}, key)
@@ -253,7 +274,10 @@ class ChainVerifier:
             now = time.monotonic()
             if full or self._full_at is None or now - self._full_at > self.full_every_s:
                 self._known, self._full_at = {}, now
-            prev, records, gaps, torn = GENESIS, 0, [], False
+            start, prev, base_problem = _base(self.dir, key)
+            if base_problem:
+                return {"ok": False, "records": 0, "error": base_problem}
+            records, gaps, torn = 0, [], False
             self.files_read = 0
             for path in files:
                 stat = path.stat()
@@ -273,17 +297,85 @@ class ChainVerifier:
                 prev, records = part["head"], records + part["records"]
                 gaps += part["gaps"]
                 torn = torn or part["torn"]
-            problem = _anchor_problem(records, prev, anchor_path(self.dir), key)
+            problem = _anchor_problem(start + records, prev, anchor_path(self.dir), key)
         if problem:
             return {"ok": False, "records": records, "error": problem}
         if gaps:
             return {"ok": False, "records": records, "error": f"logging restarted after a gap: {'; '.join(gaps)}"}
-        return {"ok": True, "records": records, "head": prev, **({"torn_tail": True} if torn else {})}
+        return {"ok": True, "records": records, "head": prev, **({"torn_tail": True} if torn else {}),
+                **({"archived": start} if start else {})}
 
 
 def verify_chain(directory: str | Path, key_file: str | Path | None = None) -> dict[str, Any]:
     """Check every record's hash and link, then the record count against the anchor."""
     return ChainVerifier(directory, key_file).check(full=True)
+
+
+def archive(directory: str | Path, before: str, destination: str | Path,
+            key_file: str | Path | None = None) -> dict[str, Any]:
+    """Move whole days before ``before`` (YYYY-MM-DD) out; the rest still verifies on its own.
+
+    Only an intact log is archived, and the newest day always stays. Safe while the runtime
+    writes: it only ever touches the newest file. The archive has its own marker and anchor,
+    so ``verify`` works on it with the same key.
+    """
+    directory, destination = Path(directory), Path(destination)
+    if destination.resolve() == directory.resolve() or directory.resolve() in destination.resolve().parents:
+        raise ValueError("the archive must be outside the log directory")
+    state = verify_chain(directory, key_file)
+    if not state["ok"]:
+        raise ValueError(f"the log is not intact, so nothing was moved: {state['error']}")
+    key, _ = _read_key(directory, key_file, True)
+    if key is None:
+        return {"moved": 0, "records": 0}
+    start, prev, _ = _base(directory, key)
+    files = sorted(directory.glob("*.jsonl"))
+    old = [f for f in files[:-1] if f.stem < before]
+    if not old:
+        return {"moved": 0, "records": 0}
+    destination.mkdir(parents=True, exist_ok=True)
+    kept_key = _key_path(destination, key_file)
+    if not kept_key.exists():
+        raise ValueError(f"give --key-file (or set QUALYXUS_AUDIT_KEY_FILE): no key at {kept_key}")
+    first = (start, prev)
+    if base_path(destination).exists() or any(destination.glob("*.jsonl")):
+        # Continuing an archive: it must end exactly where this log begins.
+        tail = verify_chain(destination, key_file)
+        if not tail["ok"] or tail.get("head") != prev:
+            raise ValueError("the archive does not end where this log begins; use an empty directory")
+        first = _base(destination, key)[:2]
+    records, head = start, prev
+    for f in old:
+        part = _check_file(f, head, key, False)
+        target = destination / f.name
+        tmp = target.with_suffix(".part")
+        tmp.write_bytes(f.read_bytes())
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+        records, head = records + part["records"], part["head"]
+    _write_json(base_path(destination), {"records": first[0], "head": first[1],
+                                         "mac": _anchor_mac(first[0], "base:" + first[1], key)})
+    _write_json(anchor_path(destination), {"records": records, "head": head, "mac": _anchor_mac(records, head, key)})
+    if not verify_chain(destination, key_file)["ok"]:
+        raise ValueError("the archive copy does not verify, so nothing was removed")
+    # Between these two steps a check would fail, so the old days are first renamed out of its sight;
+    # a crash in between leaves them complete in the archive.
+    for f in old:
+        f.rename(f.with_suffix(".archived"))
+    _write_json(base_path(directory), {"records": records, "head": head, "mac": _anchor_mac(records, "base:" + head, key)})
+    for f in old:
+        f.with_suffix(".archived").unlink()
+    return {"moved": len(old), "records": records - start}
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 _verifiers: dict[tuple[str, str], ChainVerifier] = {}
@@ -304,8 +396,14 @@ def main(argv=None) -> dict[str, Any]:
     p = sub.add_parser("verify")
     p.add_argument("directory", nargs="?", default="data/audit")
     p.add_argument("--key-file", default=None)
+    p = sub.add_parser("archive", help="Move whole old days to another place; both parts still verify")
+    p.add_argument("directory", nargs="?", default="data/audit")
+    p.add_argument("--before", required=True, help="YYYY-MM-DD; this day and later stay")
+    p.add_argument("--to", required=True)
+    p.add_argument("--key-file", default=None)
     args = parser.parse_args(argv)
-    result = verify_chain(args.directory, args.key_file)
+    result = (verify_chain(args.directory, args.key_file) if args.cmd == "verify"
+              else archive(args.directory, args.before, args.to, args.key_file))
     print(json.dumps(result, indent=2))
     return result
 

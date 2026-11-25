@@ -2,8 +2,8 @@
 
 Commit `0d06b82`. Nothing was changed during this audit. Stage 1 (marked fixed) was done on 2026-11-25; its tests are in `tests/test_safe_verdicts.py`.
 Stage 2 (also marked fixed) was done on 2026-11-25; its tests are in `tests/test_true_numbers.py`.
-Probes 06, 16, 17, 20 and 23 in `scripts/audit_probes.py` still fail: they check the old text or method, not the fixed behaviour.
-A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to copy the sequence register to the acknowledge register.
+Probes 04, 06, 16, 17, 20, 23 and 33 in `scripts/audit_probes.py` still fail: they check the old text or method, not the fixed behaviour.
+Stage 3 (also marked fixed) was done on 2026-11-25; its tests are in `tests/test_real_camera.py`. A11 also needs the plant's PLC program to copy the sequence register to the acknowledge register.
 
 **Evidence labels**
 - **P**: proven by running it (a probe failed, or it was measured)
@@ -22,14 +22,14 @@ A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to cop
 
 | # | Fault | Evidence | Where | Effort |
 |---|---|---|---|---|
-| A1 | **Part detection only works on a plain background.** An empty station with ordinary uneven light counts as "part present", so parts never separate: 0 of 10 detected. No hardware trigger input exists either. | P | `camera_manager.is_part_present` | M |
+| ~~A1~~ fixed | **Part detection only works on a plain background.** An empty station with ordinary uneven light counts as "part present", so parts never separate: 0 of 10 detected. No hardware trigger input exists either. | P | `camera_manager.is_part_present` | M |
 | ~~A2~~ fixed | **Repeated part number to the PLC.** When one part has no machine cycle, the next number repeats (1,2,3,4,**4**,5). The PLC contract says it changes every time, so a reject can go unnoticed. | P | `_publish_part_verdict` | S |
 | ~~A3~~ fixed | **Cameras overwrite each other's verdict.** Without `required_view`, one camera's pass replaces another's reject for the same part. The shipped `config.yaml` has 5 cameras and none marked required. | P | `PartVerdictFuser`, `config.yaml` | S |
 | ~~A4~~ fixed | **Old verdicts are sent late.** With the PLC unreachable, each write blocks 3 s; verdicts queue without limit and have no expiry, so a 60 s old verdict is still written, for a part long gone. | P | `_deliver_verdict`, `plc_adapter` | S |
 | ~~A5~~ fixed | **Retraining breaks the false-reject guarantee.** It calibrates only on parts scoring under 0.8, so the new limit is too tight: 8.9% of good parts rejected in simulation of the method, while reporting 1% "guaranteed". | P | `good_pool`, `model_registry._retrain` | M |
 | ~~A6~~ fixed | **Retraining ignores the number of views,** so six-view false rejects return. It also drops part alignment unless asked. | C | `model_registry._retrain` | S |
 | ~~A7~~ fixed | **Unknown product is judged with the default product's model.** A missing recipe should be "not inspected". | P | `StackProvider._build` | S |
-| A8 | **Two views of one part can link to two cycles.** 0.2 s apart on a 3 s cycle gave m-1 and m-2, so neither part completes. Each view should not link on its own. | P | `alignment.CycleAligner` | M |
+| ~~A8~~ fixed | **Two views of one part can link to two cycles.** 0.2 s apart on a 3 s cycle gave m-1 and m-2, so neither part completes. Each view should not link on its own. | P | `alignment.CycleAligner` | M |
 | ~~A9~~ fixed | **Parts waiting at shutdown get no verdict.** The PLC thread stops first, then queued inspections are cancelled. | C | `_sync_stop` | S |
 | ~~A10~~ fixed | **A typo in config silently removes a safety rule.** `requred_view` loads without complaint, so that view is no longer needed for a pass. Duplicate camera ids load too. | P | `config.py` | M |
 | ~~A11~~ fixed | **No verdict handshake.** One register pair, no acknowledgement or sequence buffer: two verdicts within one PLC scan lose the first. Nothing is read back. | C | `plc_adapter` | M |
@@ -49,14 +49,14 @@ A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to cop
 | ~~B7~~ fixed | **A network outage is merged into one cycle:** a 59 s gap became a 61 s "cycle" that feeds health and training. | P | `CycleAssembler` | S |
 | ~~B8~~ fixed | Health baseline is the first 100 cycles ever, for life. Maintenance, a new mould or material never resets it. | C | `machine_health`, `console/data` | M |
 | ~~B9~~ fixed | Health mixes all machines, and the runtime supports one machine source only. | C | `store.cycle_features`, `main.py` | M |
-| B10 | **Lighting faults are treated as bad parts.** Uneven light, shadow, reflection, JPEG compression, textured belt and half-in-frame each rejected 20 of 20 good parts. Half-covered, glare, darker and brighter frames pass the image check. No exposure or framing check. | P | `image_quality.py` | M |
+| ~~B10~~ fixed | **Lighting faults are treated as bad parts.** Uneven light, shadow, reflection, JPEG compression, textured belt and half-in-frame each rejected 20 of 20 good parts. Half-covered, glare, darker and brighter frames pass the image check. No exposure or framing check. | P | `image_quality.py` | M |
 | ~~B11~~ fixed | **Model-blind drift raises no alarm.** Scores falling to a tenth of normal pass silently; only upward drift alerts. | P | `monitoring.py` | S |
 | ~~B12~~ fixed | **Second rollback returns to the bad model** (v3, then v2, then v3 again). | P | `model_registry.rollback` | S |
 | ~~B13~~ fixed | Model file digest is recorded but never checked at load (vision models; joblib ones are signed). | C | `inspection_stack` | S |
-| B14 | **4.6 GB RAM per 12 MP camera** for the frame buffer, 28 GB for six. | P | `_POOL_SLOTS` | S |
-| B15 | **5 fps limit at 12 MP** from presence, sharpness and copying on full frames. | P | `part_inspection`, `camera_manager` | M |
-| B16 | Storage at 12 MP: up to 69 GB per recipe (good pool) and 115 GB per camera (review). Neither obeys the disk monitor. | P | `good_pool`, `monitoring` | S |
-| B17 | No retention for cycles, inspections, events or audit: about 82 MB a day in `process.db` per line. | P | `store.py` | M |
+| ~~B14~~ fixed | **4.6 GB RAM per 12 MP camera** for the frame buffer, 28 GB for six. | P | `_POOL_SLOTS` | S |
+| ~~B15~~ fixed | **5 fps limit at 12 MP** from presence, sharpness and copying on full frames. | P | `part_inspection`, `camera_manager` | M |
+| ~~B16~~ fixed | Storage at 12 MP: up to 69 GB per recipe (good pool) and 115 GB per camera (review). Neither obeys the disk monitor. | P | `good_pool`, `monitoring` | S |
+| ~~B17~~ fixed | No retention for cycles, inspections, events or audit: about 82 MB a day in `process.db` per line. | P | `store.py` | M |
 | ~~B18~~ fixed | Audit check reads the whole log every 10 s: 11 s long after 30 days, 129 s after a year. Needs checkpoints. | P | `console`, `audit_log` | M |
 | ~~B19~~ fixed | **Event writer dies on one database error** ("database is locked"), and tracking events in that batch are lost. It restarts only on the next event. | P | `event_logger` | S |
 | ~~B20~~ fixed | Events already taken from the queue are lost at shutdown. | P | `event_logger` | S |
@@ -64,18 +64,18 @@ A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to cop
 | ~~B22~~ fixed | **Language-model errors are saved as the defect's root cause.** It is on by default and sends every defect to a local server that may not exist. | P | `vlm_gateway` | S |
 | ~~B23~~ fixed | One 95 °C reading latches EMERGENCY: all cameras stop until restart. No confirmation, no recovery. | P | `resource_monitor` | S |
 | ~~B24~~ fixed | Corrections advise raising hold pressure when the alarm says the check ring is worn, which hides the wear. Old suggestions stay open and contradict newer ones. | C | `prescriptions.py` | M |
-| B25 | Modbus reads one signal per request (10 round trips per sample); 20 Hz needs under 5 ms each. Use block reads. One failed register drops the whole sample and reconnects. | C | `ModbusCycleSource` | M |
+| ~~B25~~ fixed | Modbus reads one signal per request (10 round trips per sample); 20 Hz needs under 5 ms each. Use block reads. One failed register drops the whole sample and reconnects. | C | `ModbusCycleSource` | M |
 | B26 | **Docker image cannot run on a Jetson:** x86 CUDA wheels on an x86-style base. The image has never been built to completion. | C | `Dockerfile`, `requirements.txt` | L |
 | B27 | Python 3.10 reached end of life in October 2026. 48 advisories in pillow (42), tornado (4) and filelock (2); this scan could not check the CUDA builds of torch, where about 20 were found earlier. | P | `requirements.txt` | L |
-| B28 | OPC UA has no security policy, certificates or login wiring; bad-quality values are not handled. | C | `sources.py` | M |
-| B29 | RTSP open and read have no timeout, so a hung stream can hold a thread and the camera. | C | `_open_camera` | S |
-| B30 | All six views are inspected one after another on one thread, not batched: about 170 ms per part before audit writes. | C | `inspection_executor` | M |
+| ~~B28~~ fixed | OPC UA has no security policy, certificates or login wiring; bad-quality values are not handled. | C | `sources.py` | M |
+| ~~B29~~ fixed | RTSP open and read have no timeout, so a hung stream can hold a thread and the camera. | C | `_open_camera` | S |
+| ~~B30~~ fixed | All six views are inspected one after another on one thread, not batched: about 170 ms per part before audit writes. | C | `inspection_executor` | M |
 
 ## C. Product and claim gaps
 
 | # | Gap | Evidence | Effort |
 |---|---|---|---|
-| C1 | **The "six faces" in the demo are the same face** (0.90 to 0.94 alike). One model is shared by all views; real faces differ and each needs its own. | P | M |
+| ~~C1~~ fixed | **The "six faces" in the demo are the same face** (0.90 to 0.94 alike). One model is shared by all views; real faces differ and each needs its own. | P | M |
 | C2 | Full VisA is 4 of 12 categories. MVTec AD, AD 2 and LOCO not run. | C | L |
 | C3 | Catch rate at the real limit is 35 to 90%, the main AI weakness. | C | L |
 | C4 | Early warning is weak: 16 of 60 episodes, median lead zero. | C | L |
@@ -152,6 +152,17 @@ A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to cop
 - **The earlier simulated scrap reduction (79% to 93% on the same 3 seeds) came mostly from settings that hid wear.** With repairs done 50 cycles after a request: 68%, 75% and 49%. Repairs do most of it. Simulation only, ideal vision (`--vision oracle`); rerun: `python scripts/simulate_closed_loop.py --vision oracle --seed 11`. With rendered camera images and PatchCore, as in the README: 50%, 63% and 52% (seeds 11, 23, 37), and early warning in 32 of 244 episodes.
 - A baseline assumes the first 100 cycles after a reset are healthy. After a repair someone must reset it (`python -m src.process.baseline`), or the repair request comes back.
 - A Modbus or OPC UA source that stays down produces no cycle, so its lost cycles are recorded only when it returns.
+
+## Limits that remain after stage 3
+
+- **A shadow or reflection lying only on the part** cannot be told from a defect: it is still rejected (B10). Every other lighting condition of the audit is now a camera fault.
+- **The PLC trigger is polled** (tens of milliseconds), so it suits parts at rest. Camera-level triggering needs C5 and hardware.
+- **Without a reference image**, a part that reaches the edge of the frame, or a patterned belt, is not handled by part detection: learn the empty station or use the trigger.
+- **Batching six views saves about 18%** on the laptop GPU (148 ms against 180 ms), less than hoped: the models, not the batching, are the cost.
+- **12 MP is measured on enlarged simulated frames**, not on a 12 MP camera: presence under 10 ms, inspection checks under 0.2 s a view without the neural network.
+- **OPC UA encryption** is wired and checked for configuration errors, but has not been run against a secured server.
+- Views are grouped by time (`process.view_spread_s`): on a line where parts arrive closer together than the cameras' spread, use the trigger or part ids.
+- A model calibrated before stage 3 keeps only the old focus and noise checks until it is recalibrated.
 
 ## What held up
 

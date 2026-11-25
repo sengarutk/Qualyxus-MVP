@@ -24,6 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 # Large per-pixel arrays are persisted elsewhere and must never be pushed to SSE clients.
 EVACUATE_S = 8.0
+CSV_MAX_BYTES = 100 * 1024 * 1024
 _BROADCAST_EXCLUDED_KEYS = {"mask", "frame_data"}
 
 
@@ -419,6 +420,7 @@ class EventLogger:
                 csv_path = self.csv_fallback_path
 
             os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            self._rotate(csv_path)
             file_exists = os.path.isfile(csv_path)
             with open(csv_path, mode="a", newline="", encoding="utf-8") as csvfile:
                 writer = csv.writer(csvfile)
@@ -484,6 +486,7 @@ class EventLogger:
                 csv_path = os.path.join(parent_dir, "geometry.csv")
 
             os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            self._rotate(csv_path)
             file_exists = os.path.isfile(csv_path)
             with open(csv_path, mode="a", newline="", encoding="utf-8") as csvfile:
                 writer = csv.writer(csvfile)
@@ -958,6 +961,33 @@ class EventLogger:
                 self._db_conn.close()
                 self._db_conn = None
         except Exception:
+            pass
+
+    def prune(self, *, events_older_than_s: float, tracking_older_than_s: float) -> dict[str, int]:
+        """Delete old defect events, and tracking and geometry rows, which are far more numerous."""
+        now = time.time()
+        done = {}
+        with self.db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            try:
+                for table, age, text in (("defect_events", events_older_than_s, True),
+                                         ("events", tracking_older_than_s, False),
+                                         ("geometry_events", tracking_older_than_s, False)):
+                    limit = now - float(age)
+                    cutoff = datetime.utcfromtimestamp(limit).isoformat() if text else limit
+                    done[table] = conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,)).rowcount
+                conn.commit()
+            finally:
+                conn.close()
+        return done
+
+    @staticmethod
+    def _rotate(path: str) -> None:
+        """A CSV grows for ever otherwise; the database holds the same events."""
+        try:
+            if os.path.getsize(path) > CSV_MAX_BYTES:
+                os.replace(path, f"{os.path.splitext(path)[0]}.{time.strftime('%Y%m%d%H%M%S')}.csv")
+        except OSError:
             pass
 
     def append_vlm_narrative(self, event_id: str, narrative: str) -> None:

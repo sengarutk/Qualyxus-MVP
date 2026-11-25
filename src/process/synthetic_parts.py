@@ -17,23 +17,59 @@ import numpy as np
 BACKGROUND = 40
 
 
-def _part_geometry(width: int, height: int, rng: np.random.Generator) -> dict:
+# (width, height) of the part on each face, as a share of the frame: top, bottom, front, back, left, right.
+FACES = ((0.56, 0.36), (0.50, 0.46), (0.62, 0.18), (0.58, 0.24), (0.26, 0.40), (0.20, 0.50))
+FACE_NAMES = ("top", "bottom", "front", "back", "left", "right")
+
+
+def _part_geometry(width: int, height: int, rng: np.random.Generator, face: int = 0) -> dict:
     cx = width / 2 + rng.uniform(-0.02, 0.02) * width
     cy = height / 2 + rng.uniform(-0.02, 0.02) * height
     return {
         "cx": cx,
         "cy": cy,
-        "w": 0.56 * width,
-        "h": 0.36 * height,
+        "w": FACES[face][0] * width,
+        "h": FACES[face][1] * height,
         "angle": rng.uniform(-2.0, 2.0),
         "gain": rng.uniform(0.95, 1.05),
     }
 
 
-def render_part(width: int, height: int, defect_type: str | None, seed: int, *, return_mask: bool = False):
-    """Render one part. With ``return_mask`` also returns the pixel mask of the defect."""
+def _draw_features(part: np.ndarray, face: int, g: dict, x1: int, y1: int, x2: int, y2: int) -> None:
+    """What tells one face of the part from another (face 0 is drawn by :func:`render_part`)."""
+    w, h = x2 - x1, y2 - y1
+
+    def at(fx: float, fy: float) -> tuple[int, int]:
+        return int(x1 + fx * w), int(y1 + fy * h)
+    dark, light, hole = (118, 118, 124), (178, 178, 185), (BACKGROUND,) * 3
+    if face == 1:       # pocketed underside with four bosses
+        for fx in (0.08, 0.54):
+            for fy in (0.10, 0.54):
+                cv2.rectangle(part, at(fx, fy), at(fx + 0.38, fy + 0.36), dark, -1)
+        for fx in (0.08, 0.92):
+            for fy in (0.08, 0.92):
+                cv2.circle(part, at(fx, fy), max(3, int(0.05 * h)), light, 2)
+    elif face == 2:     # front: row of slots
+        for k in range(5):
+            cv2.rectangle(part, at(0.10 + 0.17 * k, 0.35), at(0.20 + 0.17 * k, 0.65), hole, -1)
+    elif face == 3:     # back: connector window and two pins
+        cv2.rectangle(part, at(0.30, 0.25), at(0.70, 0.75), dark, -1)
+        for fx in (0.15, 0.85):
+            cv2.circle(part, at(fx, 0.5), max(3, int(0.16 * h)), hole, -1)
+    elif face == 4:     # left: vertical vents
+        for k in range(4):
+            cv2.line(part, at(0.2 + 0.2 * k, 0.12), at(0.2 + 0.2 * k, 0.6), dark, 4)
+        cv2.circle(part, at(0.5, 0.8), max(4, int(0.08 * h)), hole, -1)
+    elif face == 5:     # right: stacked bars
+        for k in range(5):
+            cv2.line(part, at(0.15, 0.15 + 0.17 * k), at(0.85, 0.15 + 0.17 * k), light, 4)
+
+
+def render_part(width: int, height: int, defect_type: str | None, seed: int, *, return_mask: bool = False,
+                face: int = 0):
+    """Render one face of one part. With ``return_mask`` also returns the pixel mask of the defect."""
     rng = np.random.default_rng(seed)
-    g = _part_geometry(width, height, rng)
+    g = _part_geometry(width, height, rng, face)
     part = np.full((height, width, 3), BACKGROUND, dtype=np.uint8)
     dmask = np.zeros((height, width), dtype=np.uint8)
     x1, y1 = int(g["cx"] - g["w"] / 2), int(g["cy"] - g["h"] / 2)
@@ -46,13 +82,15 @@ def render_part(width: int, height: int, defect_type: str | None, seed: int, *, 
     cv2.rectangle(part, (x1, y1 + radius), (x2, y2 - radius), body, -1)
     for cx_, cy_ in ((x1 + radius, y1 + radius), (x2 - radius, y1 + radius), (x1 + radius, y2 - radius), (x2 - radius, y2 - radius)):
         cv2.circle(part, (cx_, cy_), radius, body, -1)
-    # Mounting hole and stiffening ribs
-    hole_c = (int(x1 + 0.2 * g["w"]), int(g["cy"]))
-    cv2.circle(part, hole_c, int(0.18 * g["h"]), (BACKGROUND,) * 3, -1)
-    cv2.circle(part, hole_c, int(0.18 * g["h"]), (120, 120, 126), 2)
-    for frac in (0.45, 0.62, 0.79):
-        xr = int(x1 + frac * g["w"])
-        cv2.line(part, (xr, y1 + int(0.15 * g["h"])), (xr, y2 - int(0.15 * g["h"])), (175, 175, 182), 3)
+    if face:
+        _draw_features(part, face, g, x1, y1, x2, y2)
+    else:   # mounting hole and stiffening ribs
+        hole_c = (int(x1 + 0.2 * g["w"]), int(g["cy"]))
+        cv2.circle(part, hole_c, int(0.18 * g["h"]), (BACKGROUND,) * 3, -1)
+        cv2.circle(part, hole_c, int(0.18 * g["h"]), (120, 120, 126), 2)
+        for frac in (0.45, 0.62, 0.79):
+            xr = int(x1 + frac * g["w"])
+            cv2.line(part, (xr, y1 + int(0.15 * g["h"])), (xr, y2 - int(0.15 * g["h"])), (175, 175, 182), 3)
 
     if defect_type == "short_shot":
         # Incomplete fill at the far end of the flow path: ragged missing chunk.
@@ -125,7 +163,7 @@ class SyntheticPartFeed:
     after the cycle ends and dwells there for ``dwell_s``.
 
     With ``n_views > 1`` this feed is one face of a multi-camera station: every view sees
-    the same part, but a defect sits on a single face, so only one view can catch it.
+    its own face of the same part, and a defect sits on a single face, so only one view can catch it.
     ``inject_defect_every`` places a demo defect on every Nth part regardless of the process.
     """
 
@@ -171,7 +209,8 @@ class SyntheticPartFeed:
             noise = np.random.default_rng(int(now * 1000) & 0xFFFFFFFF).normal(0.0, 0.6, frame.shape)
             return np.clip(frame + noise, 0, 255).astype(np.uint8), None
         defect = part.defect_type if part.seed % self.n_views == self.view_index else None
-        return render_part(width, height, defect, part.seed + self.view_index * 7919), part
+        return render_part(width, height, defect, part.seed + self.view_index * 7919,
+                           face=self.view_index % len(FACES)), part
 
 
 def export_segmentation_dataset(out_dir, *, n_train: int = 400, n_val: int = 100, width: int = 640,

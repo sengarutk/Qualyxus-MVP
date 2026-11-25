@@ -20,7 +20,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.inference.anomaly.backbones import CNNBackbone, ViTBackbone, is_vit, to_tensor_batch
+from src.inference.anomaly.backbones import is_vit, shared_backbone, to_tensor_batch
+from src.inference.anomaly.preprocess import MAP_SIDE
 from src.inference.anomaly.base import AnomalyDetector, AnomalyResult  # noqa: F401  (re-export)
 
 logger = logging.getLogger("QualyxusPatchCore")
@@ -79,12 +80,12 @@ class PatchCoreDetector(AnomalyDetector):
     def _ensure_backbone(self):
         if self._backbone is None:
             if self.vit:
-                self._backbone = ViTBackbone(self.backbone_name, self.device)
+                self._backbone = shared_backbone(self.backbone_name, self.device)
                 self.image_size = self._backbone.align_size(self.image_size)
                 if self.vit_layer is None:
                     self.vit_layer = self._backbone.num_layers - 1
             else:
-                self._backbone = CNNBackbone(self.backbone_name, self.device)
+                self._backbone = shared_backbone(self.backbone_name, self.device)
         return self._backbone
 
     @torch.inference_mode()
@@ -121,11 +122,29 @@ class PatchCoreDetector(AnomalyDetector):
 
     # ------------------------------------------------------------- inference
 
-    @torch.inference_mode()
     def score_map(self, image: np.ndarray) -> tuple[float, np.ndarray]:
+        return self.score_batch([image])[0]
+
+    def score_batch(self, images: Sequence[np.ndarray], batch_size: int = 12) -> list[tuple[float, np.ndarray]]:
         if self.memory_bank is None:
             raise RuntimeError("PatchCore detector is not fitted/loaded")
-        feats, (h, w) = self._patch_features([image])
+        out = []
+        for start in range(0, len(images), batch_size):
+            chunk = images[start:start + batch_size]
+            feats, grid = self._patch_features(chunk)
+            for k, part in enumerate(feats.chunk(len(chunk))):
+                out.append(self._score_features(part, grid, chunk[k].shape[:2]))
+        return out
+
+    def feature_key(self) -> tuple:
+        """Detectors with the same key see the same features, so their images can share a batch."""
+        self._ensure_backbone()
+        return (self.backbone_name, self.image_size, self.vit_layer, self.embed_dim, str(self.device))
+
+    @torch.inference_mode()
+    def _score_features(self, feats: torch.Tensor, grid: tuple[int, int], shape: tuple[int, int]
+                        ) -> tuple[float, np.ndarray]:
+        h, w = grid
         best = None
         for start in range(0, self.memory_bank.shape[0], 8192):
             bank = self.memory_bank[start:start + 8192]
@@ -135,17 +154,19 @@ class PatchCoreDetector(AnomalyDetector):
                 d = torch.cdist(feats, bank)
             chunk_min = d.min(dim=1).values
             best = chunk_min if best is None else torch.minimum(best, chunk_min)
-        patch_scores = best
-        patch_map = patch_scores.view(1, 1, h, w)
-        full = F.interpolate(patch_map, size=image.shape[:2], mode="bilinear", align_corners=False)[0, 0]
-        amap = full.float().cpu().numpy()
-        sigma = max(1.0, 4.0 * image.shape[0] / self.image_size)
-        amap = cv2.GaussianBlur(amap, (0, 0), sigmaX=sigma)
+        patch_map = best.view(1, 1, h, w)
+        # Smoothing a 12 MP map costs seconds and adds nothing: it only has the patches' detail.
+        k = min(1.0, MAP_SIDE / max(shape))
+        size = (max(1, round(shape[0] * k)), max(1, round(shape[1] * k)))
+        amap = F.interpolate(patch_map, size=size, mode="bilinear", align_corners=False)[0, 0].float().cpu().numpy()
+        amap = cv2.GaussianBlur(amap, (0, 0), sigmaX=max(1.0, 4.0 * size[0] / self.image_size))
         if self.vit:
-            k = max(1, int(round(0.01 * patch_scores.numel())))
-            score = float(torch.topk(patch_scores, k).values.mean())
+            n = max(1, int(round(0.01 * best.numel())))
+            score = float(torch.topk(best, n).values.mean())
         else:
             score = float(amap.max())
+        if size != tuple(shape):
+            amap = cv2.resize(amap, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
         return score, amap.astype(np.float32)
 
     # ----------------------------------------------------------- persistence

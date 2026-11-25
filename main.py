@@ -12,6 +12,7 @@ from src.api.pulse_server import PulseServer
 from src.camera.camera_manager import CameraManager
 from src.analytics.vlm_narrator import VLMNarrator
 from src.fleet.historian import PredictiveHistorian
+from src.system.retention import RetentionWorker
 from src.process.service import ProcessIntelligenceService
 from src.process.sources import build_cycle_sources
 
@@ -85,6 +86,9 @@ class CoreOrchestrator:
             self.manager.register_instance("ProcessIntelligence", self.process_service)
             self.camera_manager.attach_process_service(self.process_service)
         
+        self.retention = RetentionWorker(self.config.raw, store=self.process_service.store if self.process_service else None,
+                                         event_logger=self.event_logger)
+
         # Centralized lifecycle event to coordinate thread-safe shutdowns
         self.shutdown_trigger_event = asyncio.Event()
 
@@ -107,6 +111,7 @@ class CoreOrchestrator:
         if self.process_service is not None:
             self.process_service.start()
         await self.camera_manager.start(loop)
+        self.retention.start()
         
         # Spawn background execution daemons
         logger.info("[Main] Spawning background execution daemons...")
@@ -156,6 +161,7 @@ class CoreOrchestrator:
         logger.warning("[Main] Initiating strict 4-stage sequential termination matrix...")
         self.running = False
         
+        self.retention.stop()
         # Stage 1: Halt Ingestion. CameraManager joins the capture workers first (no new frames),
         # then stops the shared inference multiplexer, then drains its disk/reflex writers.
         # It blocks on thread joins, so it runs off the event loop.

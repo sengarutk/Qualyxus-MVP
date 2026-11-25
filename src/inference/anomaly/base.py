@@ -73,7 +73,8 @@ class AnomalyDetector(ABC):
 
     def _holdout_scores(self, holdout: Sequence[np.ndarray]) -> list[float]:
         """Image scores of held-out good images used for threshold calibration."""
-        return [s for s, _ in self.infer_batch(holdout)]
+        # In chunks: a map is as big as its image, and only the score is wanted.
+        return [s for i in range(0, len(holdout), 12) for s, _ in self.infer_batch(holdout[i:i + 12])]
 
     def fit(self, good_images: Sequence[np.ndarray], *, holdout_fraction: float = 0.2,
             target_frr: float = 0.01, confidence: float | None = None, seed: int = 0,
@@ -115,6 +116,9 @@ class AnomalyDetector(ABC):
             raise RuntimeError(f"{self.kind} detector has no calibrated threshold")
         with self._lock:
             score, amap = self.infer(image)
+        return self._result(score, amap)
+
+    def _result(self, score: float, amap: np.ndarray) -> AnomalyResult:
         normalized = score / self.threshold if self.threshold > 0 else float("inf")
         bbox = None
         if normalized > 1.0:
@@ -191,3 +195,33 @@ class AnomalyDetector(ABC):
         self.threshold = float(payload["threshold"])
         self.calibration = dict(payload.get("calibration") or {})
         self.preprocessor = Preprocessor.from_state(payload.get("preprocess"))
+
+
+def predict_many(jobs: Sequence[tuple[AnomalyDetector, np.ndarray]]) -> list[AnomalyResult]:
+    """Judge several views in one pass where their models share a backbone; the rest one by one."""
+    results: list[AnomalyResult | None] = [None] * len(jobs)
+    groups: dict[Any, list[int]] = {}
+    for i, (detector, _) in enumerate(jobs):
+        key = detector.feature_key() if hasattr(detector, "feature_key") else ("own", i)
+        groups.setdefault(key, []).append(i)
+    for members in groups.values():
+        first = jobs[members[0]][0]
+        if len(members) == 1 or not hasattr(first, "_score_features"):
+            for i in members:
+                results[i] = jobs[i][0].predict(jobs[i][1])
+            continue
+        prepared = [jobs[i][0].preprocessor.prepare(jobs[i][1]) if jobs[i][0].preprocessor.active else None
+                    for i in members]
+        tiles = [[v.image for v in p.views] if p is not None else [jobs[i][1]] for p, i in zip(prepared, members)]
+        flat = [tile for group in tiles for tile in group]
+        with first._lock:
+            feats, grid = first._patch_features(flat)
+        chunks = iter(feats.chunk(len(flat)))
+        for p, group, i in zip(prepared, tiles, members):
+            detector = jobs[i][0]
+            if detector.threshold is None:
+                raise RuntimeError(f"{detector.kind} detector has no calibrated threshold")
+            scored = [detector._score_features(next(chunks), grid, tile.shape[:2]) for tile in group]
+            score, amap = detector.preprocessor.combine(p, scored) if p is not None else scored[0]
+            results[i] = detector._result(score, amap)
+    return results

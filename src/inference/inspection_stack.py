@@ -127,9 +127,13 @@ class InspectionStack:
         """True unless every configured inspection model loaded: part of a check is not a pass."""
         return self.model_missing or (self.anomaly is None and self.segmenter is None)
 
-    def judge(self, frame: np.ndarray, *, frame_defect_types: list[str] | None = None) -> PartJudgement:
-        """Any model failing the part fails it. Type: segmenter > frame detector > classifier."""
-        anomaly = self.anomaly.predict(frame) if self.anomaly is not None else None
+    def judge(self, frame: np.ndarray, *, frame_defect_types: list[str] | None = None, anomaly: Any = None) -> PartJudgement:
+        """Any model failing the part fails it. Type: segmenter > frame detector > classifier.
+
+        ``anomaly`` is this frame's result when it was already computed in a batch.
+        """
+        if anomaly is None and self.anomaly is not None:
+            anomaly = self.anomaly.predict(frame)
         instances = self.segmenter.predict(frame) if self.segmenter is not None else []
         anomalous = bool(anomaly and anomaly.is_anomalous)
         failed = anomalous or bool(instances) or bool(frame_defect_types)

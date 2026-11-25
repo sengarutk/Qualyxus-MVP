@@ -16,9 +16,10 @@ logger = logging.getLogger("PLCAdapter")
 #              telemetry.require_ack no verdict is overwritten before that
 #   cavity     which part of the shot (written only for multi-cavity stations)
 #   heartbeat  counts while inspection is healthy; if it stops, treat parts as not inspected
+#   trigger    written by the PLC (only with inspection.trigger): add 1 when a part is in position
 #   alert      machine-level alert (geometry, vibration) that belongs to no single part
 PLC_REGISTERS = {"verdict": 100, "part": 101, "heartbeat": 102, "alert": 103,
-                 "sequence": 104, "ack": 105, "cavity": 106}
+                 "sequence": 104, "ack": 105, "cavity": 106, "trigger": 107}
 PLC_PASS = 0
 PLC_FLAG_NOT_INSPECTED = 4
 

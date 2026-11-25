@@ -27,10 +27,12 @@ _CAMERA = {
     **_keys("""id enabled source mock_inference mock_event_every independent_logs fps width height frame_queue_size
                event_queue_size jpeg_quality reconnect_delay save_every buffer_size raw_dir defect_dir recipe
                required_view synthetic_scene synthetic_fail_after_frames part_dwell_s view_index n_views
-               inject_defect_every"""),
+               inject_defect_every model_view"""),
+    "presence": _keys("min_contrast min_area reference"),
     "process_link": _LINK,
 }
-_CONNECTION = {**_keys("host port unit_id poll_hz endpoint username password"),
+_CONNECTION = {**_keys("""host port unit_id poll_hz endpoint username password password_env security_policy
+                          security_mode certificate private_key server_certificate allow_insecure_login"""),
                "cycle_counter": _SIGNAL, "signals": {"*": _SIGNAL}, "setpoints": {"*": _SIGNAL}}
 
 SCHEMA: dict[str, Any] = {
@@ -40,23 +42,25 @@ SCHEMA: dict[str, Any] = {
                vibration_analysis geometry severstal console dashboard severity edge uns hub telemetry_stream"""),
     "telemetry": {**_keys("""mode protocol endpoint port unit_id heartbeat_s require_ack min_verdict_hold_s
                              max_verdict_age_s bench_test"""),
-                  "register_map": _keys("verdict part heartbeat alert sequence ack cavity")},
+                  "register_map": _keys("verdict part heartbeat alert sequence ack cavity trigger")},
     "inspection": {
         **_keys("""enabled recipe recipe_from_scalar registry_dir reload_check_s max_cached_recipes max_frame_age_s
-                   max_inspect_s max_inspection_backlog expect_part_per_cycle view_timeout_s presence_std_threshold
+                   max_inspect_s max_inspection_backlog expect_part_per_cycle view_timeout_s
                    on_frames off_frames"""),
         **_MODELS,
         "recipes": {"*": _MODELS},
         "shadow": _keys("enabled"),
+        "presence": _keys("min_contrast min_area reference"),
+        "trigger": _keys("enabled frames delay_s poll_s"),
         "health": _keys("window drift_ratio expected_reject_rate request_retrain"),
         "audit": _keys("enabled dir key_file"),
-        "good_pool": _keys("enabled dir every_n max_items max_score calibration_every_n calibration_max_items"),
-        "review": _keys("enabled dir band"),
+        "good_pool": _keys("enabled dir every_n max_items max_score calibration_every_n calibration_max_items max_gb"),
+        "review": _keys("enabled dir band max_gb"),
         "view_store": _keys("enabled dir keep_parts"),
     },
     "process": {
         **_keys("""enabled source machine_id line_id db_path models_dir store_curves curve_retention_days spec_limits
-                   components baseline_reset_on"""),
+                   components baseline_reset_on view_spread_s retention_days"""),
         "simulator": _keys("seed time_scale disturbance_scale scenario"),
         "model": _keys("""golden_warmup_cycles retrain_every_labels min_train_samples min_train_positives
                           min_promotion_auc min_label_confidence regime_min_good_cycles hybrid_deviation
@@ -74,8 +78,8 @@ SCHEMA: dict[str, Any] = {
 _BOOLEANS = {"enabled", "required_view", "mock_inference", "require_ack", "expect_part_per_cycle", "bench_test",
              "request_retrain", "store_curves"}
 _POSITIVE = {"view_timeout_s", "max_verdict_age_s", "max_inspect_s", "max_frame_age_s", "max_inspection_backlog",
-             "heartbeat_s", "tolerance_s", "fps", "width", "height", "on_frames", "off_frames"}
-_NOT_NEGATIVE = {"min_verdict_hold_s", "transport_delay_s", "presence_std_threshold"}
+             "heartbeat_s", "tolerance_s", "fps", "width", "height", "on_frames", "off_frames", "min_contrast", "min_area", "poll_s", "max_gb", "view_spread_s"}
+_NOT_NEGATIVE = {"min_verdict_hold_s", "transport_delay_s", "delay_s"}
 
 
 def _check(value: Any, schema: Any, path: str, problems: list[str]) -> None:
@@ -139,6 +143,9 @@ def validate(raw: dict[str, Any]) -> None:
     telemetry = raw.get("telemetry") if isinstance(raw.get("telemetry"), dict) else {}
     if telemetry.get("mode") not in (None, "simulated", "plc"):
         problems.append(f"telemetry.mode must be 'simulated' or 'plc', got {telemetry.get('mode')!r}")
+    inspection = raw.get("inspection") if isinstance(raw.get("inspection"), dict) else {}
+    if (inspection.get("trigger") or {}).get("enabled") and telemetry.get("mode") != "plc":
+        problems.append("inspection.trigger needs telemetry.mode: plc (the trigger comes from the PLC)")
     registers = telemetry.get("register_map")
     if isinstance(registers, dict):
         from src.telemetry.plc_adapter import PLC_REGISTERS

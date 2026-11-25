@@ -117,7 +117,7 @@ class ProcessIntelligenceService:
             link_cfg = cam.get("process_link")
             if link_cfg:
                 links.append(StationLink.from_config(str(cam.get("id")), link_cfg))
-        self.aligner = CycleAligner(self.store, links)
+        self.aligner = CycleAligner(self.store, links, view_spread_s=float(cfg.get("view_spread_s", 1.0)))
 
         model_cfg = cfg.get("model", {}) or {}
         self.golden_warmup_cycles = int(model_cfg.get("golden_warmup_cycles", 50))

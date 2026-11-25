@@ -63,6 +63,7 @@ def main(argv=None) -> dict:
     parser.add_argument("--confidence", type=float, default=None,
                         help="Guarantee this deployment's FRR <= target with this probability (e.g. 0.9; needs more holdout)")
     parser.add_argument("--holdout", type=float, default=0.2, help="Fraction of good images held out for calibration")
+    parser.add_argument("--face", type=int, default=0, choices=range(6), help="Synthetic: which face of the part")
     parser.add_argument("--width", type=int, default=640, help="Synthetic render width")
     parser.add_argument("--height", type=int, default=480, help="Synthetic render height")
     parser.add_argument("--limit", type=int, default=None)
@@ -74,7 +75,7 @@ def main(argv=None) -> dict:
     if args.synthetic:
         from src.process.synthetic_parts import render_part
 
-        images = [render_part(args.width, args.height, None, seed=10_000 + i) for i in range(args.synthetic)]
+        images = [render_part(args.width, args.height, None, seed=10_000 + i, face=args.face) for i in range(args.synthetic)]
     else:
         images = load_images(args.images, args.limit)
     logger.info("Training %s/%s on %d good images", args.method, args.backbone, len(images))

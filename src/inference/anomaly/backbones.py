@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -187,3 +188,16 @@ class CNNBackbone(torch.nn.Module):
         feats = torch.cat([f2, f3], dim=1)
         b, c, h, w = feats.shape
         return feats.permute(0, 2, 3, 1).reshape(b, h * w, c), (h, w)
+
+
+_shared: dict[tuple[str, str], torch.nn.Module] = {}
+_shared_lock = threading.Lock()
+
+
+def shared_backbone(name: str, device: torch.device) -> torch.nn.Module:
+    """One frozen copy per device: a station with a model per view must not hold six of them."""
+    with _shared_lock:
+        key = (name, str(device))
+        if key not in _shared:
+            _shared[key] = (ViTBackbone if is_vit(name) else CNNBackbone)(name, device)
+        return _shared[key]

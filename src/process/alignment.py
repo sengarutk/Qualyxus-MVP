@@ -18,7 +18,9 @@ timestamp streams, so it does not have to be measured by hand.
 """
 from __future__ import annotations
 
+import collections
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -67,13 +69,51 @@ class AlignmentResult:
     cavity: int = 0                   # which part of this cycle, in inspection order
 
 
+VIEW_SPREAD_S = 1.0
+
+
 class CycleAligner:
-    def __init__(self, store: ProcessStore, links: Iterable[StationLink]):
+    def __init__(self, store: ProcessStore, links: Iterable[StationLink], *, view_spread_s: float = VIEW_SPREAD_S):
         self.store = store
+        self.view_spread_s = float(view_spread_s)
+        self._parts: collections.deque[dict] = collections.deque(maxlen=64)
+        self._parts_lock = threading.Lock()
         self.links = {link.camera_id: link for link in links}
 
     def link_for(self, camera_id: str) -> StationLink | None:
         return self.links.get(camera_id)
+
+    def align_view(self, camera_id: str, inspection_ts: float) -> AlignmentResult:
+        """Link one view of a part. Views of the same part are linked once, together.
+
+        Each camera sees the part at a slightly different moment, so linking them one by one
+        can put two views of one part on two cycles, and then neither part is ever complete.
+        Views belong together when, with each camera's own transport delay taken off, they are
+        closer than ``view_spread_s`` (and well under half a machine cycle) and no camera
+        appears twice.
+        """
+        link = self.links.get(camera_id)
+        if link is None or link.mode != "time":
+            return self.align(camera_id, inspection_ts)
+        left_machine = float(inspection_ts) - link.transport_delay_s
+        with self._parts_lock:
+            spread = min(self.view_spread_s, 0.4 * self._cycle_period(link, left_machine))
+            near = [p for p in self._parts if p["machine"] == link.machine_id and camera_id not in p["cameras"]
+                    and abs(p["left"] - left_machine) <= spread]
+            if near:
+                part = min(near, key=lambda p: abs(p["left"] - left_machine))
+                part["cameras"].add(camera_id)
+                return part["result"]
+            result = self.align(camera_id, inspection_ts)
+            self._parts.append({"machine": link.machine_id, "left": left_machine, "cameras": {camera_id},
+                                "result": result})
+            return result
+
+    def _cycle_period(self, link: StationLink, left_machine: float) -> float:
+        """Shortest recent time between parts; with several cavities they leave together."""
+        ends = sorted(t for _, t in self.store.cycles_ending_before(link.machine_id, left_machine + link.tolerance_s, 6))
+        gaps = [b - a for a, b in zip(ends, ends[1:]) if b > a]
+        return min(gaps) if gaps else float("inf")
 
     def align(self, camera_id: str, inspection_ts: float, part_id: str | None = None) -> AlignmentResult:
         link = self.links.get(camera_id)

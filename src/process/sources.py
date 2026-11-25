@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import os
 import struct
 import threading
 import time
@@ -265,6 +266,18 @@ def _decode_registers(words: list[int], spec: SignalSpec) -> float:
     return float(value) * spec.scale + spec.offset
 
 
+MAX_BLOCK_WORDS = 120       # the protocol allows 125
+MAX_BLOCK_GAP = 16          # reading a few unused registers is cheaper than another request
+
+
+def _words(spec: SignalSpec) -> int:
+    return 1 if spec.data_type in ("int16", "uint16") else 2
+
+
+def _end(block: list[SignalSpec]) -> int:
+    return max(s.address + _words(s) for s in block)
+
+
 class ModbusCycleSource(CycleSource):
     name = "modbus"
 
@@ -293,6 +306,8 @@ class ModbusCycleSource(CycleSource):
             nominal_sample_rate_hz=poll_hz, line_id=line_id, source="modbus",
         )
         self._client_factory = client_factory
+        self._plan: list[list[SignalSpec]] | None = None
+        self._bad: set[str] = set()
 
     def _client(self):
         if self._client_factory is not None:
@@ -301,31 +316,91 @@ class ModbusCycleSource(CycleSource):
 
         return ModbusTcpClient(self.host, port=self.port, timeout=1.0, retries=1)
 
-    def _read(self, client, spec: SignalSpec) -> float:
-        count = 1 if spec.data_type in ("int16", "uint16") else 2
-        reader = client.read_input_registers if spec.register_type == "input" else client.read_holding_registers
+    def _blocks(self, specs: list[SignalSpec]) -> list[list[SignalSpec]]:
+        """Signals close together in memory are read in one request."""
+        blocks: list[list[SignalSpec]] = []
+        for spec in sorted(specs, key=lambda s: (s.register_type, s.address)):
+            last = blocks[-1] if blocks else None
+            if (last is not None and last[0].register_type == spec.register_type
+                    and spec.address - _end(last) <= MAX_BLOCK_GAP
+                    and max(_end(last), spec.address + _words(spec)) - last[0].address <= MAX_BLOCK_WORDS):
+                last.append(spec)
+            else:
+                blocks.append([spec])
+        return blocks
+
+    def _request(self, client, block: list[SignalSpec]) -> list[int] | None:
+        """Registers of one block; None when the machine refuses them (a lost connection raises)."""
+        count = _end(block) - block[0].address
+        reader = client.read_input_registers if block[0].register_type == "input" else client.read_holding_registers
         try:
-            response = reader(spec.address, count=count, device_id=self.unit_id)
+            response = reader(block[0].address, count=count, device_id=self.unit_id)
         except TypeError:  # pymodbus < 3.10
-            response = reader(spec.address, count=count, slave=self.unit_id)
-        if response is None or (hasattr(response, "isError") and response.isError()):
-            raise IOError(f"Modbus read failed for {spec.name} @ {spec.address}: {response}")
-        return _decode_registers(list(response.registers), spec)
+            response = reader(block[0].address, count=count, slave=self.unit_id)
+        if response is None:
+            raise IOError(f"Modbus read of {block[0].address} got no reply")
+        if hasattr(response, "isError") and response.isError():
+            if hasattr(response, "exception_code"):     # the machine answered: this address is refused
+                return None
+            raise IOError(f"Modbus read of {block[0].address} failed: {response}")
+        registers = list(response.registers)
+        return registers if len(registers) >= count else None
+
+    def read_all(self, client) -> dict[str, float | None]:
+        """Every signal, in as few requests as possible. One the machine refuses is None, not a lost sample."""
+        if self._plan is None:
+            self._plan = self._blocks([*self.signals, *self.setpoints, self.counter])
+        values: dict[str, float | None] = {}
+        plan: list[list[SignalSpec]] = []
+        for block in self._plan:
+            registers = self._request(client, block)
+            if registers is None and len(block) > 1:
+                # Something in this range cannot be read together: from now on, singly.
+                logger.warning("[Modbus] Registers %d to %d cannot be read in one request; reading them singly.",
+                               block[0].address, _end(block) - 1)
+                for spec in block:
+                    one = self._request(client, [spec])
+                    values[spec.name] = self._value(one, spec)
+                    plan.append([spec])
+                continue
+            plan.append(block)
+            for spec in block:
+                offset = spec.address - block[0].address
+                values[spec.name] = self._value(None if registers is None else registers[offset:], spec)
+        self._plan = plan
+        return values
+
+    def _value(self, words: list[int] | None, spec: SignalSpec) -> float | None:
+        value = None if words is None else _decode_registers(words, spec)
+        value = value if value is not None and np.isfinite(value) else None
+        if value is None and spec.name not in self._bad:
+            logger.error("[Modbus] %s (register %s) has no valid value.", spec.name, spec.address)
+            self._bad.add(spec.name)
+        elif value is not None and spec.name in self._bad:
+            logger.info("[Modbus] %s is back.", spec.name)
+            self._bad.discard(spec.name)
+        return value
 
     def _run(self) -> None:
         client = self._client()
         if not client.connect():
             raise ConnectionError(f"Cannot connect to Modbus server {self.host}:{self.port}")
         logger.info("[Modbus] Connected to %s:%s (unit %s)", self.host, self.port, self.unit_id)
+        slow_at = float("-inf")
         try:
             while not self._stop.is_set():
                 tick = time.monotonic()
-                values = {s.name: self._read(client, s) for s in self.signals + self.setpoints}
-                counter = int(self._read(client, self.counter))
-                cycle = self.assembler.feed(station_time(), values, counter)
+                values = self.read_all(client)
+                counter = values.pop(self.counter.name)
+                cycle = self.assembler.feed(station_time(), values, None if counter is None else int(counter))
                 if cycle is not None:
                     self._emit(cycle)
-                self._stop.wait(max(0.0, self.poll_interval - (time.monotonic() - tick)))
+                took = time.monotonic() - tick
+                if took > 1.5 * self.poll_interval and tick - slow_at > 60.0:
+                    slow_at = tick
+                    logger.warning("[Modbus] One sample takes %.0f ms; %.0f ms was asked for (poll_hz).",
+                                   1000 * took, 1000 * self.poll_interval)
+                self._stop.wait(max(0.0, self.poll_interval - took))
         finally:
             client.close()
 
@@ -345,9 +420,25 @@ class OpcUaCycleSource(CycleSource):
         line_id: str | None = None,
         username: str | None = None,
         password: str | None = None,
+        security_policy: str | None = None,
+        security_mode: str = "SignAndEncrypt",
+        certificate: str | None = None,
+        private_key: str | None = None,
+        server_certificate: str | None = None,
+        allow_insecure_login: bool = False,
     ):
         super().__init__()
         self.endpoint = endpoint
+        self.security = None
+        if security_policy:
+            if not (certificate and private_key):
+                raise ValueError("OPC UA security_policy needs certificate and private_key")
+            self.security = ",".join(filter(None, [security_policy, security_mode, certificate, private_key,
+                                                   server_certificate]))
+        elif username and not allow_insecure_login:
+            raise ValueError("OPC UA login without security_policy would send the password unprotected; set "
+                             "security_policy, or allow_insecure_login: true on a closed machine network")
+        self._bad: set[str] = set()
         self.signals = signals
         self.counter = counter
         self.setpoints = list(setpoints or [])
@@ -358,6 +449,25 @@ class OpcUaCycleSource(CycleSource):
             nominal_sample_rate_hz=poll_hz, line_id=line_id, source="opcua",
         )
 
+    def _value(self, data, spec: SignalSpec) -> float | None:
+        """None for a value the server itself does not vouch for (bad quality) or that is not a number."""
+        value = None
+        status = getattr(data, "StatusCode", None)
+        if status is None or status.is_good():
+            try:
+                value = float(data.Value.Value) * spec.scale + spec.offset
+            except (TypeError, ValueError, AttributeError):
+                value = None
+        if value is not None and not np.isfinite(value):
+            value = None
+        if value is None and spec.name not in self._bad:
+            logger.error("[OPC UA] %s (%s) has no valid value: %s", spec.name, spec.node_id, status)
+            self._bad.add(spec.name)
+        elif value is not None and spec.name in self._bad:
+            logger.info("[OPC UA] %s is back.", spec.name)
+            self._bad.discard(spec.name)
+        return value
+
     def _run(self) -> None:
         asyncio.run(self._run_async())
 
@@ -365,6 +475,8 @@ class OpcUaCycleSource(CycleSource):
         from asyncua import Client
 
         client = Client(url=self.endpoint, timeout=4)
+        if self.security:
+            await client.set_security_string(self.security)
         if self.username:
             client.set_user(self.username)
             client.set_password(self.password or "")
@@ -374,10 +486,10 @@ class OpcUaCycleSource(CycleSource):
             nodes = [client.get_node(s.node_id) for s in specs]
             while not self._stop.is_set():
                 tick = time.monotonic()
-                raw = await client.read_values(nodes)
-                values = {s.name: float(v) * s.scale + s.offset for s, v in zip(specs, raw)}
-                counter = int(values.pop(self.counter.name))
-                cycle = self.assembler.feed(station_time(), values, counter)
+                data = await client.read_attributes(nodes)
+                values = {s.name: self._value(d, s) for s, d in zip(specs, data)}
+                counter = values.pop(self.counter.name)
+                cycle = self.assembler.feed(station_time(), values, None if counter is None else int(counter))
                 if cycle is not None:
                     self._emit(cycle)
                 await asyncio.sleep(max(0.0, self.poll_interval - (time.monotonic() - tick)))
@@ -424,6 +536,11 @@ def build_cycle_source(process_cfg: dict[str, Any]) -> CycleSource:
     if kind == "opcua":
         return OpcUaCycleSource(
             str(conn["endpoint"]), signals=signals, counter=counter, setpoints=setpoints, poll_hz=poll_hz,
-            machine_id=machine_id, line_id=line_id, username=conn.get("username"), password=conn.get("password"),
+            machine_id=machine_id, line_id=line_id, username=conn.get("username"),
+            password=os.environ.get(str(conn["password_env"])) if conn.get("password_env") else conn.get("password"),
+            security_policy=conn.get("security_policy"), security_mode=str(conn.get("security_mode", "SignAndEncrypt")),
+            certificate=conn.get("certificate"), private_key=conn.get("private_key"),
+            server_certificate=conn.get("server_certificate"),
+            allow_insecure_login=bool(conn.get("allow_insecure_login", False)),
         )
     raise ValueError(f"Unknown process.source '{kind}' (expected simulated | modbus | opcua)")

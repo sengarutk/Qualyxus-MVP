@@ -24,11 +24,25 @@ def _finite(value: float) -> float:
     return value if math.isfinite(value) else 0.0
 
 
-def curve_statistics(values: np.ndarray, sample_rate_hz: float) -> dict[str, float]:
+MIN_VALID = 0.5
+
+
+def filled(values: np.ndarray) -> np.ndarray | None:
+    """The curve with missing samples bridged; None when too much of it is missing."""
     arr = np.asarray(values, dtype=np.float64)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return {stat: 0.0 for stat in CURVE_STATS}
+    good = np.isfinite(arr)
+    if not arr.size or good.mean() < MIN_VALID:
+        return None
+    if not good.all():
+        x = np.arange(arr.size)
+        arr = np.interp(x, x[good], arr[good])
+    return arr
+
+
+def curve_statistics(values: np.ndarray, sample_rate_hz: float) -> dict[str, float]:
+    arr = filled(values)
+    if arr is None:
+        return {}       # no signal, no features: zeros would look like a real and terrible cycle
     dt = 1.0 / max(sample_rate_hz, 1e-6)
     peak_idx = int(np.argmax(arr))
     slope = np.diff(arr) / dt if arr.size > 1 else np.zeros(1)
@@ -92,7 +106,8 @@ class GoldenCycleReference:
 
     def deviation(self, name: str, values: np.ndarray) -> dict[str, float]:
         golden = self.curves.get(name)
-        if golden is None:
+        values = filled(values)
+        if golden is None or values is None:
             return {}
         diff = resample(values) - golden
         scale = self.scale.get(name, 1.0)

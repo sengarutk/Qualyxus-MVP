@@ -22,8 +22,10 @@ try:
 except ImportError:
     _psutil = None
 
+from src.camera.trigger import PartTrigger, TriggerSource
 from src.camera.view_store import ViewStore
 from src.process.models import NOT_INSPECTED, InspectionRecord
+from src.camera.presence import PresenceDetector, is_part_present
 from src.camera.part_inspection import CompletedPart, PartPresenceTracker, PartVerdictFuser, part_pose
 from src.config.schema import check_real_plc, required_views
 from src.inference.anomaly.image_quality import image_fault
@@ -47,7 +49,11 @@ logger = logging.getLogger(__name__)
 
 _TRUTHY = {"1", "true", "yes"}
 _SHEDDING_STATES = (SystemState.CRITICAL, SystemState.EMERGENCY)
-_POOL_SLOTS = 128
+FRAME_POOL_BYTES = 192 * 1024 * 1024
+# Whole frames waiting to be inspected; beyond this, parts are reported as not inspected at once.
+BACKLOG_BYTES = 1024 * 1024 * 1024
+INSPECT_BATCH = 8
+EVIDENCE_PENDING = 8
 
 
 def _env_flag(name: str) -> bool:
@@ -84,29 +90,9 @@ class FrameSlot:
         self.frame = np.ascontiguousarray(np.zeros((h, w, 3), dtype=np.uint8))
 
 
-def is_part_present(frame: np.ndarray, std_dev_threshold: float = 2.2) -> bool:
-    """
-    Adaptive multi-angle part presence check.
-    Supports low-contrast side profiles (cam_3) via dual std_dev + Laplacian variance checks.
-    Returns True if std_dev >= 2.2 OR Laplacian edge variance >= 6.0,
-    or if QUALYXUS_SAVE_BLANK_FRAMES=1 override environment flag is enabled.
-    """
-    if os.getenv("QUALYXUS_SAVE_BLANK_FRAMES", "0").strip().lower() in {"1", "true", "yes"}:
-        return True
-    if frame is None or frame.size == 0:
-        return False
-    if len(frame.shape) == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.shape[2] == 3 else frame[:, :, 0]
-    else:
-        gray = frame
-    # Denoise first: the Laplacian amplifies per-pixel sensor noise, which otherwise makes an
-    # empty, noisy background look like a textured part.
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    std_dev = float(np.std(gray))
-    if std_dev >= std_dev_threshold:
-        return True
-    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    return lap_var >= 6.0
+def pool_slots(height: int, width: int) -> int:
+    """Frames a camera keeps: a memory budget, not a count, so 12 MP costs what VGA does."""
+    return int(np.clip(FRAME_POOL_BYTES // (height * width * 3), 4, 32))
 
 
 class CameraSyncManager:
@@ -291,6 +277,7 @@ class CameraManager:
 
         manager_cfg = self.raw_config.get("camera_manager", {}) or {}
         self.monitor_interval = float(manager_cfg.get("monitor_interval", 2.0))
+        self.stream_timeout_s = float(manager_cfg.get("stream_timeout_s", 5.0))
         self.restart_backoff = float(manager_cfg.get("restart_backoff", 1.5))
         self.geometry_ok_log_interval = float(manager_cfg.get("geometry_ok_log_interval_sec", 1.0))
         self.status_path = Path(
@@ -386,7 +373,27 @@ class CameraManager:
         # process model), judged by the good-parts-only anomaly detector.
         inspection_cfg = self.raw_config.get("inspection", {}) or {}
         self.inspection_enabled = bool(inspection_cfg.get("enabled", True))
-        self.presence_std_threshold = float(inspection_cfg.get("presence_std_threshold", 2.2))
+        self.presence: dict[str, PresenceDetector] = {
+            str(c.get("id")): PresenceDetector.from_config({**(inspection_cfg.get("presence") or {}), **(c.get("presence") or {})})
+            for c in (self.raw_config.get("cameras") or []) if c.get("enabled", True)}
+        self._pending_parts: collections.deque = collections.deque()
+        self._backlog_bytes = 0
+        self._backlog_lock = threading.Lock()
+        self.evidence_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="evidence-writer")
+        self._evidence_pending = 0
+        self._model_views = {str(c.get("id")): str(c["model_view"]) for c in (self.raw_config.get("cameras") or [])
+                             if c.get("model_view")}
+        trigger_cfg = inspection_cfg.get("trigger") or {}
+        self.trigger: PartTrigger | None = None
+        self.trigger_source: TriggerSource | None = None
+        if trigger_cfg.get("enabled"):
+            cameras = [str(c["id"]) for c in (self.raw_config.get("cameras") or []) if c.get("enabled", True)]
+            self.trigger = PartTrigger(cameras, frames=int(trigger_cfg.get("frames", 3)),
+                                       delay_s=float(trigger_cfg.get("delay_s", 0.05)),
+                                       timeout_s=float(inspection_cfg.get("view_timeout_s", 5.0)))
+            self.trigger_source = TriggerSource(self.telemetry.adapter.config, self._on_trigger,
+                                                poll_s=float(trigger_cfg.get("poll_s", 0.02)))
+        self._trigger_numbers: collections.OrderedDict[str, int] = collections.OrderedDict()
         self._presence_on_frames = int(inspection_cfg.get("on_frames", 2))
         self._presence_off_frames = int(inspection_cfg.get("off_frames", 2))
         self.part_trackers: dict[str, PartPresenceTracker] = {}
@@ -425,7 +432,12 @@ class CameraManager:
         self.camera_recipes = {str(c.get("id")): c.get("recipe") for c in (self.raw_config.get("cameras") or [])
                                if c.get("id") is not None and c.get("recipe")}
         self.recipe_from_scalar = inspection_cfg.get("recipe_from_scalar")
-        self.stack_provider.get()  # load the default recipe's models at start-up, not on the first part
+        recipes = {self._model_recipe(str(c["id"]), self.camera_recipes.get(str(c["id"])) or self.stack_provider.default_recipe)
+                   for c in (self.raw_config.get("cameras") or []) if c.get("enabled", True) and c.get("id") is not None}
+        # Never fewer than the station needs at once, or every part would reload the models.
+        self.stack_provider.max_cached = max(self.stack_provider.max_cached, 2 * len(recipes))
+        for recipe in sorted(recipes) or [self.stack_provider.default_recipe]:
+            self.stack_provider.get(recipe)  # at start-up, not on the first part
         self._health_cfg = inspection_cfg.get("health", {}) or {}
         self.model_health: dict[Any, Any] = {}
         self.retrain_on_drift = bool(self._health_cfg.get("request_retrain", True))
@@ -435,7 +447,8 @@ class CameraManager:
             from src.inference.anomaly.monitoring import ReviewQueue
 
             self.review_queue = ReviewQueue(review_cfg.get("dir", "data/review"),
-                                            band=tuple(review_cfg.get("band", (0.8, 1.25))))
+                                            band=tuple(review_cfg.get("band", (0.8, 1.25))),
+                                            max_gb=float(review_cfg.get("max_gb", 5.0)))
         audit_cfg = inspection_cfg.get("audit", {}) or {}
         self.audit_log = None
         if audit_cfg.get("enabled", True):
@@ -525,6 +538,11 @@ class CameraManager:
             return UNKNOWN_RECIPE
         return self.camera_recipes.get(camera_id) or self.stack_provider.default_recipe
 
+    def _model_recipe(self, camera_id: str, product: str) -> str:
+        """Each face of a part looks different, so a camera with ``model_view`` has its own model."""
+        view = getattr(self, "_model_views", {}).get(camera_id)
+        return f"{product}-{view}" if view else product
+
     def _good_pool(self, recipe: str):
         if not self._pool_cfg.get("enabled", True):
             return None
@@ -537,7 +555,8 @@ class CameraManager:
                 every_n=int(self._pool_cfg.get("every_n", 5)), max_items=int(self._pool_cfg.get("max_items", 3000)),
                 max_score=self._pool_cfg.get("max_score", 0.8),
                 calibration_every_n=int(self._pool_cfg.get("calibration_every_n", 20)),
-                calibration_max_items=int(self._pool_cfg.get("calibration_max_items", 2000))))
+                calibration_max_items=int(self._pool_cfg.get("calibration_max_items", 2000)),
+                max_gb=float(self._pool_cfg.get("max_gb", 5.0))))
         return pool
 
     def attach_process_service(self, service) -> None:
@@ -754,6 +773,8 @@ class CameraManager:
 
         for cam in self._camera_entries():
             self._start_camera_worker(cam)
+        if self.trigger_source is not None:
+            self.trigger_source.start()
 
         self._monitor_thread = threading.Thread(target=self._monitor_loop, name="camera-monitor", daemon=True)
         self._monitor_thread.start()
@@ -799,14 +820,26 @@ class CameraManager:
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.vlm_executor.shutdown(wait=True, cancel_futures=True)
         self.plc_executor.shutdown(wait=True)
+        if getattr(self, "evidence_executor", None) is not None:
+            self.evidence_executor.shutdown(wait=True)
         self.runtime_metrics.stop()
         self.disk_monitor.stop()
 
     def _finish_inspections(self, states: list[CameraWorkerState]) -> None:
+        trigger = getattr(self, "trigger", None)
+        if trigger is not None:
+            self.trigger_source.stop()
+            by_camera = {s.camera_id: s for s in states}
+            for camera_id, key, ts in trigger.expire(float("inf")):
+                if camera_id in by_camera:
+                    by_camera[camera_id].parts_not_inspected += 1
+                    self._report_view(by_camera[camera_id], self._part_key(camera_id, ts, key)[2], PLC_FLAG_NOT_INSPECTED)
         self.inspection_executor.shutdown(wait=True)
+        while getattr(self, "_pending_parts", None):
+            self._inspect_pending()
         for state in states:
             tracker = self.part_trackers.get(state.camera_id)
-            if tracker is not None and tracker.part_in_view:   # stopped in the middle of a part
+            if trigger is None and tracker is not None and tracker.part_in_view:   # stopped in the middle of a part
                 state.parts_not_inspected += 1
                 self._report_view(state, self._part_key(state.camera_id, station_time())[2], PLC_FLAG_NOT_INSPECTED)
         for verdict in self.part_fuser.expired(float("inf")):  # their other views will never come
@@ -870,7 +903,14 @@ class CameraManager:
     # ------------------------------------------------------------------
 
     def _open_camera(self, source: Any, width: int = 640, height: int = 480, fps: float = 30.0):
-        cap = cv2.VideoCapture(source)
+        network = isinstance(source, str) and "://" in source
+        if network:
+            # Without these a stream that stops answering holds the thread for ever.
+            timeout_ms = int(1000 * self.stream_timeout_s)
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms,
+                                                           cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms])
+        else:
+            cap = cv2.VideoCapture(source)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             cap.set(cv2.CAP_PROP_FPS, fps)
@@ -933,7 +973,7 @@ class CameraManager:
         sync_mgr.register_channel(state.camera_id)
 
         # Pre-allocate the mutable ring buffer managed within CameraWorkerState
-        state.pool = [FrameSlot(height, width) for _ in range(_POOL_SLOTS)]
+        state.pool = [FrameSlot(height, width) for _ in range(pool_slots(height, width))]
         state.pool_write_index = 0
 
         cap = None
@@ -961,7 +1001,7 @@ class CameraManager:
                     synthetic_fail_after = camera_cfg.get("synthetic_fail_after_frames")
                     if synthetic_fail_after is not None and state.restarts == 0 and frame_id >= int(synthetic_fail_after):
                         raise RuntimeError("Synthetic capture failure injected")
-                    slot = state.pool[state.pool_write_index % _POOL_SLOTS]
+                    slot = state.pool[state.pool_write_index % len(state.pool)]
                     part_feed = self._part_feeds.get(state.camera_id)
                     if part_feed is not None:
                         rendered, _ = part_feed.render(station_time(), width, height)
@@ -1019,7 +1059,7 @@ class CameraManager:
 
                     frame = None
                     if grabbed:
-                        slot = state.pool[state.pool_write_index % _POOL_SLOTS]
+                        slot = state.pool[state.pool_write_index % len(state.pool)]
                         ret, decoded_img = cap.retrieve(image=slot.frame)
                         if ret and decoded_img is not None:
                             if decoded_img is not slot.frame:
@@ -1031,7 +1071,7 @@ class CameraManager:
                                     state.camera_id, w, h, width, height,
                                 )
                                 width, height = w, h
-                                state.pool = [FrameSlot(h, w) for _ in range(_POOL_SLOTS)]
+                                state.pool = [FrameSlot(h, w) for _ in range(pool_slots(h, w))]
                                 state.pool_write_index = 0
                                 slot = state.pool[0]
                                 np.copyto(slot.frame, decoded_img)
@@ -1304,44 +1344,135 @@ class CameraManager:
             tracker = self.part_trackers.setdefault(state.camera_id, PartPresenceTracker(
                 state.camera_id, on_frames=self._presence_on_frames, off_frames=self._presence_off_frames,
             ))
-        present = is_part_present(frame, self.presence_std_threshold)
-        completed = tracker.update(frame, present, station_time(), frame_id, event_ids, defect_types)
+        if self.trigger is not None:
+            completed = self.trigger.frame(state.camera_id, frame, frame_id, station_time(), event_ids, defect_types)
+        else:
+            present = self._presence_of(state.camera_id)(frame)
+            completed = tracker.update(frame, present, station_time(), frame_id, event_ids, defect_types)
         state.last_infer_ts = time.perf_counter()   # this frame made it through the part pipeline
         if completed is not None:
-            if not self._inspection_slots.acquire(blocking=False):
-                logger.error("[%s] Inspection backlog full: part recorded as not inspected.", state.camera_id)
-                state.parts_not_inspected += 1
-                self._view_faults[state.camera_id] = True
-                self._report_view(state, None, PLC_FLAG_NOT_INSPECTED)
-                return
-            try:
-                self.inspection_executor.submit(self._inspect_queued, state, completed)
-            except RuntimeError:  # shutting down
+            self._queue_inspection(state, completed)
+
+    def _presence_of(self, camera_id: str) -> PresenceDetector:
+        detector = self.presence.get(camera_id)
+        return detector if detector is not None else self.presence.setdefault(camera_id, PresenceDetector())
+
+    def _queue_inspection(self, state: CameraWorkerState, part: CompletedPart) -> None:
+        size = part.best_frame.nbytes
+        with self._backlog_lock:
+            fits = not self._backlog_bytes or self._backlog_bytes + size <= BACKLOG_BYTES
+        if not fits or not self._inspection_slots.acquire(blocking=False):
+            logger.error("[%s] Inspection backlog full: part recorded as not inspected.", state.camera_id)
+            state.parts_not_inspected += 1
+            self._view_faults[state.camera_id] = True
+            self._report_view(state, part.trigger_key, PLC_FLAG_NOT_INSPECTED)
+            return
+        with self._backlog_lock:
+            self._backlog_bytes += size
+            self._pending_parts.append((state, part))
+        try:
+            self.inspection_executor.submit(self._inspect_pending)
+        except RuntimeError:  # shutting down
+            with self._backlog_lock:
+                queued = (state, part) in self._pending_parts
+                if queued:
+                    self._pending_parts.remove((state, part))
+                    self._backlog_bytes -= size
+            if queued:
                 self._inspection_slots.release()
                 state.parts_not_inspected += 1
-                self._report_view(state, self._part_key(state.camera_id, completed.ts)[2], PLC_FLAG_NOT_INSPECTED)
+                self._report_view(state, self._part_key(state.camera_id, part.ts, part.trigger_key)[2],
+                                  PLC_FLAG_NOT_INSPECTED)
 
-    def _part_key(self, camera_id: str, ts: float):
-        """(process service if this camera is linked, alignment, key of the physical part)."""
+    def _inspect_pending(self) -> None:
+        """Inspect what is waiting: views already queued go through the model together.
+
+        Nothing is held back to fill a batch, and a camera appears at most once in one, because
+        linking its next part needs this one's record.
+        """
+        batch: list[tuple[CameraWorkerState, CompletedPart]] = []
+        with self._backlog_lock:
+            cameras: set[str] = set()
+            while self._pending_parts and len(batch) < INSPECT_BATCH:
+                if self._pending_parts[0][0].camera_id in cameras:
+                    break
+                batch.append(self._pending_parts.popleft())
+                cameras.add(batch[-1][0].camera_id)
+        if not batch:
+            return
+        prepared = self._judge_together(batch) if len(batch) > 1 else {}
+        for i, (state, part) in enumerate(batch):
+            try:
+                self._inspect_queued(state, part, *([prepared[i]] if i in prepared else []))
+            except Exception as e:      # one view must not cost the others in the batch
+                logger.error("[%s] Part inspection failed: %s", state.camera_id, e, exc_info=True)
+            finally:
+                with self._backlog_lock:
+                    self._backlog_bytes -= part.best_frame.nbytes
+        with self._backlog_lock:    # a camera that came up twice in this batch is still waiting
+            waiting = bool(self._pending_parts)
+        if waiting:
+            try:
+                self.inspection_executor.submit(self._inspect_pending)
+            except RuntimeError:
+                self._inspect_pending()
+
+    def _judge_together(self, batch) -> dict[int, Any]:
+        """Anomaly results of several views in one pass; any problem leaves them to be judged singly."""
+        from src.inference.anomaly.base import predict_many
+
+        self._inspecting_since = time.monotonic()
+        try:
+            jobs, index = [], []
+            for i, (state, part) in enumerate(batch):
+                if self.recipe_from_scalar:      # the product is known only once the part is linked
+                    return {}
+                recipe = self._model_recipe(state.camera_id, self._recipe_for(state.camera_id, None))
+                stack, _ = self.stack_provider.get(recipe)
+                detector = None if stack.empty else stack.anomaly
+                if detector is None:
+                    continue
+                if image_fault(part.best_frame, (detector.calibration or {}).get("image_quality")):
+                    continue
+                jobs.append((detector, part.best_frame))
+                index.append((i, detector))
+            if len(jobs) < 2:
+                return {}
+            return {i: (detector, result) for (i, detector), result in zip(index, predict_many(jobs))}
+        except Exception as e:
+            logger.error("[Inspection] Views could not be judged together: %s", e, exc_info=True)
+            return {}
+
+    def _part_key(self, camera_id: str, ts: float, trigger_key: str | None = None):
+        """(process service if this camera is linked, alignment, key of the physical part).
+
+        A trigger proves which views are the same part, so it stands in where no cycle is known.
+        """
+        service, alignment, key = self._cycle_key(camera_id, ts)
+        if trigger_key is not None and key is not None and "#" not in key:
+            self._trigger_numbers[key] = self._trigger_numbers.get(trigger_key, 0)
+        return service, alignment, key or trigger_key
+
+    def _cycle_key(self, camera_id: str, ts: float):
         service = self.process_service
         link = service.aligner.link_for(camera_id) if service is not None else None
         if link is None:
             return None, None, None   # camera not linked to a machine: no process label to record
-        alignment = service.aligner.align(camera_id, ts)
+        alignment = service.aligner.align_view(camera_id, ts)
         key = alignment.cycle_id if alignment else None
         if key is not None and link.parts_per_cycle > 1:
             key = f"{key}#{alignment.cavity}"   # each cavity is its own part
         return service, alignment, key
 
-    def _inspect_queued(self, state: CameraWorkerState, part: CompletedPart) -> None:
+    def _inspect_queued(self, state: CameraWorkerState, part: CompletedPart, *judged) -> None:
         self._inspecting_since = time.monotonic()
         try:
-            self._inspect_part(state, part)
+            self._inspect_part(state, part, *judged)
         finally:
             self._inspecting_since = None
             self._inspection_slots.release()
 
-    def _inspect_part(self, state: CameraWorkerState, part: CompletedPart) -> None:
+    def _inspect_part(self, state: CameraWorkerState, part: CompletedPart, batched=None) -> None:
         """Final verdict for one physical part, recorded against its producing cycle.
 
         Decision stack (per recipe): good-parts-only anomaly model (catches anything unusual)
@@ -1353,9 +1484,9 @@ class CameraManager:
         reported = False
         try:
             frame = part.best_frame
-            service, alignment, part_key = self._part_key(state.camera_id, part.ts)
+            service, alignment, part_key = self._part_key(state.camera_id, part.ts, part.trigger_key)
             cycle_id = alignment.cycle_id if alignment else None
-            recipe = self._recipe_for(state.camera_id, cycle_id)
+            recipe = self._model_recipe(state.camera_id, self._recipe_for(state.camera_id, cycle_id))
             stack, shadow = self.stack_provider.get(recipe)
 
             baseline = (getattr(stack.anomaly, "calibration", None) or {}).get("image_quality")
@@ -1363,7 +1494,9 @@ class CameraManager:
             if fault:
                 judged = PartJudgement(False, None, None, None)
             else:
-                judged = stack.judge(frame, frame_defect_types=list(part.defect_types or []))
+                # A batched result counts only for the very model that judges this part now.
+                ready = ({"anomaly": batched[1]} if batched is not None and batched[0] is stack.anomaly else {})
+                judged = stack.judge(frame, frame_defect_types=list(part.defect_types or []), **ready)
             failed = judged.failed or bool(part.defect_event_ids)
             anomaly, top = judged.anomaly, judged.top
             defect_type, bbox, confidence = judged.defect_type, judged.bbox, judged.confidence
@@ -1430,32 +1563,8 @@ class CameraManager:
                     logger.warning("[%s] Shadow model failed on a part: %s", state.camera_id, e)
 
             self._update_model_health(state.camera_id, recipe, stack, normalized, failed)
-            pool = self._good_pool(recipe)
-            # An unbiased sample of parts, whatever they scored, so a retrained model's threshold is
-            # not calibrated on easy parts only. One the pool cannot vouch for needs a person.
-            sampled = False
-            if pool is not None and not not_inspected and not part.defect_event_ids:
-                try:
-                    sampled = pool.sample(frame, verdict=verdict, normalized_score=normalized,
-                                          camera_id=state.camera_id, image_sha=image_sha) == "needs_review"
-                except OSError as e:   # a full disk must not cost the audit record below
-                    logger.error("[%s] Calibration sample not stored: %s", state.camera_id, e)
-            if self.review_queue is not None and (sampled or self.review_queue.should_review(normalized)):
-                self.review_queue.add(
-                    state.camera_id, frame, normalized_score=normalized, verdict=verdict,
-                    cycle_id=cycle_id, event_id=event_id,
-                    overlay=(stack.anomaly.heatmap_overlay(frame, anomaly, stack.anomaly.threshold)
-                             if anomaly is not None else None),
-                    bbox=bbox if failed else (anomaly.bbox if anomaly is not None else None),
-                    predicted_type=defect_type, image_sha=image_sha, recipe=recipe,
-                )
-            elif verdict == "pass":
-                if pool is not None:
-                    try:
-                        pool.offer(frame, verdict=verdict, normalized_score=normalized, camera_id=state.camera_id,
-                                   image_sha=image_sha)
-                    except OSError as e:
-                        logger.error("[%s] Good-pool image not stored: %s", state.camera_id, e)
+            self._in_background(lambda: self._keep_images(
+                state, part, frame, recipe, stack, judged, verdict, not_inspected, cycle_id, event_id, image_sha))
 
             if self.audit_log is not None:
                 self.audit_log.append({
@@ -1494,6 +1603,67 @@ class CameraManager:
                 state.parts_not_inspected += 1
                 self._view_faults[state.camera_id] = True
                 self._report_view(state, part_key, PLC_FLAG_NOT_INSPECTED)
+
+    def _in_background(self, job) -> None:
+        """Write images off the inspection thread; when the disk falls behind, they are skipped."""
+        executor = getattr(self, "evidence_executor", None)
+        if executor is None:
+            try:
+                job()
+            except Exception as e:
+                logger.error("[Inspection] Images not kept: %s", e, exc_info=True)
+            return
+        with self._backlog_lock:
+            if self._evidence_pending >= EVIDENCE_PENDING:
+                logger.warning("[Inspection] Review and training images skipped: the disk is too slow.")
+                return
+            self._evidence_pending += 1
+
+        def run():
+            try:
+                job()
+            except Exception as e:
+                logger.error("[Inspection] Images not kept: %s", e, exc_info=True)
+            finally:
+                with self._backlog_lock:
+                    self._evidence_pending -= 1
+        try:
+            executor.submit(run)
+        except RuntimeError:    # shutting down
+            run()
+
+    def _keep_images(self, state, part, frame, recipe, stack, judged, verdict, not_inspected, cycle_id, event_id,
+                     image_sha) -> None:
+        """Training, calibration and review images of one judged part, while the disk has room."""
+        monitor = getattr(self, "disk_monitor", None)
+        if monitor is not None and not monitor.allow_defect_save():
+            return
+        anomaly, normalized, failed = judged.anomaly, judged.normalized_score, verdict == "fail"
+        pool = self._good_pool(recipe)
+        # An unbiased sample of parts, whatever they scored, so a retrained model's threshold is
+        # not calibrated on easy parts only. One the pool cannot vouch for needs a person.
+        sampled = False
+        if pool is not None and not not_inspected and not part.defect_event_ids:
+            try:
+                sampled = pool.sample(frame, verdict=verdict, normalized_score=normalized,
+                                      camera_id=state.camera_id, image_sha=image_sha) == "needs_review"
+            except OSError as e:
+                logger.error("[%s] Calibration sample not stored: %s", state.camera_id, e)
+        if self.review_queue is not None and (sampled or self.review_queue.should_review(normalized)):
+            self.review_queue.add(
+                state.camera_id, frame, normalized_score=normalized, verdict=verdict,
+                cycle_id=cycle_id, event_id=event_id,
+                overlay=(stack.anomaly.heatmap_overlay(frame, anomaly, stack.anomaly.threshold)
+                         if anomaly is not None else None),
+                bbox=judged.bbox if failed else (anomaly.bbox if anomaly is not None else None),
+                predicted_type=judged.defect_type, image_sha=image_sha, recipe=recipe,
+            )
+        elif verdict == "pass" and pool is not None:
+            try:
+                pool.offer(frame, verdict=verdict, normalized_score=normalized, camera_id=state.camera_id,
+                           image_sha=image_sha)
+            except OSError as e:
+                logger.error("[%s] Good-pool image not stored: %s", state.camera_id, e)
 
     def _save_view(self, camera_id: str, part_key: str | None, frame: np.ndarray, stack, anomaly) -> None:
         store = getattr(self, "view_store", None)
@@ -1535,6 +1705,8 @@ class CameraManager:
         if not verdict.get("update"):
             self._inspection_faulted = verdict["verdict"] == "not_inspected" or bool(verdict["missing"])
         part, cavity = self._part_number(cycle_id)
+        if cycle_id in getattr(self, "_trigger_numbers", {}):
+            part = self._trigger_numbers[cycle_id] & 0xFFFF     # the PLC's own count of the part it triggered on
         signal = {**verdict, "type": "PART_VERDICT", "part": part, "cavity": cavity, "timestamp": time.time(),
                   "published_mono": time.monotonic()}
         if verdict["verdict"] != "pass" and verdict["missing"]:
@@ -1610,6 +1782,9 @@ class CameraManager:
             return f"a part has been in inspection for over {self.max_inspect_s:.0f} s"
         if now < self._delivery_fault_until:
             return "a part verdict did not reach the PLC"
+        source = getattr(self, "trigger_source", None)
+        if source is not None and not source.alive():
+            return "the PLC trigger cannot be read"
         silent = self._silent_views()
         return f"no frames from {silent}" if silent else None
 
@@ -1646,8 +1821,31 @@ class CameraManager:
             verdicts += unseen
         return verdicts
 
+    def _on_trigger(self, number: int, lost: int) -> None:
+        """The PLC says a part is in position (``lost``: triggers that came faster than they were read)."""
+        now = station_time()
+        for _ in range(lost):
+            self._publish_part_verdict({"cycle_id": None, "verdict": "not_inspected", "flag": PLC_FLAG_NOT_INSPECTED,
+                                        "views": {}, "missing": sorted(self.trigger.cameras)})
+        key = f"trigger-{number}-{int(now)}"    # the PLC's counter wraps; the key must not repeat
+        self._trigger_numbers[key] = number
+        while len(self._trigger_numbers) > 1024:
+            self._trigger_numbers.popitem(last=False)
+        self._report_missed(self.trigger.fire(key, now))
+
+    def _report_missed(self, missed) -> None:
+        for camera_id, key, ts in missed:
+            with self._lock:
+                state = self.workers.get(camera_id)
+            logger.error("[%s] No image for triggered part %s.", camera_id, key)
+            if state is not None:
+                state.parts_not_inspected += 1
+                self._report_view(state, self._part_key(camera_id, ts, key)[2], PLC_FLAG_NOT_INSPECTED)
+
     def _reflex_tick(self, adapter) -> None:
         """Close parts nobody finished, and keep the PLC heartbeat moving."""
+        if getattr(self, "trigger", None) is not None:
+            self._report_missed(self.trigger.expire(station_time()))
         now = time.monotonic()   # a clock correction must not stall the heartbeat or a part deadline
         for verdict in self.part_fuser.expired(now) + self._unseen_parts(station_time()):
             self._publish_part_verdict(verdict)

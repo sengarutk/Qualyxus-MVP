@@ -4,13 +4,20 @@
 #   CONFIG_PATH=config.360.yaml streamlit run src/dashboard/app.py
 extends: config.yaml
 
-# Calibrated so false rejects hold per part across all six views, not per camera:
-#   python -m src.inference.anomaly.train --synthetic 1200 --method patchcore --backbone dinov2_vits14 \
-#       --register --out models/anomaly/synthetic_parts_reg.pt
-#   python -m src.inference.anomaly.recalibrate --model models/anomaly/synthetic_parts_reg.pt \
-#       --synthetic 1500 --views 6 --out models/anomaly/synthetic_parts_6view_reg.pt
+# Every face looks different, so each has its own model (camera model_view + recipes below),
+# calibrated so false rejects hold per part across all six views. For face 0 to 5:
+#   python -m src.inference.anomaly.train --synthetic 300 --face 0 --register --backbone dinov2_vits14 --out models/anomaly/base_0.pt
+#   python -m src.inference.anomaly.recalibrate --model models/anomaly/base_0.pt --synthetic 720 --face 0 --views 6 \
+#       --out models/anomaly/face_top.pt
 inspection:
-  anomaly_model: "models/anomaly/synthetic_parts_6view_reg.pt"
+  anomaly_model: null
+  recipes:
+    default-top: {anomaly_model: "models/anomaly/face_top.pt"}
+    default-bottom: {anomaly_model: "models/anomaly/face_bottom.pt"}
+    default-front: {anomaly_model: "models/anomaly/face_front.pt"}
+    default-back: {anomaly_model: "models/anomaly/face_back.pt"}
+    default-left: {anomaly_model: "models/anomaly/face_left.pt"}
+    default-right: {anomaly_model: "models/anomaly/face_right.pt"}
 
 process:
   simulator:
@@ -36,9 +43,9 @@ x-view: &view
     tolerance_s: 2.0
 
 cameras:
-  - {<<: *view, id: "view_top", view_index: 0}
-  - {<<: *view, id: "view_bottom", view_index: 1}
-  - {<<: *view, id: "view_front", view_index: 2}
-  - {<<: *view, id: "view_back", view_index: 3}
-  - {<<: *view, id: "view_left", view_index: 4}
-  - {<<: *view, id: "view_right", view_index: 5}
+  - {<<: *view, id: "view_top", model_view: "top", view_index: 0}
+  - {<<: *view, id: "view_bottom", model_view: "bottom", view_index: 1}
+  - {<<: *view, id: "view_front", model_view: "front", view_index: 2}
+  - {<<: *view, id: "view_back", model_view: "back", view_index: 3}
+  - {<<: *view, id: "view_left", model_view: "left", view_index: 4}
+  - {<<: *view, id: "view_right", model_view: "right", view_index: 5}
