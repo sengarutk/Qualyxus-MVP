@@ -51,6 +51,15 @@ VIT_CHECKPOINTS: dict[str, tuple[str, str]] = {
     "dinov3_vitb16": ("facebook/dinov3-vitb16-pretrain-lvd1689m", "DINOv3-License"),
     "dinov3_vitl16": ("facebook/dinov3-vitl16-pretrain-lvd1689m", "DINOv3-License"),
 }
+# The exact files that were tested: a changed upload upstream must not change what judges parts.
+VIT_REVISIONS: dict[str, str] = {
+    "dinov2_vits14": "ed25f3a31f01632728cabb09d1542f84ab7b0056",
+    "dinov2_vitb14": "f9e44c814b77203eaa57a6bdbbd535f21ede1415",
+    "dinov2_vitl14": "47b73eefe95e8d44ec3623f8890bd894b6ea2d6c",
+    "dinov2reg_vits14": "0d9846e56b43a21fa46d7f3f5070f0506a5795a9",
+    "dinov2reg_vitb14": "a1d738ccfa7ae170945f210395d99dde8adb1805",
+    "dinov2reg_vitl14": "e4c89a4e05589de9b3e188688a303d0f3c04d0f3",
+}
 CNN_BACKBONES = ("wide_resnet50_2", "resnet18")
 
 
@@ -123,7 +132,7 @@ class ViTBackbone(torch.nn.Module):
         if (local / "config.json").exists():
             self.model = AutoModel.from_pretrained(local, local_files_only=True).eval()
         else:
-            self.model = AutoModel.from_pretrained(checkpoint).eval()
+            self.model = AutoModel.from_pretrained(checkpoint, revision=VIT_REVISIONS.get(name)).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
         cfg = self.model.config

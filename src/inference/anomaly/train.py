@@ -28,7 +28,6 @@ import cv2
 from src.inference.anomaly.backbones import CNN_BACKBONES, VIT_CHECKPOINTS
 from src.inference.anomaly.registry import CANDIDATES, create_candidate, create_detector
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("AnomalyTrainer")
 
 _EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}

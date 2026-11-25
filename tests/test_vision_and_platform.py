@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 
 import queue
 
-import base64
-import os
 
 import numpy as np
 import pytest
@@ -69,29 +66,6 @@ def test_patchcore_save_load_roundtrip(tmp_path, detector):
     loaded = PatchCoreDetector.load(path)
     img = render_part(320, 240, "flash", seed=5)
     assert loaded.predict(img).score == pytest.approx(detector.predict(img).score, rel=1e-2)
-
-
-def test_federated_payload_is_authenticated(tmp_path, monkeypatch):
-    import torch
-
-    from src.config.config import Config
-    from src.training.federated_client import FederatedClient
-    from src.training.federated_crypto import FederatedKeyError, generate_key
-    from src.training.federated_server import FederatedServer
-
-    monkeypatch.setenv("QUALYXUS_FEDERATED_KEY", generate_key())
-    model = torch.nn.Module()
-    model.head = torch.nn.Linear(3, 2)
-    client = FederatedClient(Config(raw={"paths": {"data_dir": str(tmp_path)}}), node_id="plant")
-    payload = client.export_secure_payload(model, "v1")
-    assert "head.weight" in FederatedServer().load_secure_payload(payload)
-    with pytest.raises(ValueError):
-        FederatedServer().load_secure_payload(dict(payload, node_id="evil"))
-    with pytest.raises(ValueError):
-        FederatedServer(key=base64.urlsafe_b64decode(generate_key())).load_secure_payload(payload)
-    monkeypatch.delenv("QUALYXUS_FEDERATED_KEY")
-    with pytest.raises(FederatedKeyError):
-        FederatedServer()
 
 
 def test_config_dataset_yaml_paths_agree_and_zero_holds_are_honoured(tmp_path):

@@ -12,7 +12,6 @@ import numpy as np
 from src.core.factory_manager import FactoryManager
 
 logger = logging.getLogger("QualyxusHistorian")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 class PredictiveHistorian:
     """
@@ -159,7 +158,7 @@ class PredictiveHistorian:
                     times = data[:, 0]
                     rmss = data[:, 1]
                     
-                    # Hardening Guard: Ensure variance exists in the timing array to protect against singular matrix crashes
+                    # Ensure variance exists in the timing array to protect against singular matrix crashes
                     if np.max(times) - np.min(times) > 1e-5:
                         # Normalize time values to days to prevent floating-point catastrophic cancellation faults
                         time_days = (times - times[0]) / 86400.0

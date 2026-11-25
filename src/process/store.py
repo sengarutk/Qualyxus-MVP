@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -155,7 +156,7 @@ class ProcessStore:
             try:
                 self._conn.close()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Ignored", exc_info=True)
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._lock:

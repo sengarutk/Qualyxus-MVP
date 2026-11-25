@@ -1,4 +1,7 @@
-.venv
+.venv*
+old_decks
+*.pptx
+*.pdf
 .git
 .idea
 

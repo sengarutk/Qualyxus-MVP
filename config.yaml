@@ -47,20 +47,19 @@ logging:
   retention_days: 730          # defect events
   tracking_retention_days: 30  # per-frame tracking and geometry rows
 
+# Optional uplink to the plant broker. The password comes from MQTT_PASSWORD, never from here.
 mqtt:
-  agentic_enabled: false
+  uplink_enabled: false
   host: "127.0.0.1"
-  port: 1883
-  keepalive: 60
-  qos: 1
-  retain: false
-  topic_root: "qualyxus/agentic"
-  client_id: "qualyxus-agentic-gateway"
-  reconnect_backoff_seconds: 30
-  evaluation_queue_size: 128
+  port: 8883
+  use_tls: true
+  # ca_certs: "secrets/mqtt_ca.pem"
+  # certfile / keyfile: client certificate, if the broker asks for one
+  # username: "qualyxus"
+  client_id: "qualyxus_edge_01"
 
-# Telemetry API. Bound to this machine only. To open it to the plant network, set host to
-# "0.0.0.0" and set QUALYXUS_API_TOKEN so the streams need a token.
+# Telemetry API. Bound to this machine only. To open it to the plant network it needs a token
+# (QUALYXUS_API_TOKEN) and HTTPS: tls_cert and tls_key, or behind_proxy: true.
 api:
   host: "127.0.0.1"
   port: 8000
@@ -82,10 +81,6 @@ telemetry:
   require_ack: false
   register_map: null
 
-hardware_acceleration:
-  use_triton: true
-  precision: "fp16"
-
 vlm_reasoning:
   # Needs a local model server. Its text is stored as an unverified suggestion, never a finding.
   enabled: false
@@ -93,35 +88,6 @@ vlm_reasoning:
   local_api: "http://localhost:11434"
   timeout_seconds: 10
   backend: "ollama"
-
-esg_params:
-  # Secondary reporting module; hidden on the dashboard until the core scrap-reduction
-  # loop is proven on a real line.
-  enabled: false
-  material_density_kg_per_unit: 0.5
-  unit_cost_usd: 12.5
-  carbon_coefficient_kg_co2_per_kg: 2.5
-  currency_symbol: "$"
-  line_overrides: {}
-
-synthetic_generation:
-  model_type: "inpainting"
-  device: "cuda"
-  batch_size: 4
-  output_resolution: [640, 640]
-
-federated_learning:
-  # Requires a pre-shared AES-256 key (QUALYXUS_FEDERATED_KEY or key_path); see
-  # src/training/federated_crypto.py. Disabled until a multi-site deployment exists.
-  enabled: false
-  privacy_level: "maximum"
-  sync_interval_hours: 24
-  key_path: "secrets/federated.key"
-
-camera_settings:
-  use_gstreamer: true
-  hardware_platform: "nvidia"
-  buffer_size: 1
 
 resource_management:
   monitoring_interval: 2.0
@@ -131,6 +97,12 @@ resource_management:
   temp_thresholds:
     warning: 78
     critical: 85
+
+# Tell someone when the station stops being healthy (nothing is sent unless one is set).
+# alerts:
+#   webhook: "https://..."           # QUALYXUS_WEBHOOK_TOKEN is sent as a bearer token
+#   email: {host: "smtp.plant.local", from: "qualyxus@plant.local", to: ["line-lead@plant.local"]}
+#   command: ["/usr/local/bin/andon"] # gets PROBLEM or OVER, and the text
 
 camera_manager:
   monitor_interval: 1.0
@@ -149,11 +121,7 @@ disk_monitor:
   interval_seconds: 30.0
   warning_threshold: 15.0
   critical_threshold: 10.0
-
-log_health:
-  retry_attempts: 3
-  retry_delay: 0.2
-  queue_growth_limit: 8
+  max_gb: 20.0             # live/raw and live/defects together; the oldest images go first
 
 runtime_metrics:
   output_path: "data/runtime/runtime_metrics.json"
@@ -174,7 +142,7 @@ camera:
   width: 640
   height: 480
   reconnect_delay: 1.0
-  save_every: 10
+  save_every: 0            # keep every Nth raw frame (for collecting training images); 0 keeps none
   jpeg_quality: 90
   frame_queue_size: 8
   event_queue_size: 64

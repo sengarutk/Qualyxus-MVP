@@ -25,6 +25,7 @@ from the log, and copy the anchor off the box regularly (a printed copy works).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import hmac
 import json
@@ -42,6 +43,7 @@ logger = logging.getLogger("AuditLog")
 
 GENESIS = "0" * 64
 AUDIT_GAP = "audit_gap"
+PERSON_ACTION = "person_action"
 
 
 def image_sha256(image: np.ndarray) -> str:
@@ -136,6 +138,19 @@ def _key_path(directory: str | Path, key_file: str | Path | None) -> Path:
     return path.with_name(path.name + ".key")
 
 
+@contextlib.contextmanager
+def _only_writer(directory: Path):
+    """The runtime and the console both write: one at a time, across processes."""
+    with open(directory / ".lock", "a", encoding="utf-8") as fh:
+        try:
+            import fcntl
+
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except ImportError:     # no such lock on Windows: run one writer there
+            pass
+        yield
+
+
 class InspectionAuditLog:
     def __init__(self, directory: str | Path = "data/audit", key_file: str | Path | None = None):
         self.dir = Path(directory)
@@ -151,6 +166,9 @@ class InspectionAuditLog:
         if self._key is None:
             if not self.key_path.exists():
                 self.key_path.parent.mkdir(parents=True, exist_ok=True)
+                if self.key_path.parent.stat().st_dev == self.dir.stat().st_dev:
+                    logger.warning("[Audit] The key %s is on the same disk as the log. Whoever holds both can rewrite "
+                                   "the trail: keep the key on separate storage (inspection.audit.key_file).", self.key_path)
                 fd = os.open(self.key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(secrets.token_hex(32))
@@ -204,10 +222,19 @@ class InspectionAuditLog:
     def append(self, record: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self.dir.mkdir(parents=True, exist_ok=True)
-            key = self._load_key()
-            if self._last_hash is None:
-                self._restore_tail(key)
-            return self._write(record, key)
+            with _only_writer(self.dir):
+                key = self._load_key()
+                if self._last_hash is None or self._others_wrote(key):
+                    self._restore_tail(key)
+                return self._write(record, key)
+
+    def _others_wrote(self, key: bytes) -> bool:
+        """Another process (the console, a command) added records since ours."""
+        try:
+            anchor = json.loads(self.anchor.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True
+        return (int(anchor.get("records", -1)), str(anchor.get("head"))) != (self._records, self._last_hash)
 
 
 def _read_key(directory: str | Path, key_file: str | Path | None, has_log: bool) -> tuple[bytes | None, dict | None]:
@@ -304,6 +331,14 @@ class ChainVerifier:
             return {"ok": False, "records": records, "error": f"logging restarted after a gap: {'; '.join(gaps)}"}
         return {"ok": True, "records": records, "head": prev, **({"torn_tail": True} if torn else {}),
                 **({"archived": start} if start else {})}
+
+
+def record_person(directory: str | Path, key_file: str | Path | None, *, by: str, what: str, target: str,
+                  reason: str = "", role: str | None = None, **details) -> dict[str, Any]:
+    """A person changed something (a model, an approval): kept in the same chain as the verdicts."""
+    return InspectionAuditLog(directory, key_file).append({
+        "ts": time.time(), "record": PERSON_ACTION, "by": by, "role": role, "what": what, "target": target,
+        "reason": reason, **details})
 
 
 def verify_chain(directory: str | Path, key_file: str | Path | None = None) -> dict[str, Any]:

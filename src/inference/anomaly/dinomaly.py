@@ -98,7 +98,7 @@ class DinomalyHead(nn.Module):
 def _global_cosine_hm(en: list[torch.Tensor], de: list[torch.Tensor], p: float, factor: float) -> torch.Tensor:
     """Global cosine loss with hard-point mining (``global_cosine_hm_percent``)."""
     loss = 0.0
-    for a, b in zip(en, de):  # (B, C, H, W)
+    for a, b in zip(en, de, strict=False):  # (B, C, H, W)
         a = a.detach()
         with torch.no_grad():
             point_dist = 1.0 - F.cosine_similarity(a, b, dim=1).unsqueeze(1)
@@ -226,7 +226,7 @@ class DinomalyDetector(AnomalyDetector):
             decoded = self.head(fused)
         en = self._group_maps(tokens.layers, tokens.grid)
         de = self._group_maps([d.float() for d in decoded], tokens.grid)
-        maps = [1.0 - F.cosine_similarity(a, b, dim=1).unsqueeze(1) for a, b in zip(en, de)]
+        maps = [1.0 - F.cosine_similarity(a, b, dim=1).unsqueeze(1) for a, b in zip(en, de, strict=False)]
         maps = [F.interpolate(m, size=(256, 256), mode="bilinear", align_corners=True) for m in maps]
         return torch.cat(maps, dim=1).mean(dim=1)  # B, 256, 256
 
@@ -249,7 +249,7 @@ class DinomalyDetector(AnomalyDetector):
         for start in range(0, len(images), batch_size):
             chunk = images[start:start + batch_size]
             maps = self._maps(chunk).float().cpu().numpy()
-            out.extend(self._finalise(m, img.shape[:2]) for m, img in zip(maps, chunk))
+            out.extend(self._finalise(m, img.shape[:2]) for m, img in zip(maps, chunk, strict=False))
         return out
 
     # ----------------------------------------------------------- persistence

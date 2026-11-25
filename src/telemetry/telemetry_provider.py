@@ -17,9 +17,6 @@ class TelemetryContext:
     shift_id: str | None = None
     telemetry_mode: str = "simulated"
     plc_protocol: str | None = None
-    plc_ready: bool | None = None
-    opcua_compatible: bool | None = None
-    modbus_ready: bool | None = None
     endpoint: str | None = None
     unit_id: int | None = None
 

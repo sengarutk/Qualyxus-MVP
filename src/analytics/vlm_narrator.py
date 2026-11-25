@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
-import requests
 
 from src.inference.postprocess import normalize_metadata_keys
 from src.reasoning.vlm_engine import VLMEngine, VLMRequest
@@ -51,7 +51,7 @@ class VLMNarrator:
             except RuntimeError:
                 raise
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Ignored", exc_info=True)
 
         # Kept lightweight and optional; actual local API path is preferred.
         self._transformers_pipeline = pipeline("image-to-text", model=self.model)

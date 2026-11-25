@@ -107,10 +107,14 @@ class DiskMonitor:
     def __init__(self, watch_path: str = "data", interval_seconds: float = 30.0,
                  warning_threshold: float = 15.0, critical_threshold: float = 10.0,
                  raw_frames_dir: str | None = None,
-                 sweep_subdirs: tuple[str, ...] | None = None):
+                 sweep_subdirs: tuple[str, ...] | None = None,
+                 max_gb: float | None = None):
         self.watch_path = Path(watch_path)
         self.raw_frames_dir = Path(raw_frames_dir) if raw_frames_dir else self.watch_path / "live" / "raw"
         self.sweep_subdirs = tuple(sweep_subdirs) if sweep_subdirs is not None else self.DEFAULT_SWEEP_SUBDIRS
+        # A limit of its own, however big the disk is: evidence images must not fill it first.
+        self.max_bytes = None if not max_gb else int(max_gb * 1e9)
+        self._next_size_check = 0.0
         self._blank_purge_cursor = 0.0
         self.interval_seconds = interval_seconds
         self.warning_threshold = warning_threshold
@@ -253,6 +257,7 @@ class DiskMonitor:
         except Exception as e:
             logger.debug("[DiskMonitor] Blank-frame purge failed: %s", e)
 
+        self._keep_within_limit()
         try:
             total, used, free = shutil.disk_usage(str(self.watch_path))
             current_usage_pct = used / total if total > 0 else 0
@@ -268,14 +273,31 @@ class DiskMonitor:
             )
             self._execute_fifo_sweep(total, used)
 
+    def _keep_within_limit(self) -> None:
+        if self.max_bytes is None or time.monotonic() < self._next_size_check:
+            return
+        self._next_size_check = time.monotonic() + 300.0
+        size = 0
+        for root in (self.watch_path / sub for sub in self.sweep_subdirs):
+            for folder, _, files in os.walk(root):
+                for name in files:
+                    try:
+                        size += os.path.getsize(os.path.join(folder, name))
+                    except OSError:
+                        continue        # written or removed meanwhile
+        if size > self.max_bytes:       # down to 90 %, so this does not run every time
+            self._reclaim(size - int(0.9 * self.max_bytes))
+
     def _execute_fifo_sweep(self, total_bytes: int, current_used_bytes: int):
         target_used_bytes = int(total_bytes * self.low_watermark)
         bytes_to_reclaim = current_used_bytes - target_used_bytes
 
         if bytes_to_reclaim <= 0:
             return
+        self._reclaim(bytes_to_reclaim)
 
-        logger.info("[DiskMonitor] Reclaiming %.2f MB to restore storage homeostasis...", bytes_to_reclaim / (1024 * 1024))
+    def _reclaim(self, bytes_to_reclaim: int) -> None:
+        logger.info("[DiskMonitor] Removing the oldest %.2f MB of images...", bytes_to_reclaim / (1024 * 1024))
         
         file_registry = []
         candidate_directories = set()

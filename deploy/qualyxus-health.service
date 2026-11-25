@@ -1,0 +1,9 @@
+[Unit]
+Description=Qualyxus health check (a failure shows in systemctl and the journal)
+
+[Service]
+Type=oneshot
+User=qualyxus
+WorkingDirectory=/opt/qualyxus
+Environment=CONFIG_PATH=/etc/qualyxus/config.yaml PYTHONPATH=/opt/qualyxus
+ExecStart=/opt/qualyxus/.venv/bin/python -m src.healthcheck

@@ -236,6 +236,8 @@ class SimulatedCycleSource(CycleSource):
             duration = cycle.duration_s / self.time_scale
             cycle.start_ts = next_start
             cycle.end_ts = next_start + duration
+            # The simulator counts from 1 at every start; its cycles must not overwrite an earlier run's.
+            cycle.cycle_id = outcome.cycle_id = f"{cycle.machine_id}-{int(next_start)}-{cycle.sequence}"
             if self._stop.wait(max(0.0, cycle.end_ts - station_time())):
                 return
             with self._lock:
@@ -487,7 +489,7 @@ class OpcUaCycleSource(CycleSource):
             while not self._stop.is_set():
                 tick = time.monotonic()
                 data = await client.read_attributes(nodes)
-                values = {s.name: self._value(d, s) for s, d in zip(specs, data)}
+                values = {s.name: self._value(d, s) for s, d in zip(specs, data, strict=True)}
                 counter = values.pop(self.counter.name)
                 cycle = self.assembler.feed(station_time(), values, None if counter is None else int(counter))
                 if cycle is not None:
@@ -527,6 +529,10 @@ def build_cycle_source(process_cfg: dict[str, Any]) -> CycleSource:
         raise ValueError(f"process.{kind} needs 'signals' and 'cycle_counter' definitions")
     counter = SignalSpec.from_config("cycle_counter", {**conn["cycle_counter"], "kind": "counter"})
     poll_hz = float(conn.get("poll_hz", 20.0))
+    where = "address" if kind == "modbus" else "node_id"
+    missing = [s.name for s in [*signals, *setpoints, counter] if getattr(s, where) is None]
+    if missing:
+        raise ValueError(f"process.{kind}: no {where} for {', '.join(missing)}")
     if kind == "modbus":
         return ModbusCycleSource(
             str(conn.get("host", "127.0.0.1")), port=int(conn.get("port", 502)), unit_id=int(conn.get("unit_id", 1)),

@@ -1,0 +1,24 @@
+# What the code imports. requirements.txt is generated from this with pinned versions and
+# hashes (see README, "Dependencies").
+asyncua
+cryptography
+fastapi
+gmqtt
+httpx
+joblib
+numpy
+nvidia-ml-py
+onnx
+onnxruntime
+opencv-python-headless
+pillow
+psutil
+pymodbus
+PyYAML
+requests
+rfdetr
+scikit-learn
+torch
+torchvision
+transformers
+uvicorn

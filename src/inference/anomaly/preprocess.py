@@ -159,7 +159,7 @@ class Preprocessor:
         # Reference template: average of the registered parts in their first-found orientation,
         # each aligned (0 or 180 degrees) to the running reference.
         ref = None
-        for img, rect in zip(images, rects):
+        for img, rect in zip(images, rects, strict=True):
             if rect is None:
                 continue
             warped = self._apply(img, _canonical_rect(rect), flip=False)
@@ -215,7 +215,7 @@ class Preprocessor:
         """Stitch per-view (score, map) results into one image score and a frame-sized map."""
         h, w = prepared.canonical_shape
         canvas = np.zeros((h, w), dtype=np.float32)
-        for view, (_, amap) in zip(prepared.views, results):
+        for view, (_, amap) in zip(prepared.views, results, strict=True):
             x1, y1, x2, y2 = view.box
             if amap.shape != (y2 - y1, x2 - x1):
                 amap = cv2.resize(amap, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR)

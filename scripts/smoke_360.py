@@ -19,16 +19,19 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DASHBOARD_CHECK = """
-from streamlit.testing.v1 import AppTest
-at = AppTest.from_file(r"{app}", default_timeout=90).run()
-assert not at.exception, [e.message[:200] for e in at.exception]
-assert not at.error, [e.value[:200] for e in at.error]
-labels = {{m.label: m.value for m in at.metric}}
-assert labels.get("Audit trail") == "✅ intact", labels.get("Audit trail")
-assert any("/100" in str(m.value) for m in at.metric), "no machine-health scores"
-assert any(m.value == "**Part-position drift**" for m in at.markdown), "no position section"
-print("parts on dashboard:", labels.get("Parts judged (8h)"))
+CONSOLE_CHECK = """
+from src.config.config import Config
+from src.console.server import create_app
+from fastapi.testclient import TestClient
+client = TestClient(create_app(Config.load().raw))
+state = client.get("/api/state").json()
+assert state["audit"]["ok"], state["audit"]
+assert len(state["health"]) == 4, state["health"]
+assert state["model"]["loaded"] and state["model"]["guaranteed"], state["model"]
+for path in ("parts", "spc", "risk", "quality", "audit", "work"):
+    assert client.get("/api/" + path).status_code == 200, path
+assert len(client.get("/api/work").json()["machines"]) == 1
+print("parts on the console:", state["kpi"]["parts"])
 """
 
 
@@ -84,10 +87,10 @@ def main() -> int:
             if (r["verdict"] == "fail") != expected_fail:
                 problems.append(f"part {r['part']} verdict {r['verdict']} (demo defect: {expected_fail})")
 
-        check = subprocess.run([sys.executable, "-c", DASHBOARD_CHECK.format(app=ROOT / "src/dashboard/app.py")],
+        check = subprocess.run([sys.executable, "-c", CONSOLE_CHECK],
                                cwd=work, env=env, capture_output=True, text=True, timeout=150)
         if check.returncode != 0:
-            problems.append("dashboard: " + check.stderr.strip().splitlines()[-1][:200])
+            problems.append("console: " + check.stderr.strip().splitlines()[-1][:200])
         else:
             print(check.stdout.strip().splitlines()[-1])
 

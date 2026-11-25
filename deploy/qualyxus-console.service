@@ -1,0 +1,23 @@
+[Unit]
+Description=Qualyxus operations console
+After=qualyxus.service
+
+[Service]
+User=qualyxus
+Group=qualyxus
+WorkingDirectory=/opt/qualyxus
+Environment=CONFIG_PATH=/etc/qualyxus/config.yaml PYTHONPATH=/opt/qualyxus QUALYXUS_LOG_FORMAT=json
+EnvironmentFile=-/etc/qualyxus/environment
+# On this machine only. For the network: --host 0.0.0.0 --tls-cert ... --tls-key ...
+ExecStart=/opt/qualyxus/.venv/bin/python -m src.console $CONSOLE_ARGS
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/qualyxus
+
+[Install]
+WantedBy=multi-user.target

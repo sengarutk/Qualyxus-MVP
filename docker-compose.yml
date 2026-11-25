@@ -1,61 +1,29 @@
+x-station: &station
+  build: .
+  image: qualyxus
+  network_mode: host
+  restart: unless-stopped
+  stop_signal: SIGINT
+  stop_grace_period: 60s
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  volumes:
+    - ./data:/app/data
+    - ./models:/app/models
+    - ./secrets:/app/secrets     # keys and accounts must outlive the container
+    - ./config.yaml:/app/config.yaml:ro
+
 services:
-  qualyxus-inference:
-    build: .
-    command: python main.py
-    network_mode: "host"
-    volumes:
-      - ./data:/app/data
-      - ./models:/app/models
-      - ./secrets:/app/secrets     # audit key and accounts must outlive the container
-      - ./config.yaml:/app/config.yaml
-    environment:
-      - CONFIG_PATH=/app/config.yaml
-      - HEALTHCHECK_MODE=inference
-      - CAMERA_STATUS_PATH=/app/data/live/camera_status.json
-      - MODEL_ASSET_PATH=${MODEL_ASSET_PATH:-/app/models/best.pt}
-      - PYTHONPATH=/app
-      - LOW_MEMORY_MODE=0
-      - LOW_MEMORY_MAX_CAMERAS=${LOW_MEMORY_MAX_CAMERAS:-1}
-      - MAX_CAMERA_WORKERS=${MAX_CAMERA_WORKERS:-0}
-      - TORCH_NUM_THREADS=1
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
-    restart: unless-stopped
+  runtime:
+    <<: *station
     deploy:
       resources:
         reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    healthcheck:
-      # Hit the dedicated /api/v1/health endpoint served by main.py's Pulse server.
-      # Hitting the SSE stream endpoint creates persistent socket leaks because the stream never closes.
-      # curl is installed in the Dockerfile base layer.
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
 
-  qualyxus-dashboard:
-    build: .
-    command: streamlit run src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0
-    network_mode: "host"
-    volumes:
-      - ./data:/app/data
-      - ./secrets:/app/secrets
-      - ./config.yaml:/app/config.yaml
-    environment:
-      - CONFIG_PATH=/app/config.yaml
-      - HEALTHCHECK_MODE=dashboard
-      - PYTHONPATH=/app
-      - LOW_MEMORY_MODE=0
-      - TORCH_NUM_THREADS=1
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
-      interval: 10s
-      timeout: 2s
-      retries: 3
-      start_period: 30s
+  console:
+    <<: *station
+    # On this machine only. For the network, with accounts and a certificate:
+    #   python -m src.console --host 0.0.0.0 --tls-cert secrets/tls/cert.pem --tls-key secrets/tls/key.pem
+    command: python -m src.console
+    healthcheck: {test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8600/api/me', timeout=5)"], interval: 30s, timeout: 10s}

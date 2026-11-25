@@ -5,11 +5,11 @@ import logging
 import os
 import time
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from src.core.factory_manager import FactoryManager
-from src.logging.event_logger import EventLogger  # FIXED: Imported to resolve lazy-initialization requirements
+from src.system.tls import check_exposure
 
 logger = logging.getLogger("PulseServer")
 
@@ -32,71 +32,6 @@ def require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Missing or wrong API token")
 
 
-class TelemetryBroadcaster:
-    """
-    Singleton Broadcaster Pattern for non-blocking in-memory pub-sub.
-    Protects client boundary isolation via pre-serialized immutable strings 
-    and bounded memory drop ring buffers, eliminating slow deep copies.
-    """
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-
-    def __init__(self):
-        if self._initialized:
-            return
-        self._subscribers = set()
-        self._lock = asyncio.Lock()
-        self._initialized = True
-
-    async def register(self) -> asyncio.Queue:
-        # Bounded allocation to prevent infinite memory expansion under slow consumers
-        queue = asyncio.Queue(maxsize=100)
-        async with self._lock:
-            self._subscribers.add(queue)
-        logger.info("[Broadcaster] New client registered. Total active: %d", len(self._subscribers))
-        return queue
-
-    async def unregister(self, queue: asyncio.Queue):
-        async with self._lock:
-            if queue in self._subscribers:
-                self._subscribers.remove(queue)
-        logger.info("[Broadcaster] Client disconnected. Total active: %d", len(self._subscribers))
-
-    async def broadcast(self, payload: dict):
-        """Dispatches isolated snapshots to all active client queues asynchronously."""
-        try:
-            # Pre-serialize to an immutable string outside the lock.
-            # This completely eliminates cross-client state bleeding and avoids 
-            # the massive performance penalty of `copy.deepcopy()`.
-            immutable_json_payload = json.dumps(payload, default=str)
-        except Exception as e:
-            logger.error("[Broadcaster] Failed to serialize telemetry payload: %s", e)
-            return
-
-        async with self._lock:
-            if not self._subscribers:
-                return
-                
-            for queue in self._subscribers:
-                try:
-                    queue.put_nowait(immutable_json_payload)
-                except asyncio.QueueFull:
-                    try:
-                        # Drop oldest frame from the buffer ring if client backpressure builds
-                        queue.get_nowait()
-                        queue.put_nowait(immutable_json_payload)
-                    except asyncio.QueueEmpty:
-                        pass
-                except Exception as e:
-                    logger.error("[Broadcaster] Error dispatching to subscriber: %s", e)
-
-broadcaster = TelemetryBroadcaster()
-
 @app.get("/api/v1/stream/telemetry", dependencies=[Depends(require_token)])
 async def stream_telemetry(request: Request):
     """
@@ -106,17 +41,8 @@ async def stream_telemetry(request: Request):
     factory = FactoryManager()
     event_logger = factory.get_instance("EventLogger")
     
-    # --- FIXED: SELF-HEALING HOOK TO ELIMINATE INSTANT EXIT LOGGING ERROR ---
-    if not event_logger:
-        logger.warning("[PulseServer] EventLogger absent from FactoryManager cache. Invoking self-healing instantiation...")
-        event_logger = EventLogger()
-        if not hasattr(event_logger, "subscribers") or event_logger.subscribers is None:
-            event_logger.subscribers = []
-        factory.register_instance("EventLogger", event_logger)
-        
-    if not hasattr(event_logger, "subscribers") or event_logger.subscribers is None:
-        event_logger.subscribers = []
-
+    if event_logger is None:
+        raise HTTPException(status_code=503, detail="The runtime is starting")
     # Allocate an isolated asyncio Queue for this web client session thread
     client_queue = asyncio.Queue(maxsize=256)
     event_logger.subscribers.append(client_queue)
@@ -139,7 +65,7 @@ async def stream_telemetry(request: Request):
         except asyncio.CancelledError:
             pass
         finally:
-            # CRITICAL SHIELD: Unconditionally evict the queue to prevent memory drift leaks
+            # Unconditionally evict the queue to prevent memory drift leaks
             if client_queue in event_logger.subscribers:
                 event_logger.subscribers.remove(client_queue)
             logger.info(f"[SSE] Frontend channel disconnected. Active subscribers count: {len(event_logger.subscribers)}")
@@ -154,45 +80,23 @@ async def stream_telemetry(request: Request):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
 
-@app.get("/api/v1/telemetry/stream", dependencies=[Depends(require_token)])
-async def telemetry_stream():
-    """
-    Asynchronous Server-Sent Events (SSE) network engine.
-    Injects transmission headers to bypass corporate proxy buffering.
-    """
-    async def event_generator():
-        queue = await broadcaster.register()
-        try:
-            while True:
-                # Payload is already serialized into an immutable JSON string by the broadcaster
-                json_string = await queue.get()
-                yield f"data: {json_string}\n\n"
-        except asyncio.CancelledError:
-            logger.info("[PulseServer] Connection reset by client window close request.")
-            raise
-        finally:
-            await broadcaster.unregister(queue)
-
-    headers = {
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-        "Pragma": "no-cache",
-        "Expires": "0"
-    }
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
-
 @app.get("/api/v1/health")
 async def health_check():
-    """
-    Dedicated HTTP Health Probe Endpoint.
-    Resolves Flaw where hitting the SSE stream endpoint causes connection leaks.
-    """
-    return {"status": "ok", "timestamp": time.time()}
+    """200 only while the station can really inspect (the same check Docker and systemd use)."""
+    manager = FactoryManager().get_instance("CameraManager")
+    problems = manager.health_problems() if manager is not None else ["the runtime is starting"]
+    return JSONResponse({"status": "ok" if not problems else "unhealthy", "problems": problems, "timestamp": time.time()},
+                        status_code=200 if not problems else 503)
+
 
 class PulseServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8000):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8000, *, tls_cert: str | None = None,
+                 tls_key: str | None = None, behind_proxy: bool = False):
+        problem = check_exposure(host, tls=bool(tls_cert and tls_key), protected=bool(os.getenv("QUALYXUS_API_TOKEN")),
+                                 behind_proxy=behind_proxy)
+        if problem:
+            raise ValueError(f"api.host {host}: the API {problem}")
+        self.tls = {"ssl_certfile": tls_cert, "ssl_keyfile": tls_key} if tls_cert and tls_key else {}
         self.app = app
         self.host = host
         self.port = int(port)
@@ -208,6 +112,7 @@ class PulseServer:
             log_level="error",
             # Open SSE streams never end on their own; bound the graceful drain on shutdown.
             timeout_graceful_shutdown=1,
+            **self.tls,
         )
         self.server = uvicorn.Server(config)
         self._finished = asyncio.Event()
@@ -219,7 +124,7 @@ class PulseServer:
             logger.error("[PulseServer] Cannot listen on %s:%d. Telemetry API is off; inspection continues.",
                          self.host, self.port)
         except asyncio.CancelledError:
-            # Hardening Guard: Intercept the master loop's raw task cancellation
+            # Intercept the master loop's raw task cancellation
             logger.warning("[PulseServer] Task cancellation intercepted. Diverting to clean port severance pipeline...")
             self._force_close()
             raise  # Re-raise the CancelledError to preserve async task contract compliance
@@ -253,8 +158,3 @@ class PulseServer:
             raise
             
         logger.info("[PulseServer] Network engine shutdown complete.")
-
-# --- ADDED EXECUTION ENTRY-POINT BLOCK TO SOLVE SILENT EXIT ISSUE ---
-if __name__ == "__main__":
-    server = PulseServer()
-    asyncio.run(server.run_async())

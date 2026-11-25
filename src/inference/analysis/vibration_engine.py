@@ -33,7 +33,6 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import sys
 import json
 import threading
 
@@ -48,7 +47,6 @@ except ImportError:
     except ImportError:
         VLMNarrator = None
 
-from src.fleet.historian import PredictiveHistorian
 
 logger = logging.getLogger(__name__)
 

@@ -366,6 +366,13 @@ class ActionTracker:
         if new_status == "closed" and new_approval_required and not new_approved_by:
             raise ValueError("Action requires approval before closing.")
 
+        closing = new_status == "closed" and current["status"] != "closed" and verification_status != "WITHDRAWN"
+        closer = resolved_by or changed_by
+        if closing and not str(closure_notes or current.get("closure_notes") or "").strip():
+            raise ValueError("Say what was done before closing (closure_notes).")
+        if closing and new_approval_required and closer and closer == new_approved_by:
+            raise ValueError("The person who approved an action cannot also close it.")
+
         new_resolved_by = resolved_by if resolved_by is not None else current.get("resolved_by")
         if new_status == "closed" and not new_resolved_by:
             new_resolved_by = changed_by

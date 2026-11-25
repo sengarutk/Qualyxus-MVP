@@ -1,12 +1,9 @@
 """Stage 3 of the audit: ready for a real camera, a real PLC and months of running."""
 from __future__ import annotations
 
-import collections
-import queue
 import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -325,7 +322,7 @@ def test_full_disk_stops_image_collection_but_not_the_record(tmp_path):
 
 
 def test_backlog_is_limited_by_memory(tmp_path, monkeypatch):
-    import src.camera.camera_manager as module
+    import src.camera.inspection as module
 
     cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v", 0.4))
     cm._inspection_slots = threading.Semaphore(64)

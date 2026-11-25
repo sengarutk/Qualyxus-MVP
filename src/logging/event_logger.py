@@ -9,18 +9,16 @@ import csv
 import time
 import uuid
 import threading
-from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from src.compliance.iso_mapper import ISOMapper
 from src.logging.schema import DefectEvent
-from src.logging.db import init_db
+from src.system.station_clock import station_time
 from src.logging.metadata_contract import compute_audit_hash, to_metadata_dict
 
 logger = logging.getLogger("QualyxusEventLogger")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Large per-pixel arrays are persisted elsewhere and must never be pushed to SSE clients.
 EVACUATE_S = 8.0
@@ -42,12 +40,16 @@ def _to_json_safe(value):
         return value.isoformat()
     return value
 
+def utc_naive(ts: float) -> datetime:
+    """UTC without the zone, as the database has always stored it."""
+    return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
+
+
 class EventLogger:
-    """
-    Asynchronous, single-worker batch serialization engine backed by memory-bound queues 
-    and atomic WAL commits. Guarantees 100% transaction compliance via clean 
-    shutdown memory evacuation routines and self-healing lazy initialization.
-    Supports both legacy synchronous logging and high-velocity async batching.
+    """Saves events in batches from one writer thread, and repeats them to live subscribers.
+
+    What the database does not take is kept in a file beside it (``unsaved_path``); when the
+    queue is full, events are dropped and counted.
     """
     _instance = None
 
@@ -127,7 +129,7 @@ class EventLogger:
 
     @staticmethod
     def now() -> datetime:
-        return datetime.utcnow()
+        return utc_naive(station_time())
 
     def _generate_audit_hash(self, event: DefectEvent) -> str:
         # Contract-hardening: audit hash is computed over canonical metadata JSON.
@@ -156,14 +158,6 @@ class EventLogger:
     def _init_db(self):
         """Executed inside the isolated thread pool executor on boot state tracking."""
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        # 1. Initialize SQLAlchemy schema for defect_events (runs table creation & migrations)
-        try:
-            init_db(self.db_path)
-        except Exception as e:
-            logger.warning("[EventLogger] SQLAlchemy init_db failed: %s. Falling back to manual schemas.", e)
-
-        # 2. Hardened Fix (Blind Spot 1): Explicitly define schema layouts for BOTH defect_events
-        # and events tables using raw SQL to guarantee they exist regardless of SQLAlchemy state.
         conn = None
         try:
             conn = sqlite3.connect(self.db_path, isolation_level=None)
@@ -200,6 +194,13 @@ class EventLogger:
                 )
             """)
             
+            # Databases from before a column existed
+            known = {r[1] for r in cursor.execute("PRAGMA table_info(defect_events)")}
+            for column in ("shift_id", "line_id", "station_id", "lot_id", "audit_hash", "iso_clause", "vlm_narrative",
+                           "inspection_profile", "overlay_path", "crop_path"):
+                if column not in known:
+                    cursor.execute(f"ALTER TABLE defect_events ADD COLUMN {column} TEXT")
+
             # Create events table (raw tracking payload storage)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS events (
@@ -251,7 +252,7 @@ class EventLogger:
                     target_queue.get_nowait()
                     target_queue.put_nowait(data)
                 except Exception:
-                    pass
+                    logger.debug("Ignored", exc_info=True)
 
         for q in list(self.subscribers):
             try:
@@ -264,7 +265,7 @@ class EventLogger:
                         q.get_nowait()
                         q.put_nowait(payload)
             except Exception:
-                pass
+                logger.debug("Ignored", exc_info=True)
 
     def log_event(self, event: DefectEvent):
         """
@@ -285,7 +286,7 @@ class EventLogger:
                 event.station_id = str(profile_station_id)
             event.inspection_profile = profile_name
         except Exception:
-            pass
+            logger.debug("Ignored", exc_info=True)
 
         # 2. Audit Hash and ISO Clause
         if not event.audit_hash:
@@ -298,7 +299,7 @@ class EventLogger:
             try:
                 event.iso_clause = ISOMapper.clause_for_event(event)
             except Exception:
-                pass
+                logger.debug("Ignored", exc_info=True)
 
         if not event.vlm_narrative:
             event.vlm_narrative = self._pop_pending_narrative(event.event_id)
@@ -399,23 +400,11 @@ class EventLogger:
         try:
             # Check if independent logs are enabled for this camera source
             independent = bool(self._camera_config(event.source).get("independent_logs", False))
-            session_id = None
 
             if independent:
-                # Retrieve session_id if available
-                try:
-                    from src.core.factory_manager import FactoryManager
-                    camera_manager = FactoryManager().get_instance("CameraManager")
-                    if camera_manager and event.source in camera_manager.workers:
-                        session_id = camera_manager.workers[event.source].session_id
-                except Exception:
-                    pass
-                if not session_id:
-                    session_id = str(int(time.time()))
-
                 # Determine the custom CSV path
                 parent_dir = os.path.dirname(self.csv_fallback_path)
-                csv_path = os.path.join(parent_dir, f"events_{event.source}_{session_id}.csv")
+                csv_path = os.path.join(parent_dir, f"events_{event.source}.csv")
             else:
                 csv_path = self.csv_fallback_path
 
@@ -466,21 +455,10 @@ class EventLogger:
         try:
             camera_id = event.get("camera_id", "UNKNOWN")
             independent = bool(self._camera_config(camera_id).get("independent_logs", False))
-            session_id = None
 
             if independent:
-                try:
-                    from src.core.factory_manager import FactoryManager
-                    camera_manager = FactoryManager().get_instance("CameraManager")
-                    if camera_manager and camera_id in camera_manager.workers:
-                        session_id = camera_manager.workers[camera_id].session_id
-                except Exception:
-                    pass
-                if not session_id:
-                    session_id = str(int(time.time()))
-
                 parent_dir = os.path.dirname(self.csv_fallback_path)
-                csv_path = os.path.join(parent_dir, f"geometry_{camera_id}_{session_id}.csv")
+                csv_path = os.path.join(parent_dir, f"geometry_{camera_id}.csv")
             else:
                 parent_dir = os.path.dirname(self.csv_fallback_path)
                 csv_path = os.path.join(parent_dir, "geometry.csv")
@@ -518,7 +496,7 @@ class EventLogger:
     def _create_defect_event_from_raw(self, item: dict) -> dict:
         event_id = self.new_event_id()
         ts_val = item.get("timestamp", time.time())
-        ts_datetime = datetime.utcfromtimestamp(ts_val)
+        ts_datetime = utc_naive(ts_val)
         
         profile_name = "default"
         profile_line_id = None
@@ -530,7 +508,7 @@ class EventLogger:
             profile_line_id = pm.get_line_id()
             profile_station_id = pm.get_station_id()
         except Exception:
-            pass
+            logger.debug("Ignored", exc_info=True)
             
         # Derive confidence/severity from the detection itself. Telemetry fields stay NULL:
         # this path has no telemetry context and must not invent plant readings.
@@ -581,13 +559,9 @@ class EventLogger:
         return payload
 
     async def log_batch_async(self, payloads: list):
-        """
-        True Asynchronous Ingestion Coroutine. 
-        Guarantees total signature compatibility with the Inference Multiplexer pipeline.
-        Falls back cleanly to synchronous transaction writes in loop-less environments (like tests).
-        """
+        """Queue events for saving. Without an event loop (tests, tools) they are saved at once."""
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             if not self._starting and (self.worker_task is None or self.worker_task.done()):
                 await self.start()
                 
@@ -610,7 +584,6 @@ class EventLogger:
     def _sync_execute_transaction(self, batch: list, keep_on_failure: bool = True):
         """
         Executes atomic WAL commits synchronously inside the background thread executor.
-        Maintains a persistent connection to eradicate I/O overhead from continuous file operations.
 
         On failure nothing of the batch is in the database, and the error is raised. Unless the
         caller will retry (``keep_on_failure=False``), the batch goes to the fallback files first.
@@ -656,7 +629,7 @@ class EventLogger:
                             item["station_id"] = str(profile_station_id)
                         item["inspection_profile"] = profile_name
                     except Exception:
-                        pass
+                        logger.debug("Ignored", exc_info=True)
 
                     if not item.get("vlm_narrative"):
                         pending = self._pending_narratives.pop(str(item.get("event_id")), None)
@@ -674,7 +647,7 @@ class EventLogger:
                             temp_ev = DefectEvent(**{k: v for k, v in item.items() if k != "frame_data"})
                             item["iso_clause"] = ISOMapper.clause_for_event(temp_ev)
                         except Exception:
-                            pass
+                            logger.debug("Ignored", exc_info=True)
                     
                     ts_val = item.get("timestamp")
                     if isinstance(ts_val, datetime):
@@ -929,7 +902,7 @@ class EventLogger:
                     try:
                         self._db_conn.close()
                     except Exception:
-                        pass
+                        logger.debug("Ignored", exc_info=True)
                     self._db_conn = None
 
         try:
@@ -951,7 +924,7 @@ class EventLogger:
         try:
             if self.worker_task is not None and not self.worker_task.done():
                 try:
-                    loop = asyncio.get_running_loop()
+                    asyncio.get_running_loop()
                     self.worker_task.cancel()
                 except RuntimeError:
                     pass
@@ -961,7 +934,7 @@ class EventLogger:
                 self._db_conn.close()
                 self._db_conn = None
         except Exception:
-            pass
+            logger.debug("Ignored", exc_info=True)
 
     def prune(self, *, events_older_than_s: float, tracking_older_than_s: float) -> dict[str, int]:
         """Delete old defect events, and tracking and geometry rows, which are far more numerous."""
@@ -974,7 +947,7 @@ class EventLogger:
                                          ("events", tracking_older_than_s, False),
                                          ("geometry_events", tracking_older_than_s, False)):
                     limit = now - float(age)
-                    cutoff = datetime.utcfromtimestamp(limit).isoformat() if text else limit
+                    cutoff = utc_naive(limit).isoformat() if text else limit
                     done[table] = conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,)).rowcount
                 conn.commit()
             finally:

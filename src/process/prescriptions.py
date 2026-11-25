@@ -186,7 +186,7 @@ class PrescriptionEngine:
             rca_reference=f"cycle:{cycle_id}",
             assigned_role="maintenance",
             action_payload={
-                "title": f"Check {component} on {machine_id}", "action_type": "process_maintenance",
+                "title": f"Check the {component.lower()} on {machine_id}", "action_type": "process_maintenance",
                 "classification_6m": "Machine", "target_system": "machine", "machine_id": machine_id,
                 "component": component, "cycle_id": cycle_id,
                 "explanation": f"Check the {component.lower()} on {machine_id}: its signal has moved {wear:.1f}\u03c3 from "

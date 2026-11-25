@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Immutable metadata dictionary contract for Qualyxus events.
 
 This module is the *single source of truth* for the Event Metadata object that
@@ -15,9 +13,11 @@ Design goals:
 - stable ordering & deterministic audit hashing
 - easy validation + safe JSON serialization
 """
+from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Final
@@ -61,7 +61,7 @@ def _isoformat(ts: Any) -> str:
         try:
             return str(ts.isoformat())
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Ignored", exc_info=True)
     return str(ts)
 
 

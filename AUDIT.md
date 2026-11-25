@@ -2,7 +2,7 @@
 
 Commit `0d06b82`. Nothing was changed during this audit. Stage 1 (marked fixed) was done on 2026-11-25; its tests are in `tests/test_safe_verdicts.py`.
 Stage 2 (also marked fixed) was done on 2026-11-25; its tests are in `tests/test_true_numbers.py`.
-Probes 04, 06, 16, 17, 20, 23 and 33 in `scripts/audit_probes.py` still fail: they check the old text or method, not the fixed behaviour.
+Stage 4 (marked fixed or partly) was done on 2026-11-25; its tests are in `tests/test_platform.py`. The audit's probe script was replaced by the four test files and removed.
 Stage 3 (also marked fixed) was done on 2026-11-25; its tests are in `tests/test_real_camera.py`. A11 also needs the plant's PLC program to copy the sequence register to the acknowledge register.
 
 **Evidence labels**
@@ -98,53 +98,53 @@ Stage 3 (also marked fixed) was done on 2026-11-25; its tests are in `tests/test
 
 | # | Fault | Evidence | Effort |
 |---|---|---|---|
-| D1 | No HTTPS on the dashboard, console or API. | C | M |
-| D2 | Console token accepted in the URL (history, logs); cookie not marked secure; one shared token, no per-person login. | C | S |
-| D3 | A removed or demoted user keeps their role for up to 8 hours. | C | S |
-| D4 | Anyone can lock an account by failing 5 times; lockout resets on restart. | C | S |
-| D5 | Model promote, rollback and approve take any name as `--by`, and approvals are not in the audit chain. | C | M |
-| D6 | The same person can approve and close an action; no reason needed. | C | S |
-| D7 | MQTT is on by default, unencrypted on port 1883, with no login; the buffer is lost on restart. | C | S |
-| D8 | Audit key defaults to the same disk as the log. | C | S |
-| D9 | Model downloads are not pinned to a revision; no hashes in requirements. | P | S |
-| D10 | No backup or restore for databases, keys, models or audit. | C | M |
-| D11 | No protection for data at rest; images may be sensitive for defence customers. | J | M |
+| ~~D1~~ fixed | No HTTPS on the dashboard, console or API. | C | M |
+| ~~D2~~ fixed | Console token accepted in the URL (history, logs); cookie not marked secure; one shared token, no per-person login. | C | S |
+| ~~D3~~ fixed | A removed or demoted user keeps their role for up to 8 hours. | C | S |
+| ~~D4~~ fixed | Anyone can lock an account by failing 5 times; lockout resets on restart. | C | S |
+| ~~D5~~ fixed | Model promote, rollback and approve take any name as `--by`, and approvals are not in the audit chain. | C | M |
+| ~~D6~~ fixed | The same person can approve and close an action; no reason needed. | C | S |
+| ~~D7~~ fixed | MQTT is on by default, unencrypted on port 1883, with no login; the buffer is lost on restart. | C | S |
+| D8 partly | Audit key defaults to the same disk as the log. | C | S |
+| ~~D9~~ fixed | Model downloads are not pinned to a revision; no hashes in requirements. | P | S |
+| ~~D10~~ fixed | No backup or restore for databases, keys, models or audit. | C | M |
+| D11 partly | No protection for data at rest; images may be sensitive for defence customers. | J | M |
 
 ## E. Reliability and operations
 
 | # | Fault | Evidence | Effort |
 |---|---|---|---|
-| E1 | No soak test ever finished. | C | S |
-| E2 | No systemd service or install path except Docker. | C | S |
-| E3 | Healthcheck passes if any one camera works; Docker checks only the API port. | C | S |
-| E4 | Two capture threads can briefly run for one camera after a restart, and the old part visit carries over. | C | S |
-| E5 | The camera "sync" does not synchronise anything; it can only delay frames 50 ms. Remove it. | C | S |
-| E6 | Two MQTT stacks and two event paths. One event stream endpoint never sends data. | C | M |
-| E7 | CSV files pile up per camera session: 100+ in `data/events` already. | P | S |
-| E8 | Full-disk image writes fail silently (`cv2.imwrite` result ignored) in the review queue and good pool. | C | S |
-| E9 | Review queue and good pool list their folders on every add, slowing inspection as they grow. | C | S |
-| E10 | Shared singletons (`FactoryManager`, `EventLogger`, `ConfigVault`) make tests leak state. | C | L |
-| E11 | Time handling: mixed naive UTC, local and monotonic; events and telemetry still use the system clock. | C | M |
-| E12 | No structured logs, metrics endpoint or alert delivery (email, SMS, andon). | C | M |
-| E13 | Simulator cycle ids repeat after a restart, mixing old and new data. | C | S |
+| ~~E1~~ fixed | No soak test ever finished. | C | S |
+| ~~E2~~ fixed | No systemd service or install path except Docker. | C | S |
+| ~~E3~~ fixed | Healthcheck passes if any one camera works; Docker checks only the API port. | C | S |
+| ~~E4~~ fixed | Two capture threads can briefly run for one camera after a restart, and the old part visit carries over. | C | S |
+| ~~E5~~ fixed | The camera "sync" does not synchronise anything; it can only delay frames 50 ms. Remove it. | C | S |
+| ~~E6~~ fixed | Two MQTT stacks and two event paths. One event stream endpoint never sends data. | C | M |
+| ~~E7~~ fixed | CSV files pile up per camera session: 100+ in `data/events` already. | P | S |
+| ~~E8~~ fixed | Full-disk image writes fail silently (`cv2.imwrite` result ignored) in the review queue and good pool. | C | S |
+| ~~E9~~ fixed | Review queue and good pool list their folders on every add, slowing inspection as they grow. | C | S |
+| E10 partly | Shared singletons (`FactoryManager`, `EventLogger`, `ConfigVault`) make tests leak state. | C | L |
+| ~~E11~~ fixed | Time handling: mixed naive UTC, local and monotonic; events and telemetry still use the system clock. | C | M |
+| ~~E12~~ fixed | No structured logs, metrics endpoint or alert delivery (email, SMS, andon). | C | M |
+| ~~E13~~ fixed | Simulator cycle ids repeat after a restart, mixing old and new data. | C | S |
 | E14 | WSL crashes under heavy GPU training; the laptop clock steps back 0.65 s every 32 s (handled). | P | Environment |
 
 ## F. Code quality
 
 | # | Fault | Evidence | Effort |
 |---|---|---|---|
-| F1 | 53% coverage; 32% on `camera_manager`, 17% on `event_logger`, 14% on `disk_monitor` and `mqtt_bridge`, 0% on `healthcheck` and `bundle`. | P | L |
-| F2 | `camera_manager.py` is over 1,800 lines; `_inspect_part` has complexity 61, `_render_operations` 82. | P | L |
-| F3 | 41 places ignore errors silently. | P | M |
-| F4 | Unused code: old YOLO tools, RCA and compliance generators, `infer_live`, `tracker`, `action_verifier`, `outcome_evaluator`, federated learning, Triton kernels. Delete or finish. | P | M |
-| F5 | 11 of 18 scripts are unmaintained stress scripts, outside the test run. | J | S |
-| F6 | Root clutter: `deep_check.py`, `find_imports.py`, `strip_bom.py`, `actual_installed.txt`, empty `qualyxus.db` and `codebase_analysis.txt`. | C | S |
-| F7 | `docs/` describes the old YOLOv8 product and 10-line scaling that does not exist. Misleading if shared. | C | S |
-| F8 | No LICENSE file. | P | S |
-| F9 | Unused imports (19), unused variables (5), zip without strict (15), naive dates (9). | P | S |
-| F10 | No type checking; GitHub CI result unknown; tests need downloaded models. | C | M |
-| F11 | Misleading names and claims in comments ("Guarantees 100% transaction compliance", "opcua_compatible: True" from a placeholder). | C | S |
-| F12 | Two dashboards overlap; the old one has the wrong KPIs (B1). Move approvals into the console and retire it. | J | L |
+| F1 partly | 53% coverage; 32% on `camera_manager`, 17% on `event_logger`, 14% on `disk_monitor` and `mqtt_bridge`, 0% on `healthcheck` and `bundle`. | P | L |
+| F2 partly | `camera_manager.py` is over 1,800 lines; `_inspect_part` has complexity 61, `_render_operations` 82. | P | L |
+| ~~F3~~ fixed | 41 places ignore errors silently. | P | M |
+| ~~F4~~ fixed | Unused code: old YOLO tools, RCA and compliance generators, `infer_live`, `tracker`, `action_verifier`, `outcome_evaluator`, federated learning, Triton kernels. Delete or finish. | P | M |
+| ~~F5~~ fixed | 11 of 18 scripts are unmaintained stress scripts, outside the test run. | J | S |
+| ~~F6~~ fixed | Root clutter: `deep_check.py`, `find_imports.py`, `strip_bom.py`, `actual_installed.txt`, empty `qualyxus.db` and `codebase_analysis.txt`. | C | S |
+| ~~F7~~ fixed | `docs/` describes the old YOLOv8 product and 10-line scaling that does not exist. Misleading if shared. | C | S |
+| ~~F8~~ fixed | No LICENSE file. | P | S |
+| ~~F9~~ fixed | Unused imports (19), unused variables (5), zip without strict (15), naive dates (9). | P | S |
+| F10 partly | No type checking; GitHub CI result unknown; tests need downloaded models. | C | M |
+| ~~F11~~ fixed | Misleading names and claims in comments ("Guarantees 100% transaction compliance", "opcua_compatible: True" from a placeholder). | C | S |
+| ~~F12~~ fixed | Two dashboards overlap; the old one has the wrong KPIs (B1). Move approvals into the console and retire it. | J | L |
 
 ## Found while fixing stage 2
 
@@ -163,6 +163,19 @@ Stage 3 (also marked fixed) was done on 2026-11-25; its tests are in `tests/test
 - **OPC UA encryption** is wired and checked for configuration errors, but has not been run against a secured server.
 - Views are grouped by time (`process.view_spread_s`): on a line where parts arrive closer together than the cameras' spread, use the trigger or part ids.
 - A model calibrated before stage 3 keeps only the old focus and noise checks until it is recalibrated.
+
+## Limits that remain after stage 4
+
+- **D8, D11:** the software warns when the audit key is on the log's disk, and creates files for its own account only. Separate storage and disk encryption are for whoever installs the box.
+- **E10:** shared services are reset between tests, but are still process-wide.
+- **E1:** 90 minutes on the laptop GPU, simulated: 879 parts, every machine cycle but the one in progress got one verdict, none not inspected, no demo defect passed, audit intact, no errors. Memory rose 33 MB an hour after warm-up (1.92 to 1.93 GB over the last 50 minutes); threads and files constant. It also showed 1.8 GB an hour of saved images: raw frames are now off by default and evidence images have a 20 GB limit. A run of days has not been done.
+- **E14:** a property of the development laptop.
+- **F1:** coverage rose but not to a target; capture from a real camera is still only exercised by the long runs.
+- **F2:** the camera code is now six files and `_inspect_part` is split up. `_capture_loop` and the event logger are still long.
+- **F10:** types are checked for the process, telemetry, console, operations, system and audit code, without strict handling of missing values. Tests still need downloaded backbones. The CI result on GitHub has not been looked at.
+- **F8:** the licence file says all rights reserved, under the founder's name. Change it if a company is to hold the rights.
+- **Removed:** the Streamlit dashboard, RCA, ESG, compliance-report, federated-learning and old YOLO tools (about 14,000 lines). They are in git history before this stage.
+- The console's sign-ins are kept in memory: restarting it signs everyone out.
 
 ## What held up
 

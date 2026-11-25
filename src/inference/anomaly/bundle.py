@@ -22,7 +22,7 @@ from pathlib import Path
 
 import torch
 
-from src.inference.anomaly.backbones import CNN_BACKBONES, VIT_CHECKPOINTS, bundle_dir
+from src.inference.anomaly.backbones import CNN_BACKBONES, VIT_CHECKPOINTS, VIT_REVISIONS, bundle_dir
 
 logger = logging.getLogger("AnomalyBundle")
 
@@ -33,7 +33,7 @@ def bundle_backbone(name: str, out_dir: Path) -> Path:
         from transformers import AutoModel
 
         target = out_dir / name
-        AutoModel.from_pretrained(VIT_CHECKPOINTS[name][0]).save_pretrained(target)
+        AutoModel.from_pretrained(VIT_CHECKPOINTS[name][0], revision=VIT_REVISIONS.get(name)).save_pretrained(target)
         return target
     if name in CNN_BACKBONES:
         from src.inference.anomaly.backbones import CNNBackbone

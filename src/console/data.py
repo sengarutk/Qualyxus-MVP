@@ -310,7 +310,7 @@ class ConsoleData:
             if p["verdict"] == "fail":
                 for t in p["defect_types"] or ["unclassified"]:
                     types[t] = types.get(t, 0) + 1
-        views = {c: {"camera": c, "judged": 0, "rejects": 0} for c in self.cameras}
+        views: dict[str, dict[str, Any]] = {c: {"camera": c, "judged": 0, "rejects": 0} for c in self.cameras}
         for p in parts:
             for camera, verdict in p["views"].items():
                 if camera in views and verdict in ("pass", "fail"):
@@ -389,6 +389,7 @@ class ConsoleData:
                 "camera": r.get("camera_id"), "verdict": r.get("verdict"), "score": r.get("normalized_score"),
                 "image": (r.get("image_sha256") or "")[:12] or None,
                 "model": ((r.get("models") or {}).get("anomaly") or {}).get("digest"),
+                "by": r.get("by"), "what": r.get("what"), "reason": r.get("reason"), "target": r.get("target"),
                 "hash": str(r.get("hash", ""))[:16], "prev": str(r.get("prev_hash", ""))[:16]}
 
     def audit(self, limit: int = 120) -> dict[str, Any]:
@@ -438,6 +439,52 @@ class ConsoleData:
             payload = action.get("action_payload") or {}
             if payload.get("action_type") in ("process_prescription", "process_maintenance"):
                 out.append({"id": action["action_id"], "text": payload.get("explanation"), "issued": action.get("timestamp")})
+        return out
+
+    def metrics(self) -> str:
+        """Prometheus text: the same numbers the page shows."""
+        state = self.state()
+        rows: list[tuple[str, dict[str, str], Any]] = [
+            ("qualyxus_up", {}, int(state["online"])),
+            ("qualyxus_heartbeat_running", {}, int(state["online"] and not state["plc"].get("hold_reason"))),
+            ("qualyxus_plc_write_failures_total", {}, state["plc"].get("write_failures")),
+            ("qualyxus_yield_ratio", {}, state["kpi"]["yield"]),
+            ("qualyxus_linked_ratio", {}, state["kpi"]["linked"]),
+            ("qualyxus_machine_cycles_lost", {}, state["lost_cycles"]),
+            ("qualyxus_audit_intact", {}, None if state["audit"].get("ok") is None else int(state["audit"]["ok"])),
+            ("qualyxus_alarms", {"level": "critical"}, sum(a["level"] == "critical" for a in state["alarms"])),
+            ("qualyxus_alarms", {"level": "warning"}, sum(a["level"] != "critical" for a in state["alarms"]))]
+        rows += [("qualyxus_parts", {"verdict": v}, state["kpi"][v]) for v in ("pass", "fail", "not_inspected", "incomplete")]
+        rows += [("qualyxus_camera_online", {"camera": c["id"]}, int(c["online"])) for c in state["cameras"]]
+        rows += [("qualyxus_wear_index", {"machine": h["machine"], "component": h["component"]}, h["wear"])
+                 for h in state["health"]]
+        out, seen = [], set()
+        for name, labels, value in rows:
+            if value is None:
+                continue
+            if name not in seen:
+                seen.add(name)
+                out.append(f"# TYPE {name} {'counter' if name.endswith('_total') else 'gauge'}")
+            text = ",".join('{}="{}"'.format(k, str(v).replace('"', "'")) for k, v in labels.items())
+            out.append(f"{name}{{{text}}} {float(value):g}" if text else f"{name} {float(value):g}")
+        return "\n".join(out) + "\n"
+
+    def position(self, *, baseline_parts: int = 30, watch_px: float = 8.0, watch_deg: float = 3.0) -> list[dict[str, Any]]:
+        """Where parts sit in each camera's frame, and how far that has moved from the first ones."""
+        if self.store is None:
+            return []
+        rows: dict[str, list[Any]] = {}
+        for row in self.store.part_positions():
+            rows.setdefault(row["camera_id"], []).append((row["pos_x"], row["pos_y"], row["pos_angle"]))
+        out = []
+        for camera, values in rows.items():
+            m = np.asarray(values, dtype=np.float64)
+            home, recent = np.median(m[:baseline_parts], axis=0), m[-20:]
+            px = float(np.median(np.hypot(recent[:, 0] - home[0], recent[:, 1] - home[1])))
+            turn = np.abs((recent[:, 2] - home[2] + 90.0) % 180.0 - 90.0)
+            deg = float(np.median(turn))
+            out.append({"camera": camera, "drift_px": round(px, 1), "drift_deg": round(deg, 2), "parts": len(m),
+                        "status": "WATCH" if px >= watch_px or deg >= watch_deg else "OK"})
         return out
 
     def state(self, now: float | None = None) -> dict[str, Any]:
@@ -505,6 +552,10 @@ class ConsoleData:
                 out.append({"level": "critical" if c["status"] == "ACT" else "warning",
                             "title": f"{c['component']}: {'act now' if c['status'] == 'ACT' else 'drifting'}",
                             "text": f"{c['signal']} has moved {c['wear']:.1f}σ from its healthy baseline.{eta}"})
+        for c in self.position():
+            if c["status"] != "OK":
+                out.append({"level": "warning", "title": f"Part position moved: {c['camera']}",
+                            "text": f"{c['drift_px']:.0f} px and {c['drift_deg']:.1f} degrees from where parts used to sit."})
         judged = [p for p in parts if p["verdict"] in ("pass", "fail")][-30:]
         rejects = sum(p["verdict"] == "fail" for p in judged)
         if len(judged) == 30 and rejects >= 4:

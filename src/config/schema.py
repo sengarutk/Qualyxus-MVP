@@ -36,10 +36,10 @@ _CONNECTION = {**_keys("""host port unit_id poll_hz endpoint username password p
                "cycle_counter": _SIGNAL, "signals": {"*": _SIGNAL}, "setpoints": {"*": _SIGNAL}}
 
 SCHEMA: dict[str, Any] = {
-    **_keys("""paths active_profile dataset inference training logging mqtt api hardware_acceleration vlm_reasoning
-               esg_params synthetic_generation federated_learning camera_settings resource_management camera_manager
-               watchdog disk_monitor log_health runtime_metrics hardening test_flags camera storage
-               vibration_analysis geometry severstal console dashboard severity edge uns hub telemetry_stream"""),
+    **_keys("""paths active_profile dataset inference training logging vlm_reasoning
+               resource_management camera_manager
+               watchdog disk_monitor runtime_metrics hardening test_flags camera storage
+               vibration_analysis geometry severstal severity"""),
     "telemetry": {**_keys("""mode protocol endpoint port unit_id heartbeat_s require_ack min_verdict_hold_s
                              max_verdict_age_s bench_test"""),
                   "register_map": _keys("verdict part heartbeat alert sequence ack cavity trigger")},
@@ -72,6 +72,12 @@ SCHEMA: dict[str, Any] = {
                       "modbus": _CONNECTION, "opcua": _CONNECTION}],
     },
     "cameras": [_CAMERA],
+    "api": _keys("host port tls_cert tls_key behind_proxy"),
+    "mqtt": _keys("""uplink_enabled host port use_tls allow_insecure ca_certs certfile keyfile username password_env
+                     client_id spool_path"""),
+    "console": _keys("status_path users_file"),
+    "alerts": {**_keys("webhook webhook_token_env command hold_s repeat_s"),
+               "email": _keys("host port starttls username password_env from to")},
 }
 
 # Values whose wrong type would change a verdict rule ("false" in quotes is true in Python).

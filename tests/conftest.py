@@ -14,6 +14,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def no_shared_state():
+    """Process-wide services must not leak from one test into the next."""
+    from src.config.vault import ConfigVault
+    from src.core.factory_manager import FactoryManager
+    from src.logging.event_logger import EventLogger
+
+    yield
+    FactoryManager._instances.clear()
+    EventLogger._instance = None
+    ConfigVault._instance = None
+
+
 @pytest.fixture
 def simulated_rows():
     """Labelled per-cycle feature rows from the simulator (labels = ground truth)."""

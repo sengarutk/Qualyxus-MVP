@@ -212,12 +212,12 @@ def predict_many(jobs: Sequence[tuple[AnomalyDetector, np.ndarray]]) -> list[Ano
             continue
         prepared = [jobs[i][0].preprocessor.prepare(jobs[i][1]) if jobs[i][0].preprocessor.active else None
                     for i in members]
-        tiles = [[v.image for v in p.views] if p is not None else [jobs[i][1]] for p, i in zip(prepared, members)]
+        tiles = [[v.image for v in p.views] if p is not None else [jobs[i][1]] for p, i in zip(prepared, members, strict=True)]
         flat = [tile for group in tiles for tile in group]
         with first._lock:
             feats, grid = first._patch_features(flat)
         chunks = iter(feats.chunk(len(flat)))
-        for p, group, i in zip(prepared, tiles, members):
+        for p, group, i in zip(prepared, tiles, members, strict=True):
             detector = jobs[i][0]
             if detector.threshold is None:
                 raise RuntimeError(f"{detector.kind} detector has no calibrated threshold")

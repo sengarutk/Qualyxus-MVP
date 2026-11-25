@@ -28,7 +28,6 @@ import yaml
 
 from src.inference.segmentation.base import ARCHITECTURES, DEFAULT_ARCH, load_segmenter, write_card
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("SegmentationTrainer")
 
 
@@ -106,7 +105,7 @@ def evaluate(segmenter, items, *, target_recall: float = 0.99) -> dict[str, Any]
     })
 
     ious, type_hits, type_total = [], 0, 0
-    for (img, mask, classes), ps in zip(items, preds):
+    for (_img, mask, classes), ps in zip(items, preds, strict=False):
         if not classes:
             continue
         kept = [p for p in ps if p.confidence >= threshold]

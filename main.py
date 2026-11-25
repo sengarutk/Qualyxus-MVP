@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -12,19 +13,16 @@ from src.api.pulse_server import PulseServer
 from src.camera.camera_manager import CameraManager
 from src.analytics.vlm_narrator import VLMNarrator
 from src.fleet.historian import PredictiveHistorian
+from src.system.alerts import AlertSender
+from src.system.logs import configure as configure_logs
 from src.system.retention import RetentionWorker
 from src.process.service import ProcessIntelligenceService
 from src.process.sources import build_cycle_sources
 
 logger = logging.getLogger("QualyxusCore")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 class CoreOrchestrator:
-    """
-    Master Application Lifecycle Orchestrator.
-    Coordinates initialization, monitors background daemons, and enforces 
-    a strict, linear, race-condition-free shutdown matrix across all OS targets.
-    """
+    """Starts every part of the runtime, and stops them in an order that loses nothing."""
     def __init__(self):
         self.running = False
         self.t_pulse = None
@@ -58,13 +56,14 @@ class CoreOrchestrator:
         )
         self.manager.register_instance("EventLogger", self.event_logger)
         
-        self.hub_connector = HubConnector()
+        self.hub_connector = HubConnector(self.config.get("mqtt", default={}) or {})
         self.manager.register_instance("HubConnector", self.hub_connector)
         
         api_cfg = self.config.get("api", default={}) or {}
         self.pulse_server = PulseServer(
             host=str(api_cfg.get("host", "127.0.0.1")),
-            port=int(api_cfg.get("port", 8000)),
+            port=int(api_cfg.get("port", 8000)), tls_cert=api_cfg.get("tls_cert"), tls_key=api_cfg.get("tls_key"),
+            behind_proxy=bool(api_cfg.get("behind_proxy", False)),
         )
         
         # Instantiate Ingestion Plane Layer. CameraManager owns the single batched
@@ -89,6 +88,9 @@ class CoreOrchestrator:
         self.retention = RetentionWorker(self.config.raw, store=self.process_service.store if self.process_service else None,
                                          event_logger=self.event_logger)
 
+        line = str((self.config.get("process", default={}) or {}).get("line_id") or "Qualyxus")
+        self.alerts = AlertSender(self.config.get("alerts", default={}) or {}, line, self.camera_manager.health_problems)
+
         # Centralized lifecycle event to coordinate thread-safe shutdowns
         self.shutdown_trigger_event = asyncio.Event()
 
@@ -112,6 +114,7 @@ class CoreOrchestrator:
             self.process_service.start()
         await self.camera_manager.start(loop)
         self.retention.start()
+        self.alerts.start()
         
         # Spawn background execution daemons
         logger.info("[Main] Spawning background execution daemons...")
@@ -162,6 +165,7 @@ class CoreOrchestrator:
         self.running = False
         
         self.retention.stop()
+        self.alerts.stop()
         # Stage 1: Halt Ingestion. CameraManager joins the capture workers first (no new frames),
         # then stops the shared inference multiplexer, then drains its disk/reflex writers.
         # It blocks on thread joins, so it runs off the event loop.
@@ -244,6 +248,8 @@ async def main():
         logger.info("[Main] Reclaiming OS resources. Process terminating cleanly.")
 
 if __name__ == "__main__":
+    os.umask(0o077)      # images, databases and keys are for this account only
+    configure_logs()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

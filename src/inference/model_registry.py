@@ -182,6 +182,9 @@ class VisionModelRegistry:
             line.pop()
         return line[-1] if line else None
 
+    def earlier_version(self, recipe: str, role: str) -> str | None:
+        return self._before_current(self.manifest(recipe, role))
+
     def rollback(self, recipe: str, role: str, *, by: str, reason: str) -> str:
         """Re-activate the version that was active before the current one."""
         with self._lock:
@@ -351,7 +354,7 @@ class VisionModelRegistry:
 
 def _review_labels(review_dir: str | Path) -> dict[str, str]:
     """image_sha -> human verdict for reviewed queue items."""
-    out = {}
+    out: dict[str, str] = {}
     d = Path(review_dir)
     if not d.exists():
         return out
@@ -387,7 +390,8 @@ def _retrain_settings(reg: VisionModelRegistry, recipe: str, args) -> dict[str, 
     if not views:
         raise ValueError("how many cameras judge each part? Give --views (the current model does not record it)")
     if args.tiles:
-        tiles = tuple(int(v) for v in args.tiles.lower().split("x"))
+        rows, cols = (int(v) for v in args.tiles.lower().split("x"))
+        tiles = (rows, cols)
     return {"views": int(views), "part_frr": float(args.part_frr or calibration.get("part_frr_target") or 0.01),
             "register": register if args.register is None else bool(args.register),
             "tiles": tuple(tiles) if tiles else None}
@@ -439,6 +443,24 @@ def _retrain(reg: VisionModelRegistry, request_id: str, args) -> dict[str, Any]:
               "candidate": args.candidate, **settings}
     reg.complete_request(request_id, result)
     return result
+
+
+def _as_person(args) -> None:
+    """Changing what judges parts needs a signed-in person, and goes into the audit trail first."""
+    from src.config.config import Config
+    from src.inference.audit_log import record_person
+    from src.operations.auth import signed_in
+    from src.operations.rbac import Permission
+
+    cfg = Config.load(config_path=args.config).raw if args.config else Config.load().raw
+    users = (cfg.get("console") or {}).get("users_file", "secrets/users.json")
+    signed_in(args.by, Permission.MANAGE_MODELS, users)
+    audit = (cfg.get("inspection") or {}).get("audit") or {}
+    if audit.get("enabled", True):
+        target = getattr(args, "request_id", None) or f"{args.recipe}/{args.role}"
+        record_person(audit.get("dir", "data/audit"), audit.get("key_file"), by=args.by, what=f"model_{args.cmd}",
+                      target=target, reason=getattr(args, "reason", None) or getattr(args, "note", None)
+                      or getattr(args, "notes", "") or "", version=getattr(args, "version", None))
 
 
 def main(argv=None) -> Any:
@@ -497,9 +519,14 @@ def main(argv=None) -> Any:
                    help="Part alignment (default: as the current model)")
     p.add_argument("--tiles", default=None)
     p.add_argument("--work-dir", default="models/anomaly/retrained")
+    parser.add_argument("--config", default=None, help="Where the audit trail and accounts are (default: CONFIG_PATH)")
     args = parser.parse_args(argv)
 
     reg = VisionModelRegistry(args.root)
+    out: Any
+    if args.cmd in ("promote", "rollback", "activate", "approve", "reject") or (
+            args.cmd == "register" and args.activate):
+        _as_person(args)
     if args.cmd == "register":
         out = reg.register(args.recipe, args.role, args.path, notes=args.notes, activate=args.activate,
                            shadow=args.shadow, by=args.by)

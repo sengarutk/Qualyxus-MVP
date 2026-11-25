@@ -136,7 +136,8 @@ def main(argv=None) -> dict:
                     service.store.reset_baseline("imm_1", reason=f"repaired {component}", by="simulation",
                                                  ts=controlled.clock)
                     service.tracker.update_action(action_id, status="in_progress", acknowledged_at="sim", changed_by="sim")
-                    service.tracker.update_action(action_id, status="closed", changed_by="sim")
+                    service.tracker.update_action(action_id, status="closed", changed_by="sim",
+                                                  closure_notes="repaired")
                     repaired[component] += 1
                     del repairs_due[component]
 

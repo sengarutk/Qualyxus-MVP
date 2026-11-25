@@ -34,7 +34,6 @@ from src.inference.anomaly.datasets import (
 from src.inference.anomaly.metrics import image_metrics, pixel_metrics
 from src.inference.anomaly.registry import CANDIDATES, create_candidate
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("AnomalyBenchmark")
 
 
@@ -172,7 +171,7 @@ def main(argv=None) -> dict[str, Any]:
         try:
             report = json.loads(out_path.read_text())
         except Exception:
-            pass
+            logger.debug("Ignored", exc_info=True)
     done = {(r["dataset"], r["candidate"]) for r in report["results"]}
 
     for make in datasets:
@@ -198,7 +197,7 @@ def main(argv=None) -> dict[str, Any]:
             if best and args.save_best:
                 detector, _ = create_candidate(best["candidate"], register=args.register, tiles=tiles)
                 extra = {"iterations": args.dinomaly_iters} if best["method"] in ("dinomaly", "ensemble") else {}
-                detector.fit(ds.train_good + [img for img, y in zip(ds.test_images, ds.test_labels) if not y],
+                detector.fit(ds.train_good + [img for img, y in zip(ds.test_images, ds.test_labels, strict=False) if not y],
                              confidence=args.confidence, **extra)
                 detector.save(args.save_best)
                 logger.info("Saved selected model %s -> %s", best["candidate"], args.save_best)

@@ -13,9 +13,11 @@ machine cycle ──► per-cycle features ──► defect-risk score ──►
                                        └──────────► training labels ──► retrained risk model
 ```
 
-Also included: RTSP/USB multi-camera capture, batched YOLO inference, golden-template
-geometry checks, SQLite/CSV audit logging, an SSE API, a Streamlit dashboard and
-ISO 9001 compliance reporting.
+Also included: RTSP/USB multi-camera capture, an operations console with sign-in and approvals,
+a tamper-evident audit trail, backup, alerts and an optional MQTT uplink.
+
+**Status:** tested on simulated parts, machines and PLCs, on a laptop. It has not run on a real
+camera, PLC, Jetson or production line.
 
 ## The process ↔ quality loop
 
@@ -48,8 +50,9 @@ python -m src.inference.anomaly.bundle --model models/anomaly/<recipe>.pt --veri
 `--verify` reloads the model the way a clean disconnected box would, with an empty download
 cache and the model hubs disabled. The Docker image keeps hub access off at runtime.
 
-**Accounts.** Until an account exists the dashboard is read-only. Once one exists, everyone
-must sign in, and the account sets the role:
+**Accounts.** Until an account exists the console reads and changes nothing. Once one exists, everyone
+signs in, and the account sets the role (operator, maintenance, QA, manager). Every change needs a reason
+and goes into the audit trail before it happens; the person who approves cannot also close:
 
 ```bash
 python -m src.operations.auth add <name> --role QA
@@ -81,22 +84,34 @@ reject a part but never pass it. A view missing after `inspection.view_timeout_s
 A machine cycle whose part no camera reported also gives flag 4 (`time`-linked stations, see
 `inspection.expect_part_per_cycle`).
 
-**Operations console.** A read-only page for the line: live views of every face, a trace from a
-rejected part to its machine cycle and the signals that moved, control charts, machine health
-and the audit trail. It needs no internet and listens on this machine only (set
-`QUALYXUS_API_TOKEN` before opening it with `--host`):
+**Operations console.** Live views of every face, a trace from a rejected part to its machine cycle and
+the signals that moved, control charts, machine health, the audit trail, and a to-do page: approve or close
+corrections and repairs, promote or roll back models, judge sampled parts, reset a baseline. No internet.
+It listens on this machine only; the network needs accounts and HTTPS:
 
 ```bash
-CONFIG_PATH=config.360.yaml python -m src.console       # beside a running main.py
+CONFIG_PATH=config.360.yaml python -m src.console       # beside a running main.py, http://127.0.0.1:8600
+python -m src.system.tls make --host 192.168.1.20
+python -m src.console --host 0.0.0.0 --tls-cert secrets/tls/cert.pem --tls-key secrets/tls/key.pem
 python scripts/console_demo.py                          # a simulated shift in its own folder
 ```
+
+**Health, alerts, metrics, logs.** `python -m src.healthcheck` and `/api/v1/health` fail for any silent
+camera, held heartbeat, undelivered verdict or full disk. `alerts:` sends problems by webhook, e-mail or a
+command (an andon light, an SMS modem). `/metrics` on the console is Prometheus text.
+`QUALYXUS_LOG_FORMAT=json` gives one JSON object per line.
+
+**Backup.** `QUALYXUS_BACKUP_PASSPHRASE=... python -m src.system.backup create --to /mnt/backup`, then
+`verify` and `restore`. Safe while running; keys and accounts are included only encrypted.
+
+**Data at rest.** Files are created for the service account only. Images of parts are not encrypted by this
+software: put the data on an encrypted disk (LUKS), and the audit key on another one.
 
 **Clock.** Cycles and parts share one clock that never runs backwards, so a time correction
 cannot link a part to the wrong cycle.
 
-**Telemetry API.** It listens on this machine only. To open it to the plant network, set
-`api.host`, and set `QUALYXUS_API_TOKEN` so the streams need a bearer token. Browser origins
-are listed in `QUALYXUS_API_CORS_ORIGINS`.
+**Telemetry API.** This machine only. The plant network needs `QUALYXUS_API_TOKEN` and HTTPS
+(`api.tls_cert`, `api.tls_key`, or `api.behind_proxy`). Browser origins: `QUALYXUS_API_CORS_ORIGINS`.
 
 **Model files.** Joblib models can run code when loaded, so each carries a keyed signature
 and an unsigned or changed file is refused. To bring one in from another box, check where it
@@ -165,7 +180,7 @@ python -m src.inference.defect_typing --crops data/labels/defect_crops --out mod
 | Drift → retraining | Score drift files a retraining request; a human approves it; the model is trained on the pooled good parts, its threshold is set on an unbiased sample whose uncertain parts a person has labelled, views and alignment are inherited from the current model, and it is registered as shadow | `... model_registry requests / approve / retrain` |
 | Labelling | Review items are exported most-uncertain first with model pre-annotations (Label Studio or COCO/CVAT); polygons come back as a YOLO-seg dataset and as review verdicts | `python -m src.inference.labeling export / import` |
 | Audit trail | Every verdict with image SHA-256, model versions/digests and threshold, hash-chained so edits or deletions are detectable | `python -m src.inference.audit_log verify data/audit` |
-| Multi-view parts | A part fails if any view fails it; parts missing a `required_view: true` camera are reported as incomplete | dashboard → Vision Models |
+| Multi-view parts | A part fails if any view fails it; parts missing a `required_view: true` camera are reported as incomplete | console |
 
 DINOv3 backbones (`dinov3_vits16` / `vitb16` / `vitl16`) are gated: accept Meta's DINOv3
 license on Hugging Face with your own account and export `HF_TOKEN` before using them.
@@ -206,73 +221,42 @@ themselves. Several machines go under `process.machines`; each has its own basel
 
 ## Setup
 
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt    # pulls CUDA 12.1 torch wheels from the PyTorch index
-```
-
-Runtime configuration lives in `config.yaml` (repository root). It is loaded
-automatically; set `CONFIG_PATH=/path/to/other.yaml` to use a different file.
-`src/config/default.yaml` is only used when no `config.yaml` exists.
-
-## Data → model
-
-Prepare a dataset (pick one):
+Python 3.12. `requirements.txt` is for an x86 PC with an NVIDIA GPU, pinned with hashes:
 
 ```bash
-# Perfect-part catalog (images + masks/) -> YOLO-seg recipe, golden templates
-python -m src.data.prepare_dataset --src /path/to/catalog/<recipe_name>
-
-# Legacy Severstal steel dataset (train.csv + train_images/ under data/raw)
-bash scripts/download_severstal.sh   # or: python -m src.dataset.severstal_prepare
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install --require-hashes -r requirements.txt
+pip install -r requirements-dev.txt          # tests and checks
 ```
 
-Both write the compiled dataset YAML to `inference.yolo_yaml` from the config, which is
-exactly where training reads it.
+**Dependencies.** Edit `requirements.in`, then
+`uv pip compile requirements.in --python-version 3.12 --python-platform x86_64-unknown-linux-gnu --generate-hashes --torch-backend cu126 --emit-index-url -o requirements.txt`.
 
-Train (values default to the `training:` section of the config):
+Configuration is `config.yaml`, or `CONFIG_PATH=/path/to/other.yaml`. A misspelt key stops the start.
 
-```bash
-python -m src.training.train_yolo_seg --model yolov8s-seg.pt --epochs 30 --imgsz 640
-```
-
-Weights are written to `models/checkpoints/<dataset.name>/weights/best.pt`; point
-`inference.model_path` at that file for live inference.
+Labelled defects (images and masks) for supervised segmentation:
+`python -m src.data.prepare_dataset --src /path/to/catalog/<recipe_name>`.
 
 ## Run
 
 ```bash
-python main.py                       # edge runtime + Pulse API on :8000 (/api/v1/health)
-streamlit run src/dashboard/app.py   # operations dashboard on :8501
+python main.py                  # the runtime, and its API on 127.0.0.1:8000
+python -m src.console           # the console, on 127.0.0.1:8600
 ```
 
-Offline inference over saved frames or a video:
+On a plant box, without Docker (as root; systemd services, its own account, health timer):
 
 ```bash
-python -m src.inference.infer_images --input_dir data/live/raw --save_dir data/live/defects
-python -m src.inference.infer_video --video_path line.mp4 --source line_1_cam_1
+deploy/install.sh
 ```
 
-## Docker
+With Docker: `docker compose up -d`. On a Jetson build with `--target jetson` (written, not yet run on one).
+
+## Tests
 
 ```bash
-./deploy.sh        # docker compose build + up (inference runtime + dashboard)
-```
-
-## Tests and validation
-
-```bash
-python -m pytest tests/        # unit + integration suite (includes a live OPC UA round trip)
-```
-
-Scenario scripts can be run from the repository root, e.g.:
-
-```bash
-python scripts/test_multicamera_isolation.py
-python scripts/test_reliability.py
-python scripts/test_vibration_engine.py
-python scripts/test_geometry_engine.py
-python scripts/malicious_audit.py
-python scripts/validate_pipeline_integration.py   # isolated 1-epoch ingest + training run
+python -m pytest                           # unit and integration tests
+python scripts/smoke_360.py                # the whole six-view station, offline, 150 s
+python scripts/soak.py --minutes 120       # growth, leaks, unanswered parts
+ruff check . && mypy                       # style and types
 ```

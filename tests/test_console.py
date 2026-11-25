@@ -146,15 +146,27 @@ def test_token_protects_every_data_route(station, monkeypatch):
     assert client.get("/api/state").status_code == 401
     assert client.get("/api/state", headers={"Authorization": "Bearer s3cret"}).status_code == 200
     client.get("/?token=s3cret")
-    assert client.get("/api/state").status_code == 200
+    assert client.get("/api/state").status_code == 401        # never from the address bar
 
 
-def test_network_bind_without_a_token_is_refused(monkeypatch):
-    from src.console.server import main
+def test_network_bind_needs_accounts_and_https(tmp_path, monkeypatch):
+    from src.console import server
+    from src.operations.auth import UserStore
 
-    monkeypatch.delenv("QUALYXUS_API_TOKEN", raising=False)
+    config = tmp_path / "config.yaml"
+    config.write_text(f"console: {{users_file: {tmp_path}/users.json}}\ncameras: []\n")
+    monkeypatch.setenv("CONFIG_PATH", str(config))
+    started = []
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: started.append(k))
+    for args in (["--host", "0.0.0.0"], ["--host", "0.0.0.0", "--tls-cert", "c", "--tls-key", "k"]):
+        with pytest.raises(SystemExit):
+            server.main(args)
+    UserStore(tmp_path / "users.json").add("asha", "long enough password", "QA")
     with pytest.raises(SystemExit):
-        main(["--host", "0.0.0.0"])
+        server.main(["--host", "0.0.0.0"])
+    server.main(["--host", "0.0.0.0", "--tls-cert", "c", "--tls-key", "k"])
+    server.main([])
+    assert [s["host"] for s in started] == ["0.0.0.0", "127.0.0.1"] and started[0]["ssl_certfile"] == "c"
 
 
 def test_view_store_keeps_only_the_newest_parts(tmp_path):

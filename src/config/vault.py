@@ -28,11 +28,11 @@ class ConfigVault:
             with cls._lock:
                 if cls._instance is None:
                     instance = super().__new__(cls)
-                    # Flaw Fix: Route kwargs securely into the configuration loader to prevent silent parameter ignoring.
+                    # Route kwargs securely into the configuration loader to prevent silent parameter ignoring.
                     instance._underlying_config = Config.load(**kwargs)
                     cls._instance = instance
                 elif kwargs:
-                    # Positive Mod: Warn if a subsequent caller tries to inject new initialization parameters.
+                    # Warn if a subsequent caller tries to inject new initialization parameters.
                     logger.warning("[ConfigVault] Ignoring kwargs on subsequent allocation. Singleton is already sealed.")
         elif kwargs:
             logger.warning("[ConfigVault] Ignoring kwargs on subsequent allocation. Singleton is already sealed.")
@@ -41,7 +41,7 @@ class ConfigVault:
 
     def __init__(self, *args, **kwargs):
         """
-        Flaw Fix: Absorb instantiation arguments so Python's automatic `object.__init__` 
+        Absorb instantiation arguments so Python's automatic `object.__init__` 
         doesn't throw a TypeError when constructor arguments are used.
         """
         pass

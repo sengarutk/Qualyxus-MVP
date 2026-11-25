@@ -173,7 +173,7 @@ def main(argv=None) -> str:
     if args.width and args.height:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    frames = []
+    frames: list[np.ndarray] = []
     while len(frames) < args.frames:
         ok, frame = cap.read()
         if not ok:

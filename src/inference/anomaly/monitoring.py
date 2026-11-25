@@ -109,6 +109,7 @@ class ReviewQueue:
         self.max_items = int(max_items)
         self.max_bytes = None if max_gb is None else int(max_gb * 1e9)
         self._full_logged: set[str] = set()
+        self._count: dict[str, tuple[int, int, float]] = {}
 
     def should_review(self, normalized_score: float | None) -> bool:
         return normalized_score is not None and self.band[0] <= normalized_score <= self.band[1]
@@ -119,17 +120,18 @@ class ReviewQueue:
             image_sha: str | None = None, recipe: str | None = None) -> Path | None:
         target = self.directory / camera_id
         target.mkdir(parents=True, exist_ok=True)
-        files = list(target.iterdir())
         # Nothing waiting for a person is thrown away to make room: the queue says it is full.
-        if (sum(f.suffix == ".json" for f in files) >= self.max_items
-                or self.max_bytes is not None and sum(f.stat().st_size for f in files) >= self.max_bytes):
+        items, size = self._usage(target)
+        if items >= self.max_items or self.max_bytes is not None and size >= self.max_bytes:
             if camera_id not in self._full_logged:
                 self._full_logged.add(camera_id)
                 logger.error("[Review] The review queue of %s is full: label or remove parts in %s.", camera_id, target)
             return None
         self._full_logged.discard(camera_id)
         item_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        cv2.imwrite(str(target / f"{item_id}.png"), image, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        if not cv2.imwrite(str(target / f"{item_id}.png"), image, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+            (target / f"{item_id}.png").unlink(missing_ok=True)
+            raise OSError(f"could not write {target / item_id}.png (disk full?)")
         if overlay is not None:
             cv2.imwrite(str(target / f"{item_id}_overlay.jpg"), _shrink(overlay))
         meta = {"id": item_id, "camera_id": camera_id, "ts": time.time(), "normalized_score": normalized_score,
@@ -139,7 +141,18 @@ class ReviewQueue:
                 "review": {"verdict": None, "defect_type": None, "reviewer": None}}
         path = target / f"{item_id}.json"
         path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        self._count[str(target)] = (items + 1, size + sum(f.stat().st_size for f in target.glob(f"{item_id}*")),
+                                    self._count[str(target)][2])
         return path
+
+    def _usage(self, target: Path) -> tuple[int, int]:
+        """(items, bytes) in a camera's queue. Counted by hand; looked up again every few minutes."""
+        known = self._count.get(str(target))
+        if known is None or time.monotonic() - known[2] > 300.0:
+            files = list(target.iterdir())
+            known = (sum(f.suffix == ".json" for f in files), sum(f.stat().st_size for f in files), time.monotonic())
+            self._count[str(target)] = known
+        return known[0], known[1]
 
 
 def ingest_reviews(directory: str | Path, *, process_service=None, crops_dir: str | Path | None = None) -> dict[str, int]:

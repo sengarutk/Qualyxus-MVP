@@ -55,7 +55,7 @@ class WatchdogManager:
         now = now or time.perf_counter()
         cam = getattr(state, "camera_id", "unknown")
 
-        # Hardening Fix: Move backoff cooling restrictions to the very top of the call.
+        # Move backoff cooling restrictions to the very top of the call.
         # Avoids wasting cycles running reflectance metrics or flooding log files during backoffs.
         next_allowed = self.next_restart_after.get(cam, 0.0)
         if now < next_allowed:
@@ -90,7 +90,7 @@ class WatchdogManager:
             failures = self.failure_counts.get(cam, 0) + 1
             self.failure_counts[cam] = failures
             
-            # Hardening Fix: Cap the exponent to a safe ceiling boundary (e.g., 30)
+            # Cap the exponent to a safe ceiling boundary (e.g., 30)
             # This completely blocks float conversion failures while easily satisfying max_backoff caps
             clamped_exponent = min(30, max(0, failures - 1))
             backoff = min(self.max_backoff, self.base_backoff * (2 ** clamped_exponent))

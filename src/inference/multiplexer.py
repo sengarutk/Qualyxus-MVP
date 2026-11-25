@@ -92,7 +92,7 @@ class InferenceMultiplexer:
             # Handle queue overflow gracefully
             with self.lock:
                 self.results.pop(request_id, None)
-            raise queue.Full("InferenceMultiplexer buffer is fully saturated.")
+            raise queue.Full("InferenceMultiplexer buffer is fully saturated.") from None
             
         return request_id
         
@@ -165,7 +165,7 @@ class InferenceMultiplexer:
         frames = [item[2] for item in batch]
         
         if self.mock_mode or self.model is None:
-            for idx, item in enumerate(batch):
+            for item in batch:
                 req_id = item[0]
                 # Synthesize standard empty prediction arrays
                 boxes = np.empty((0, 6), dtype=np.float32)

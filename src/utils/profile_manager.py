@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -65,7 +66,7 @@ class ProfileManager:
             if self.config_path.exists():
                 return (yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {})
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Ignored", exc_info=True)
         return {}
 
     def _load_profile_settings(self) -> dict[str, Any]:

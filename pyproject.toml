@@ -1,0 +1,27 @@
+[project]
+name = "qualyxus"
+version = "0.2.0"
+description = "On-premise visual inspection linked to machine cycles"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "S110", "DTZ"]
+ignore = ["B008", "E701", "E702", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "DTZ", "E402"]
+"scripts/*" = ["E402", "B", "DTZ", "E70", "F"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = false
+follow_imports = "silent"
+strict_optional = false
+files = ["src/process", "src/telemetry", "src/config/schema.py", "src/operations", "src/console", "src/system",
+         "src/network", "src/inference/audit_log.py", "src/inference/model_registry.py",
+         "src/camera/part_inspection.py", "src/camera/presence.py", "src/camera/trigger.py"]

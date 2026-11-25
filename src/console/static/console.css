@@ -99,3 +99,6 @@ svg { display: block; width: 100%; overflow: visible; } svg text { fill: var(--i
 #tip b { display: block; }
 @media (max-width: 1180px) { .c3,.c4,.c5,.c6,.c7,.c8,.c9 { grid-column: span 12; } .kpis { grid-template-columns: repeat(3, 1fr); } .hl { grid-template-columns: repeat(2, 1fr); } .top { flex-wrap: wrap; height: auto; padding: 8px 16px; gap: 10px 20px; } nav { order: 3; width: 100%; overflow-x: auto; height: 40px; } }
 @media (max-width: 640px) { .kpis, .views { grid-template-columns: repeat(2, 1fr); } .hl { grid-template-columns: 1fr; } }
+.in { padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--page); color: var(--ink); font: inherit; min-width: 180px; flex: 1 1 180px; }
+#login { display: grid; gap: 10px; max-width: 320px; } .seg button:disabled, .btn:disabled { opacity: .45; cursor: not-allowed; }
+.rv { grid-template-columns: repeat(6, minmax(0, 1fr)); } .rv .seg { margin-top: 6px; } @media (max-width: 1180px) { .rv { grid-template-columns: repeat(2, 1fr); } }

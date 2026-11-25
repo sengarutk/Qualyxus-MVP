@@ -112,7 +112,7 @@ class CycleAligner:
     def _cycle_period(self, link: StationLink, left_machine: float) -> float:
         """Shortest recent time between parts; with several cavities they leave together."""
         ends = sorted(t for _, t in self.store.cycles_ending_before(link.machine_id, left_machine + link.tolerance_s, 6))
-        gaps = [b - a for a, b in zip(ends, ends[1:]) if b > a]
+        gaps = [b - a for a, b in zip(ends, ends[1:], strict=False) if b > a]
         return min(gaps) if gaps else float("inf")
 
     def align(self, camera_id: str, inspection_ts: float, part_id: str | None = None) -> AlignmentResult:

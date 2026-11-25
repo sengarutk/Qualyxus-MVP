@@ -18,7 +18,6 @@ import torch
 from src.inference.anomaly.base import AnomalyDetector
 from src.process.synthetic_parts import BACKGROUND, render_part
 
-DASHBOARD_APP = Path(__file__).resolve().parents[1] / "src" / "dashboard" / "app.py"
 
 
 def _jitter(img: np.ndarray, angle: float, dx: float, dy: float, *, interp=cv2.INTER_LINEAR) -> np.ndarray:
@@ -802,61 +801,6 @@ def test_accounts_check_password_lock_out_and_never_store_it(tmp_path):
     assert store.authenticate("ravi", "long enough password", now=10.0 + LOCKOUT_S + 1) == "QA"
 
 
-def test_dashboard_needs_a_login_once_accounts_exist(tmp_path, monkeypatch):
-    from streamlit.testing.v1 import AppTest
-
-    from src.operations.auth import UserStore
-
-    users = tmp_path / "users.json"
-    UserStore(users).add("ravi", "long enough password", "QA")
-    config = tmp_path / "config.yaml"
-    config.write_text(f"logging: {{sqlite_path: {tmp_path}/events.db}}\ndashboard: {{users_file: {users}}}\n")
-    monkeypatch.setenv("CONFIG_PATH", str(config))
-
-    at = AppTest.from_file(str(DASHBOARD_APP), default_timeout=30).run()
-    assert not at.exception and at.subheader[0].value == "Sign in" and not at.metric
-    at.text_input[0].set_value("ravi")
-    at.text_input[1].set_value("wrong password!")
-    at.button[0].click()
-    at.run()
-    assert at.error and "auth" not in at.session_state
-    at.text_input[1].set_value("long enough password")
-    at.button[0].click()
-    at.run()
-    assert at.session_state["auth"]["role"] == "QA" and not at.exception
-
-
-def test_dashboard_renders_machine_health_and_position_from_real_records(tmp_path, monkeypatch):
-    from streamlit.testing.v1 import AppTest
-
-    from src.logging.event_logger import EventLogger
-    from src.process.features import CycleFeatureExtractor
-    from src.process.models import InspectionRecord
-    from src.process.simulator import InjectionMoldingSimulator
-    from src.process.store import ProcessStore
-
-    EventLogger(sqlite_path=str(tmp_path / "events.db"), csv_path=str(tmp_path / "e.csv"))._init_db()
-    store = ProcessStore(tmp_path / "process.db")
-    sim, extractor, now = InjectionMoldingSimulator(seed=3), CycleFeatureExtractor(), time.time()
-    for i in range(60):
-        cycle, _ = sim.next_cycle(start_ts=now - 600 + i)
-        store.save_cycle(cycle, extractor.extract(cycle))
-        store.save_inspection(InspectionRecord("", "cam", cycle.end_ts, "pass", cycle_id=cycle.cycle_id,
-                                               pos_x=300.0 + i, pos_y=200.0, pos_angle=0.0))
-    store.close()
-    config = tmp_path / "config.yaml"
-    config.write_text(f"logging: {{sqlite_path: {tmp_path}/events.db}}\n"
-                      f"process: {{enabled: true, db_path: {tmp_path}/process.db}}\n"
-                      f"dashboard: {{users_file: {tmp_path}/users.json}}\n"
-                      f"esg_params: {{enabled: false}}\n")
-    monkeypatch.setenv("CONFIG_PATH", str(config))
-
-    at = AppTest.from_file(str(DASHBOARD_APP), default_timeout=60).run()
-    assert not at.exception, [e.message for e in at.exception]
-    assert any("/100" in str(m.value) for m in at.metric)
-    assert "**Part-position drift**" in [m.value for m in at.markdown]
-
-
 def test_bundled_vit_backbone_loads_with_no_hub_access(tmp_path, monkeypatch):
     from transformers import Dinov2Config, Dinov2Model
 
@@ -913,8 +857,8 @@ def test_part_pose_reads_position_and_angle_from_the_frame():
     assert part_pose(np.full((480, 640, 3), 40, np.uint8)) is None
 
 
-def test_part_position_drift_is_reported_per_camera(tmp_path, monkeypatch):
-    from src.dashboard.data_access import fetch_part_position
+def test_part_position_drift_is_reported_per_camera(tmp_path):
+    from src.console.data import ConsoleData
     from src.process.models import InspectionRecord
     from src.process.store import ProcessStore
 
@@ -923,8 +867,8 @@ def test_part_position_drift_is_reported_per_camera(tmp_path, monkeypatch):
         x = 300.0 if i < 50 else 300.0 + (i - 50)
         store.save_inspection(InspectionRecord("", "cam", float(i), "pass", pos_x=x, pos_y=200.0, pos_angle=0.0))
     store.close()
-    summary = fetch_part_position(str(tmp_path / "p.db"))["summary"][0]
-    assert summary["camera"] == "cam" and summary["status"] == "WATCH" and summary["drift_px"] > 15
+    (found,) = ConsoleData({"process": {"db_path": str(tmp_path / "p.db")}}).position()
+    assert found["camera"] == "cam" and found["status"] == "WATCH" and found["drift_px"] > 15
 
 
 def test_one_view_catches_a_defect_on_its_face_only():
@@ -1047,7 +991,7 @@ def test_heartbeat_stops_on_a_single_camera_station_too(tmp_path):
 
 
 def test_a_good_view_does_not_clear_another_views_fault(tmp_path):
-    from src.camera import camera_manager as module
+    from src.camera import inspection as module
     from src.camera.part_inspection import CompletedPart
 
     cm, state = _heartbeat_manager(tmp_path)
@@ -1258,15 +1202,6 @@ def test_api_is_closed_by_default():
     assert PulseServer().host == "127.0.0.1"
     cors = next(m for m in app.user_middleware if m.cls.__name__ == "CORSMiddleware")
     assert cors.kwargs["allow_origins"] == [] and not cors.kwargs.get("allow_credentials")
-
-
-def test_report_template_escapes_recorded_text(tmp_path):
-    from jinja2 import DictLoader, Environment, select_autoescape
-
-    source = Path("src/compliance/report_generator.py").read_text(encoding="utf-8")
-    assert 'autoescape=select_autoescape(["html"])' in source
-    env = Environment(loader=DictLoader({"r.html": "{{ v }}"}), autoescape=select_autoescape(["html"]))
-    assert "<script>" not in env.get_template("r.html").render(v="<script>x</script>")
 
 
 def test_wall_clock_jumping_back_does_not_stall_the_heartbeat(tmp_path, monkeypatch):
@@ -1532,7 +1467,7 @@ def test_unseen_part_is_counted_on_the_dashboard_too(tmp_path):
 
 def test_blurred_part_is_stored_as_not_inspected_with_its_picture(tmp_path):
     """The inspection path itself, end to end: it used to return before saving anything."""
-    from src.camera import camera_manager as module
+    from src.camera import inspection as module
     from src.camera.part_inspection import CompletedPart
     from src.camera.view_store import ViewStore
 

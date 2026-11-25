@@ -8,7 +8,6 @@ import numpy as np
 import argparse
 from src.config.config import Config
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DynamicPreprocessor")
 
 def auto_ingest_pipeline(src_override=None, clear_cache=False):

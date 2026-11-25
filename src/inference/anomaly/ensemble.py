@@ -69,9 +69,9 @@ class EnsembleDetector(AnomalyDetector):
 
     def _fuse(self, per_member: Sequence[Sequence[tuple[float, np.ndarray]]]) -> list[tuple[float, np.ndarray]]:
         out = []
-        for results in zip(*per_member):
+        for results in zip(*per_member, strict=False):
             score, amap = 0.0, None
-            for (s, m), (med, scale), w in zip(results, self.norm, self.weights):
+            for (s, m), (med, scale), w in zip(results, self.norm, self.weights, strict=False):
                 score += w * (s - med) / scale
                 z = (m - med) / scale
                 amap = w * z if amap is None else amap + w * z

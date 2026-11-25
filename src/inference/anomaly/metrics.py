@@ -47,7 +47,7 @@ def frr_at_recall(labels: np.ndarray, scores: np.ndarray, recall: float) -> floa
 
 def _resize_maps(maps: Sequence[np.ndarray], masks: Sequence[np.ndarray], size: int):
     rm, rg = [], []
-    for amap, gt in zip(maps, masks):
+    for amap, gt in zip(maps, masks, strict=False):
         rm.append(cv2.resize(amap.astype(np.float32), (size, size), interpolation=cv2.INTER_LINEAR))
         rg.append(cv2.resize((gt > 0).astype(np.uint8), (size, size), interpolation=cv2.INTER_NEAREST))
     return np.stack(rm), np.stack(rg).astype(bool)

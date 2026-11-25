@@ -3,7 +3,6 @@ import threading
 from typing import Any, Optional
 
 logger = logging.getLogger("QualyxusFactory")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 class SafeServiceStub:
     """

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 
 import cv2
 import numpy as np

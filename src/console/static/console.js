@@ -5,11 +5,12 @@ const num = (v, d = 1) => (v === null || v === undefined || Number.isNaN(v) ? "�
 const pct = (v, d = 1) => (v === null || v === undefined ? "–" : num(v * 100, d) + "%");
 const words = (s) => { const t = String(s ?? "").replace(/^view_/, "").replace(/_/g, " "); return t.charAt(0).toUpperCase() + t.slice(1); };
 const clock = (ts) => new Date(ts * 1000).toLocaleTimeString("en-GB");
-const api = async (path) => { const r = await fetch("/api/" + path); if (!r.ok) throw new Error(r.status); return r.json(); };
+const api = async (path) => { const r = await fetch("/api/" + path); if (r.status === 401) S.signIn = true; if (!r.ok) throw new Error(r.status); return r.json(); };
+const post = async (path, body) => { const r = await fetch("/api/" + path, { method: "POST", headers: { "Content-Type": "application/json", "X-Qualyxus": "1" }, body: JSON.stringify(body || {}) }); const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.detail || "Failed (" + r.status + ")"); return d; };
 const LABEL = { pass: "PASS", fail: "REJECT", not_inspected: "NOT INSPECTED", incomplete: "INCOMPLETE", missing: "NO IMAGE" };
-const TABS = [["live", "Live"], ["trace", "Trace a part"], ["process", "Process control"], ["quality", "Quality"], ["audit", "Audit trail"]];
+const TABS = [["live", "Live"], ["trace", "Trace a part"], ["process", "Process control"], ["quality", "Quality"], ["work", "To do"], ["audit", "Audit trail"]];
 
-const S = { tab: "live", state: null, parts: [], part: null, key: null, heat: true, signal: "hold_pressure.active_median", failedOnly: true, busy: false };
+const S = { tab: "live", state: null, parts: [], part: null, key: null, heat: true, signal: "hold_pressure.active_median", failedOnly: true, busy: false, me: null, signIn: false, note: "", reasons: {} };
 
 /* ---------------------------------------------------------------- charts */
 const tip = $("#tip");
@@ -147,10 +148,27 @@ async function qualityView() {
    <section class="card c12"><h2>Inspection model</h2><div class="rows"><div class="row"><span>Method</span><span>${esc(m.kind || "–")} ${m.backbone ? "on " + esc(m.backbone) : ""}, trained on good parts only</span></div><div class="row"><span>Reject limit</span><span>${num(m.threshold, 4)}, set from ${num(m.n_holdout, 0)} held-out good parts</span></div><div class="row"><span>False rejects</span><span>${m.part_frr_target ? `calibrated to at most ${pct(m.part_frr_target, 0)} of good parts across ${m.n_views} views` : "–"}</span></div><div class="row"><span>Model digest</span><span class="mono">${esc(m.digest || "–")}</span></div></div></section></div>`;
 }
 
+const can = (p) => (S.me?.may || []).includes(p);
+const gate = (p) => can(p) ? "" : `disabled title="${S.me?.name ? "Your role may not do this" : "Sign in first"}"`;
+const why = (id, hint) => `<input class="in" data-reason="${esc(id)}" placeholder="${esc(hint)}" maxlength="300" value="${esc(S.reasons[id] || "")}">`;
+function loginView() {
+  return `<div class="grid"><section class="card c4"><h2>Sign in</h2><form id="login"><input class="in" name="name" placeholder="Name" autocomplete="username" required><input class="in" name="password" type="password" placeholder="Password" autocomplete="current-password" required><button class="btn">Sign in</button></form><p class="muted" id="loginerr">${esc(S.note)}</p></section></div>`;
+}
+async function workView() {
+  const w = await api("work"), act = (a) => `<div class="alarm"><span class="ic" aria-hidden="true">${a.type === "process_maintenance" ? "▲" : "→"}</span><div><b>${esc(a.title || "Action")}</b> <span class="chip">${a.status === "in_progress" ? "started" + (a.assigned_to ? " by " + esc(a.assigned_to) : "") : "open"}</span>${a.approved_by ? ` <span class="chip good">approved by ${esc(a.approved_by)}</span>` : a.needs_approval ? ' <span class="chip warn">needs approval</span>' : ""}<p>${esc(a.text)}</p><div class="seg">${why(a.id, "Reason, or what was done")}
+    ${a.needs_approval && !a.approved_by ? `<button data-do="actions/${esc(a.id)}/approve" ${gate("approve_actions")}>Approve</button><button data-do="actions/${esc(a.id)}/reject" ${gate("approve_actions")}>Reject</button>` : ""}${a.status === "open" ? `<button data-do="actions/${esc(a.id)}/start" ${gate("close_actions")}>Start</button>` : ""}<button data-do="actions/${esc(a.id)}/close" ${gate("close_actions")}>Close</button></div></div></div>`;
+  const rep = (r) => !r || !r.parts ? "no parts compared yet" : `${num(r.parts, 0)} parts, ${pct(r.agreement)} agreement, rejects ${pct(r.active_reject_rate)} → ${pct(r.shadow_reject_rate)}${r.reviewed ? `, escapes ${r.reviewed.active_escapes} → ${r.reviewed.shadow_escapes} of ${r.reviewed.parts} reviewed` : ""}`;
+  return `<div class="grid">
+   <section class="card c7"><h2>Corrections and repairs <span class="end">never written to the machine</span></h2>${w.actions.length ? w.actions.map(act).join("") : '<div class="empty">Nothing open.</div>'}</section>
+   <section class="card c5"><h2>Models</h2>${w.requests.map((q) => `<div class="alarm"><span class="ic">↻</span><div><b>Retrain ${esc(q.recipe)}</b> <span class="chip">${esc(q.status)}</span><p>${esc(q.reason)}</p>${q.status === "pending" ? `<div class="seg">${why(q.id, "Reason")}<button data-do="requests/${esc(q.id)}/approve" ${gate("manage_models")}>Approve</button><button data-do="requests/${esc(q.id)}/reject" ${gate("manage_models")}>Reject</button></div>` : ""}</div></div>`).join("")}${w.models.map((m) => `<div class="alarm"><span class="ic">◇</span><div><b>${esc(m.recipe)}</b> active ${esc(m.active || "–")}${m.shadow ? `, shadow ${esc(m.shadow)}` : ""}<p>${m.shadow ? rep(m.shadow_report) : `${m.versions} versions`}</p><div class="seg">${why("m" + m.recipe, "Reason")}${m.shadow ? `<button data-do="models/${esc(m.recipe)}/promote" data-key="m${esc(m.recipe)}" ${gate("manage_models")}>Promote shadow</button>` : ""}<button data-do="models/${esc(m.recipe)}/rollback" data-key="m${esc(m.recipe)}" ${gate("manage_models")}>Roll back</button></div></div></div>`).join("")}${w.models.length + w.requests.length ? "" : '<div class="empty">No model registry on this station.</div>'}
+   <h2 style="margin-top:18px">Baseline after a repair</h2>${w.machines.map((m) => `<div class="seg" style="margin-bottom:6px"><b style="min-width:70px">${esc(m)}</b>${why("b" + m, "What was repaired or changed")}<button data-do="baseline/${esc(m)}" data-key="b${esc(m)}" ${gate("close_actions")}>Repaired</button><button data-do="baseline/${esc(m)}" data-change="1" data-key="b${esc(m)}" ${gate("close_actions")}>New mould or material</button></div>`).join("")}</section>
+   <section class="card c12"><h2>Parts to judge <span class="end">${num(w.review_waiting, 0)} waiting, most uncertain first</span></h2>${w.review.length ? `<div class="views rv">${w.review.map((r) => `<div><div class="view"><img loading="lazy" alt="Part seen by ${esc(words(r.camera))}" src="/review/${encodeURIComponent(r.camera)}/${encodeURIComponent(r.id)}"><div class="cap"><b>${esc(words(r.camera))}</b><span>${num(r.score, 2)}</span></div></div><div class="seg"><button data-do="review/${esc(r.camera)}/${esc(r.id)}" data-verdict="pass" ${gate("review_parts")}>Good</button><button data-do="review/${esc(r.camera)}/${esc(r.id)}" data-verdict="fail" ${gate("review_parts")}>Bad</button></div></div>`).join("")}</div>` : '<div class="empty">No parts waiting.</div>'}</section></div>`;
+}
+
 async function auditView() {
   const a = await api("audit"), ok = a.chain.ok;
   return `<div class="grid"><section class="card c12"><h2>Tamper-evident record of every verdict <span class="end"><button class="btn" id="csv">Export these records</button></span></h2><div class="verdict"><span class="big ${ok ? "pass" : ok === false ? "fail" : "other"}">${ok ? "INTACT" : ok === false ? "BROKEN" : a.chain.checking ? "CHECKING" : "NO RECORDS"}</span><span>${ok ? `${num(a.chain.records, 0)} records checked, every link and signature valid` : esc(a.chain.error || "")}</span><span class="muted">${a.chain.checked ? "checked " + clock(a.chain.checked) : ""}</span></div>
-   <div class="scroll"><table><thead><tr><th>Time</th><th>Record</th><th>Cycle</th><th>View</th><th>Verdict</th><th class="n" style="padding-right:26px">Score</th><th>Image SHA-256</th><th>Model</th><th>Hash</th><th>Chained to</th></tr></thead><tbody>${a.records.map((r) => `<tr class="${r.cycle_id ? "click" : ""}" ${r.cycle_id ? `data-part="${esc(r.cycle_id)}#0" tabindex="0"` : ""}><td>${r.ts ? clock(r.ts) : "–"}</td><td>${r.record === "part_verdict" ? "Part verdict" : r.record === "view" ? "View" : esc(words(r.record))}</td><td>${esc(r.cycle_id || "–")}</td><td>${r.camera ? esc(words(r.camera)) : "All"}</td><td>${esc(words(r.verdict || "–"))}</td><td class="n" style="padding-right:26px">${num(r.score, 2)}</td><td class="mono">${esc(r.image || "–")}</td><td class="mono">${esc(r.model || "–")}</td><td class="mono">${esc(r.hash)}</td><td class="mono muted">${esc(r.prev)}</td></tr>`).join("")}</tbody></table></div></section></div>`;
+   <div class="scroll"><table><thead><tr><th>Time</th><th>Record</th><th>Cycle</th><th>View</th><th>Verdict</th><th class="n" style="padding-right:26px">Score</th><th>Image SHA-256</th><th>Model</th><th>Hash</th><th>Chained to</th></tr></thead><tbody>${a.records.map((r) => `<tr class="${r.cycle_id ? "click" : ""}" ${r.cycle_id ? `data-part="${esc(r.cycle_id)}#0" tabindex="0"` : ""}><td>${r.ts ? clock(r.ts) : "–"}</td><td>${r.record === "part_verdict" ? "Part verdict" : r.record === "view" ? "View" : r.record === "person_action" ? esc(words(r.what)) + " by " + esc(r.by) : esc(words(r.record))}</td><td>${esc(r.cycle_id || (r.record === "person_action" ? (r.target || "") + (r.reason ? ": " + r.reason : "") : "–"))}</td><td>${r.camera ? esc(words(r.camera)) : "All"}</td><td>${esc(words(r.verdict || "–"))}</td><td class="n" style="padding-right:26px">${num(r.score, 2)}</td><td class="mono">${esc(r.image || "–")}</td><td class="mono">${esc(r.model || "–")}</td><td class="mono">${esc(r.hash)}</td><td class="mono muted">${esc(r.prev)}</td></tr>`).join("")}</tbody></table></div></section></div>`;
 }
 
 /* ---------------------------------------------------------------- app */
@@ -158,6 +176,7 @@ function chrome() {
   const s = S.state;
   $("#nav").innerHTML = TABS.map(([id, t]) => `<button role="tab" data-tab="${id}" aria-selected="${S.tab === id}">${t}</button>`).join("");
   $("#clock").textContent = new Date().toLocaleTimeString("en-GB");
+  const who = $("#who"); who.textContent = S.me?.name ? `${S.me.name} (${S.me.role}) · sign out` : S.me?.accounts ? "" : "no accounts: reading only"; who.disabled = !S.me?.name;
   if (!s) return;
   $("#where").textContent = `${s.line} · ${s.machine}`;
   const sim = $("#sim"); sim.textContent = s.simulated ? `Simulated station${s.time_scale !== 1 ? ` · ${s.time_scale}× speed` : ""}` : "";
@@ -166,11 +185,14 @@ function chrome() {
 }
 let lastHtml = "", drawing = 0;
 async function draw() {
+  if (S.signIn) { if (!$("#login")) $("#view").innerHTML = lastHtml = loginView(); return; }
   if (!S.state) return; const token = ++drawing; let html;
   registry.clear(); chartId = 0;
-  try { html = S.tab === "live" ? liveView() : S.tab === "trace" ? traceView() : S.tab === "process" ? await processView() : S.tab === "quality" ? await qualityView() : await auditView(); }
+  try { html = S.tab === "live" ? liveView() : S.tab === "trace" ? traceView() : S.tab === "process" ? await processView() : S.tab === "quality" ? await qualityView() : S.tab === "work" ? await workView() : await auditView(); }
   catch (err) { html = '<div class="card"><div class="empty">This view could not load. Retrying.</div></div>'; }
   if (token !== drawing || html === lastHtml) return;
+  if (document.activeElement?.matches?.(".in") && document.activeElement.value && !S.force) return;   // someone is typing
+  S.force = false;
   const boxes = [...document.querySelectorAll(".scroll")].map((b) => b.scrollTop); $("#view").innerHTML = lastHtml = html;
   document.querySelectorAll(".scroll").forEach((b, i) => { b.scrollTop = boxes[i] || 0; });
 }
@@ -179,6 +201,8 @@ async function select(key, tab) { S.key = key; if (tab) S.tab = tab; hideTip(); 
 async function tick() {
   if (S.busy) return; S.busy = true;
   try {
+    S.me = await api("me"); if (S.me.accounts && !S.me.name) S.signIn = true;
+    if (S.signIn) throw new Error("sign in");
     const [state, parts] = await Promise.all([api("state"), api("parts?limit=600")]); S.state = state; S.parts = parts;
     if (S.tab === "live") S.key = state.latest;
     if (S.tab === "trace" && !S.key) S.key = (parts.filter((p) => p.verdict === "fail" && p.key).pop() || {}).key || null;
@@ -187,7 +211,9 @@ async function tick() {
   S.busy = false; chrome(); draw();
 }
 document.addEventListener("click", (e) => {
-  const t = e.target.closest("[data-tab],[data-part],[data-heat],[data-only],[data-signal],[data-machine],#theme,#csv"); if (!t) return;
+  const t = e.target.closest("[data-tab],[data-part],[data-heat],[data-only],[data-signal],[data-machine],[data-do],#theme,#csv,#who"); if (!t) return;
+  if (t.dataset.do) return change(t);
+  if (t.id === "who") { post("logout").finally(() => { S.me = null; S.signIn = true; S.state = null; tick(); }); return; }
   if (t.dataset.tab) { S.tab = t.dataset.tab; history.replaceState(null, "", "#" + S.tab); lastHtml = ""; if (S.tab === "trace") { const f = S.parts.filter((p) => p.verdict === "fail" && p.key).pop(); if (f) return select(f.key); } chrome(); draw(); }
   else if (t.dataset.part !== undefined) { if (t.dataset.part) select(t.dataset.part, "trace"); }
   else if (t.dataset.heat) { S.heat = t.dataset.heat === "1"; draw(); }
@@ -196,6 +222,17 @@ document.addEventListener("click", (e) => {
   else if (t.dataset.machine) { S.machine = t.dataset.machine; draw(); }
   else if (t.id === "theme") { const r = document.documentElement; r.dataset.theme = r.dataset.theme === "dark" ? "light" : "dark"; }
   else if (t.id === "csv") { const rows = [...document.querySelectorAll("#view table tr")].map((r) => [...r.children].map((c) => '"' + c.textContent.replace(/"/g, '""') + '"').join(",")); const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([rows.join("\n")], { type: "text/csv" })); a.download = "qualyxus-audit.csv"; a.click(); }
+});
+async function change(t) {
+  const id = t.dataset.key || t.dataset.do.split("/")[1]; t.disabled = true;
+  try { await post(t.dataset.do, { reason: S.reasons[id] || "", verdict: t.dataset.verdict, process_change: !!t.dataset.change }); delete S.reasons[id]; S.force = true; lastHtml = ""; await draw(); }
+  catch (err) { t.disabled = false; tip.textContent = err.message; tip.style.opacity = 1; const b = t.getBoundingClientRect(); tip.style.left = b.left + "px"; tip.style.top = b.bottom + 8 + "px"; setTimeout(hideTip, 4000); }
+}
+document.addEventListener("input", (e) => { if (e.target.dataset?.reason) S.reasons[e.target.dataset.reason] = e.target.value; });
+document.addEventListener("submit", async (e) => {
+  if (e.target.id !== "login") return; e.preventDefault(); const f = new FormData(e.target);
+  try { await post("login", { name: f.get("name"), password: f.get("password") }); S.signIn = false; S.note = ""; lastHtml = ""; $("#view").innerHTML = ""; await tick(); }
+  catch (err) { S.note = err.message; $("#loginerr").textContent = err.message; }
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.matches?.("tr[data-part]")) select(e.target.dataset.part, "trace"); });
 const [h, k] = location.hash.slice(1).split("/"); if (TABS.some(([id]) => id === h)) { S.tab = h; if (k) S.key = decodeURIComponent(k) + (location.hash.split("#")[2] ? "#" + location.hash.split("#")[2] : ""); }

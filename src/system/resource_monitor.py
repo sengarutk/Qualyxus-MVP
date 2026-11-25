@@ -64,7 +64,7 @@ class ResourceGovernor:
                 if len(self._latency_samples) > 30:
                     self._latency_samples = self._latency_samples[-30:]
         except Exception:
-            pass
+            LOGGER.debug("Ignored", exc_info=True)
 
     def allow_gpu_preprocess(self, vram_soft_limit: float = 90.0) -> bool:
         """Return False when VRAM is too high to safely run extra GPU kernels.

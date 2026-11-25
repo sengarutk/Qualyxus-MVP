@@ -4,7 +4,6 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
 
 import requests
 
@@ -131,7 +130,7 @@ class VLMEngine:
                         raw = str(val.get("content")).strip()
                         break
             except Exception:
-                pass
+                LOGGER.debug("Ignored", exc_info=True)
 
         # Remove boilerplate/meta-talk.
         raw = re.sub(r"^as an ai language model[,:\s]+", "", raw, flags=re.IGNORECASE)

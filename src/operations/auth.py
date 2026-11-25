@@ -1,4 +1,4 @@
-"""Dashboard accounts: who is signed in decides the role, not a dropdown.
+"""Accounts for the console and the command line: who is signed in decides the role, not a dropdown.
 
 Passwords are stored as salted scrypt hashes in a local file, so logins work on an
 air-gapped box. Create accounts from a shell on that box:
@@ -21,12 +21,13 @@ import threading
 import time
 from pathlib import Path
 
-from src.operations.rbac import parse_role
+from src.operations.rbac import enforce, parse_role
 
 _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32}
 MIN_PASSWORD = 10
 MAX_FAILURES = 5
 LOCKOUT_S = 300.0
+MAX_ADDRESS_FAILURES = 30
 SESSION_S = 8 * 3600.0
 
 
@@ -37,7 +38,9 @@ def _hash(password: str, salt: bytes) -> str:
 class UserStore:
     def __init__(self, path: str | Path = "secrets/users.json"):
         self.path = Path(path)
-        self._failures: dict[str, tuple[int, float]] = {}
+        # Failures are counted per account *and* where they come from: someone else's wrong
+        # guesses must not lock a person out. Kept on disk, so a restart does not reset them.
+        self._failures_path = self.path.with_name(self.path.stem + ".failures.json")
         self._lock = threading.Lock()
 
     def _read(self) -> dict[str, dict[str, str]]:
@@ -75,30 +78,77 @@ class UserStore:
             self._write(users)
         return removed
 
-    def locked_for(self, username: str, now: float | None = None) -> float:
-        """Seconds until this account can try again after repeated failures."""
-        now = time.time() if now is None else now
-        with self._lock:
-            count, last = self._failures.get(username, (0, 0.0))
-        return max(0.0, last + LOCKOUT_S - now) if count >= MAX_FAILURES else 0.0
+    def role_of(self, username: str) -> str | None:
+        """The role now. A removed or demoted person loses it at once, whatever they signed in with."""
+        entry = self._read().get(username)
+        return entry["role"] if entry else None
 
-    def authenticate(self, username: str, password: str, now: float | None = None) -> str | None:
+    def _failures(self, now: float) -> dict[str, list[float]]:
+        try:
+            raw = json.loads(self._failures_path.read_text(encoding="utf-8"))
+            return {k: [int(v[0]), float(v[1])] for k, v in raw.items() if now - float(v[1]) < LOCKOUT_S}
+        except (OSError, ValueError, TypeError, IndexError):
+            return {}
+
+    def _save_failures(self, failures: dict[str, list[float]]) -> None:
+        self._failures_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._failures_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(failures), encoding="utf-8")
+        os.replace(tmp, self._failures_path)
+
+    def locked_for(self, username: str, now: float | None = None, address: str = "local") -> float:
+        """Seconds until this account can be tried again from this address."""
+        now = time.time() if now is None else now
+        failures = self._failures(now)
+        wait = 0.0
+        for key, limit in ((f"{username}@{address}", MAX_FAILURES), (f"@{address}", MAX_ADDRESS_FAILURES)):
+            count, last = failures.get(key, (0, 0.0))
+            if count >= limit:
+                wait = max(wait, last + LOCKOUT_S - now)
+        return wait
+
+    def authenticate(self, username: str, password: str, now: float | None = None, address: str = "local") -> str | None:
         """The account's role, or None. Unknown users cost the same time as wrong passwords."""
         now = time.time() if now is None else now
-        if self.locked_for(username, now) > 0:
-            return None
-        entry = self._read().get(username)
-        salt = bytes.fromhex(entry["salt"]) if entry else b"\0" * 16
-        candidate = _hash(password, salt)
-        if entry is not None and hmac.compare_digest(candidate, entry["hash"]):
-            with self._lock:
-                self._failures.pop(username, None)
-            return entry["role"]
         with self._lock:
-            count, last = self._failures.get(username, (0, 0.0))
-            count = 0 if now - last > LOCKOUT_S else count
-            self._failures[username] = (count + 1, now)
-        return None
+            if self.locked_for(username, now, address) > 0:
+                return None
+            entry = self._read().get(username)
+            salt = bytes.fromhex(entry["salt"]) if entry else b"\0" * 16
+            candidate = _hash(password, salt)
+            good = entry is not None and hmac.compare_digest(candidate, entry["hash"])
+            failures = self._failures(now)
+            if good:
+                if failures.pop(f"{username}@{address}", None) is not None:
+                    self._save_failures(failures)
+                return entry["role"]
+            for key in (f"{username}@{address}", f"@{address}"):
+                failures[key] = [failures.get(key, (0, 0.0))[0] + 1, now]
+            while len(failures) > 10000:
+                failures.pop(next(iter(failures)))
+            self._save_failures(failures)
+            return None
+
+
+def signed_in(username: str, permission, users_file: str | Path = "secrets/users.json") -> str:
+    """For commands that change something: prove who it is, and that they may.
+
+    The password comes from QUALYXUS_PASSWORD or is asked for. A box with no accounts yet
+    accepts any name, and says so: that is for setting it up, not for production.
+    """
+    store = UserStore(users_file)
+    if not store.has_users():
+        print("WARNING: no accounts exist, so this name is not checked. Create accounts: "
+              "python -m src.operations.auth add NAME --role QA", file=sys.stderr)
+        return username
+    password = os.environ.get("QUALYXUS_PASSWORD")
+    if password is None:
+        password = getpass.getpass(f"Password for {username}: ")
+    role = store.authenticate(username, password)
+    if role is None:
+        raise PermissionError("wrong name or password (or too many attempts; wait five minutes)")
+    enforce(role, permission)
+    return username
 
 
 def main(argv=None) -> int:

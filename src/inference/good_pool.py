@@ -14,6 +14,7 @@ queue and count only once a person has confirmed them. Retraining itself always 
 """
 from __future__ import annotations
 
+import collections
 import json
 import threading
 import time
@@ -38,6 +39,8 @@ class GoodPartPool:
         # The calibration sample matters more per image, so it gets the larger share of the space.
         self.max_bytes = None if max_gb is None else int(max_gb * 1e9 * 0.4)
         self.calibration_max_bytes = None if max_gb is None else int(max_gb * 1e9 * 0.6)
+        self._listed: dict[Path, collections.deque[tuple[Path, int]]] = {}
+        self._written = self.dir
         self._seen = 0
         self._parts = 0
         self._lock = threading.Lock()
@@ -53,7 +56,8 @@ class GoodPartPool:
             self._seen += 1
             if self._seen % self.every_n:
                 return None
-            path = self._write(self.dir, image, camera_id, normalized_score=normalized_score, image_sha=image_sha)
+            path = self._written = self._write(self.dir, image, camera_id, normalized_score=normalized_score,
+                                               image_sha=image_sha)
             self._evict(self.dir, self.max_items, self.max_bytes)
             return path
 
@@ -66,8 +70,8 @@ class GoodPartPool:
                 return None
             accepted = verdict == "pass" and (self.max_score is None or normalized_score is None
                                               or normalized_score <= self.max_score)
-            self._write(self.calibration_dir, image, camera_id, normalized_score=normalized_score,
-                        image_sha=image_sha, accepted=accepted)
+            self._written = self._write(self.calibration_dir, image, camera_id, normalized_score=normalized_score,
+                                        image_sha=image_sha, accepted=accepted)
             self._evict(self.calibration_dir, self.calibration_max_items, self.calibration_max_bytes)
             return "accepted" if accepted else "needs_review"
 
@@ -110,18 +114,19 @@ class GoodPartPool:
             raise
         return path
 
-    @staticmethod
-    def _evict(directory: Path, max_items: int, max_bytes: int | None = None) -> None:
-        images = sorted(directory.glob("*.png"))
-        keep = min(len(images), max_items)
-        if max_bytes is not None:
-            total = 0
-            for k, path in enumerate(reversed(images)):     # newest first
-                total += path.stat().st_size
-                if total > max_bytes:
-                    keep = min(keep, k)
-                    break
-        for old in images[: len(images) - keep]:
+    def _evict(self, directory: Path, max_items: int, max_bytes: int | None = None) -> None:
+        """Drop the oldest. The folder is listed once; after that the list is kept by hand."""
+        images = self._listed.get(directory)
+        if images is None:
+            images = collections.deque((p, p.stat().st_size) for p in sorted(directory.glob("*.png")))
+            self._listed[directory] = images
+        else:
+            newest = self._written
+            images.append((newest, newest.stat().st_size))
+        total = sum(size for _, size in images)
+        while images and (len(images) > max_items or max_bytes is not None and total > max_bytes and len(images) > 1):
+            old, size = images.popleft()
+            total -= size
             old.unlink(missing_ok=True)
             old.with_suffix(".json").unlink(missing_ok=True)
 
