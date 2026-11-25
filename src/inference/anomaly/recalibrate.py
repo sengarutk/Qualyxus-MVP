@@ -33,11 +33,12 @@ SYNTHETIC_HOLDOUT_SEED = 200_000
 
 
 def recalibrate(detector, good_images: Sequence[np.ndarray], *, part_frr: float = 0.01,
-                n_views: int = 1) -> dict[str, Any]:
+                n_views: int = 1, confidence: float | None = None) -> dict[str, Any]:
     """Set the detector's threshold so a good part is falsely rejected at most ``part_frr``."""
     if n_views < 1:
         raise ValueError("n_views must be at least 1")
-    result = detector.calibrate(detector._holdout_scores(good_images), target_frr=part_frr / n_views)
+    result = detector.calibrate(detector._holdout_scores(good_images), target_frr=part_frr / n_views,
+                                confidence=confidence)
     detector.calibration.update({"part_frr_target": part_frr, "n_views": n_views,
                                  "image_quality": image_quality_baseline(good_images)})
     return {**result, "part_frr_target": part_frr, "n_views": n_views}

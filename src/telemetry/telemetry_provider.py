@@ -41,6 +41,8 @@ class TelemetryProvider:
         port: int = 502,
         unit_id: int = 1,
         register_map: dict[str, Any] | None = None,
+        require_ack: bool = False,
+        min_verdict_hold_s: float = 0.1,
     ):
         resolved_mode = mode or ("simulated" if simulation_mode else "plc")
         self.simulation_mode = resolved_mode == "simulated"
@@ -53,6 +55,8 @@ class TelemetryProvider:
                 port=port,
                 unit_id=unit_id,
                 register_map=register_map,
+                require_ack=require_ack,
+                min_verdict_hold_s=min_verdict_hold_s,
             )
         )
         self._sim_targets: dict[str, dict[str, Any]] = {}

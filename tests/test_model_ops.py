@@ -308,6 +308,8 @@ def _health_fields(cm, views=()):
 
     now = time.perf_counter()
     cm._lock = threading.Lock()
+    cm.shutdown_event, cm._reflex_stop = threading.Event(), threading.Event()
+    cm.max_verdict_age_s, cm._alert_write = 3.0, None
     cm._view_faults, cm._delivery_fault_until = {}, 0.0
     cm._heartbeat_write, cm._hold_reason = None, None
     cm.max_frame_age_s, cm.max_inspect_s = 5.0, 10.0
@@ -423,17 +425,43 @@ def test_approved_retrain_trains_on_the_pool_and_registers_a_shadow(tmp_path):
     pool = GoodPartPool(tmp_path / "pool", "housing", every_n=1)
     for s in range(16):
         pool.offer(render_part(160, 120, None, seed=s), verdict="pass", normalized_score=0.2, camera_id="cam")
+    calibration = GoodPartPool(tmp_path / "pool", "housing", calibration_every_n=1)
+    for s in range(12):    # one of them was uncertain, so a person has to decide it
+        calibration.sample(render_part(160, 120, None, seed=100 + s), verdict="pass", camera_id="cam",
+                           normalized_score=0.95 if s == 0 else 0.2, image_sha=f"sha{s}")
     reg = VisionModelRegistry(tmp_path / "reg")
     req = reg.request_retrain("housing", camera_id="cam", reason="drift", since_ts=0.0)
     with pytest.raises(ValueError):   # not approved yet
         main(["--root", str(tmp_path / "reg"), "retrain", req["id"], "--pool-dir", str(tmp_path / "pool"),
               "--min-images", "10", "--candidate", "patchcore_wrn50", "--work-dir", str(tmp_path / "work")])
     reg.decide(req["id"], approve=True, by="alice")
-    result = main(["--root", str(tmp_path / "reg"), "retrain", req["id"], "--pool-dir", str(tmp_path / "pool"),
-                   "--min-images", "10", "--candidate", "patchcore_wrn50", "--confidence", "0.5",
-                   "--work-dir", str(tmp_path / "work")])
-    assert result["images"] == 16
+    command = ["--root", str(tmp_path / "reg"), "retrain", req["id"], "--pool-dir", str(tmp_path / "pool"),
+               "--min-images", "10", "--candidate", "patchcore_wrn50", "--confidence", "0.5",
+               "--work-dir", str(tmp_path / "work"), "--review-dir", str(tmp_path / "review")]
+    with pytest.raises(ValueError, match="--views"):
+        main(command)
+    command += ["--views", "2", "--part-frr", "0.4", "--register"]
+    with pytest.raises(ValueError, match="need a person"):
+        main(command)
+    (tmp_path / "review").mkdir()
+    (tmp_path / "review" / "a.json").write_text(json.dumps({"image_sha": "sha0", "review": {"verdict": "pass"}}))
+    with pytest.raises(ValueError, match="calibration images"):   # 2 views at 0.2% each need far more
+        main([*command, "--part-frr", "0.004"])
+    result = main(command)
+    assert (result["images"], result["calibration_images"], result["views"]) == (16, 12, 2)
+    from src.inference.anomaly.registry import load_detector
+
+    trained = load_detector(reg.path_of("housing", "anomaly", result["version"]), device="cpu")
+    assert trained.calibration["n_views"] == 2 and trained.calibration["target_frr"] == pytest.approx(0.2)
+    assert trained.calibration["n_holdout"] == 12 and trained.preprocessor.register
+    # The next retraining of this recipe inherits views, target and alignment from that model.
+    from types import SimpleNamespace
+    from src.inference.model_registry import _retrain_settings
+
     assert reg.resolve("housing", "anomaly")["shadow_version"] == result["version"]
+    reg.promote("housing", "anomaly", by="alice", reason="test")
+    blank = SimpleNamespace(base_model=None, views=None, part_frr=None, tiles=None, register=None)
+    assert _retrain_settings(reg, "housing", blank) == {"views": 2, "part_frr": 0.4, "register": True, "tiles": None}
     assert reg.requests()[0]["status"] == "done"
 
 
@@ -484,7 +512,8 @@ def test_passed_part_reports_a_clear_flag_with_its_number(tmp_path):
     cm, state = _reject_path_manager(tmp_path, _StubStack(False, "v0001", 0.4))
     cm._inspect_part(state, CompletedPart("cam", 1.0, 2.0, render_part(160, 120, None, seed=3), 7, 3))
     signal = cm.fast_queue.get_nowait()
-    assert state.parts_inspected == 1 and signal["verdict"] == "pass" and signal["flag"] == 0 and signal["part"] == 1
+    assert state.parts_inspected == 1 and signal["verdict"] == "pass" and signal["flag"] == 0
+    assert signal["part"] == 0    # no machine cycle: never an invented number
 
 
 def test_part_with_no_model_is_not_passed(tmp_path):
@@ -591,7 +620,9 @@ def _modbus_recorder():
                     return
                 body = conn.recv(struct.unpack(">H", header[4:6])[0] - 1)
                 function, address = body[0], struct.unpack(">H", body[1:3])[0]
-                if function == 0x06:
+                if function == 0x03:    # reads: every register holds 7
+                    conn.sendall(header[:4] + struct.pack(">H", 5) + header[6:7] + bytes([3, 2, 0, 7]))
+                elif function == 0x06:
                     frames.append((function, address, [struct.unpack(">H", body[3:5])[0]]))
                     conn.sendall(header + body)
                 else:  # 0x10 write multiple
@@ -616,7 +647,7 @@ def test_part_verdict_writes_flag_and_part_number_in_one_frame_on_a_real_socket(
     adapter.close()
     worker.join(timeout=2)
     server.close()
-    assert frames == [(0x10, 100, [3, 70001 & 0xFFFF]), (0x06, 102, [1]), (0x06, 102, [2]), (0x06, 103, [2])]
+    assert frames == [(0x10, 100, [3, 70001 & 0xFFFF]), (0x06, 104, [8]), (0x06, 102, [1]), (0x06, 102, [2]), (0x06, 103, [2])]
 
 
 def test_plc_write_failure_is_counted_not_raised():
@@ -914,10 +945,10 @@ def test_one_view_catches_a_defect_on_its_face_only():
 def test_config_extends_overlays_a_base_file(tmp_path):
     from src.config.config import Config
 
-    (tmp_path / "base.yaml").write_text("a: {x: 1, y: 2}\ncameras: [{id: old}]\n")
-    (tmp_path / "child.yaml").write_text("extends: base.yaml\na: {y: 3}\ncameras: [{id: new}]\n")
+    (tmp_path / "base.yaml").write_text("paths: {x: 1, y: 2}\ncameras: [{id: old}]\n")
+    (tmp_path / "child.yaml").write_text("extends: base.yaml\npaths: {y: 3}\ncameras: [{id: new}]\n")
     raw = Config.load(config_path=str(tmp_path / "child.yaml")).raw
-    assert raw["a"] == {"x": 1, "y": 3} and raw["cameras"] == [{"id": "new"}] and "extends" not in raw
+    assert raw["paths"] == {"x": 1, "y": 3} and raw["cameras"] == [{"id": "new"}] and "extends" not in raw
 
 
 def test_patchcore_training_does_not_hold_the_raw_bank_on_the_device():
@@ -937,7 +968,7 @@ def test_recalibration_splits_the_false_reject_budget_across_views():
         def _holdout_scores(self, images):
             return list(images)
 
-        def calibrate(self, scores, target_frr):
+        def calibrate(self, scores, target_frr, confidence=None):
             self.target = target_frr
             self.calibration = {}
             return {"threshold": 1.0}
@@ -1086,7 +1117,7 @@ def test_verdict_that_never_arrived_stops_the_heartbeat(tmp_path, adapter_result
     cm, _ = _heartbeat_manager(tmp_path)
 
     class Plc(_Beats):
-        def write_part_verdict(self, signal):
+        def write_part_verdict(self, signal, deadline=None):
             if isinstance(adapter_result, Exception):
                 raise adapter_result
             return adapter_result
@@ -1122,10 +1153,11 @@ def test_heartbeats_do_not_queue_up_behind_a_hung_plc(tmp_path):
 
 
 def test_clean_stop_does_not_leave_a_pass_on_the_plc():
-    from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED, PLC_REGISTERS, PLCAdapter
+    from src.telemetry.plc_adapter import PLC_FLAG_NOT_INSPECTED, PLC_REGISTERS, PLCAdapter, PLCAdapterConfig
 
-    plc, sent = PLCAdapter(), {}
+    plc, sent = PLCAdapter(PLCAdapterConfig(mode="plc")), {}
     plc._send = lambda address, values: sent.update({address: values[0]}) or True
+    plc._read = lambda name: 0
     plc.clear()
     assert sent == {PLC_REGISTERS["verdict"]: PLC_FLAG_NOT_INSPECTED, PLC_REGISTERS["alert"]: 0}
 

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import yaml
 
+from src.config.schema import ConfigError, validate
+
 
 def _deep_update(base: dict, override: dict) -> dict:
     for k, v in override.items():
@@ -13,6 +15,32 @@ def _deep_update(base: dict, override: dict) -> dict:
         else:
             base[k] = v
     return base
+
+
+class _StrictLoader(yaml.SafeLoader):
+    """YAML where a repeated key is an error: the later one would silently win."""
+
+    def construct_mapping(self, node, deep=False):
+        keys = [k.value for k, _ in node.value if k.tag != "tag:yaml.org,2002:merge"]
+        repeated = sorted({k for k in keys if isinstance(k, str) and keys.count(k) > 1})
+        merged = getattr(node, "_qualyxus_flat", False)
+        if repeated and not merged:
+            raise ConfigError(f"key {repeated} appears twice{node.start_mark}")
+        node._qualyxus_flat = True    # merge keys are expanded below; overriding those is legitimate
+        return super().construct_mapping(node, deep=deep)
+
+
+def _read_layers(path: Path, seen: tuple[Path, ...] = ()) -> dict:
+    """A config file layered over the one it `extends:` (relative to itself), to any depth."""
+    path = path.resolve()
+    if path in seen:
+        raise ConfigError(f"config files extend each other in a circle: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        base = yaml.load(f, Loader=_StrictLoader)   # noqa: S506 - subclass of SafeLoader
+    if not isinstance(base, dict) or not base:
+        raise RuntimeError(f"Config YAML is empty or invalid: {path}")
+    extends = base.pop("extends", None)
+    return _deep_update(_read_layers(path.parent / extends, (*seen, path)), base) if extends else base
 
 
 @dataclass(frozen=True)
@@ -62,20 +90,10 @@ class Config:
         if not resolved_config_path.exists():
             raise FileNotFoundError(f"Config file not found: {resolved_config_path}")
 
-        with open(resolved_config_path, "r", encoding="utf-8") as f:
-            base = yaml.safe_load(f)
-
-        if base is None:
-            raise RuntimeError(f"Config YAML is empty or invalid: {resolved_config_path}")
-
-        # `extends: <file>` layers this config over another one (relative to this file).
-        extends = base.pop("extends", None)
-        if extends:
-            with open(resolved_config_path.parent / extends, "r", encoding="utf-8") as f:
-                base = _deep_update(yaml.safe_load(f), base)
-
+        base = _read_layers(resolved_config_path)
         if overrides:
             base = _deep_update(base, overrides)
+        validate(base)
 
         cfg = Config(raw=base)
         cfg.ensure_dirs()

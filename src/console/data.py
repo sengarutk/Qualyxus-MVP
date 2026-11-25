@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from src.camera.view_store import part_folder
+from src.config.schema import required_views
 from src.process.machine_health import ACT_Z, INJECTION_MOLDING_COMPONENTS, WATCH_Z, assess_machine
 from src.process.simulator import INJECTION_MOLDING_SPEC_LIMITS
 from src.process.store import ProcessStore
@@ -75,7 +76,7 @@ class ConsoleData:
         self.model_path = inspection.get("anomaly_model")
         cameras = [c for c in cfg.get("cameras") or [] if c.get("enabled", True)]
         self.cameras = [str(c["id"]) for c in cameras]
-        self.required = [str(c["id"]) for c in cameras if c.get("required_view")] or self.cameras
+        self.required = required_views(cameras) or self.cameras
         self.simulated = str(process.get("source", "simulated")) == "simulated"
         self.time_scale = float((process.get("simulator") or {}).get("time_scale", 1.0)) if self.simulated else 1.0
         self._store: ProcessStore | None = None

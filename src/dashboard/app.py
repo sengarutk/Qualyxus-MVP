@@ -31,6 +31,7 @@ def _safe_parse_telemetry_float(value: Any, default: float = 0.0) -> float:
 from src.analytics.insight_generator import generate_insights
 from src.analytics.root_cause import run_root_cause
 from src.config.config import Config
+from src.config.schema import required_views
 from src.dashboard.components import kpi_row, show_events_table
 from src.operations.action_tracker import ActionTracker
 from src.operations.alert_manager import build_alerts, load_unresolved_actions
@@ -263,8 +264,7 @@ def main():
 def _render_vision_section(cfg, status_path: str) -> None:
     st.divider()
     st.subheader("🔬 Vision Models & Inspection Quality")
-    required = tuple(str(c.get("id")) for c in (cfg.get("cameras", default=[]) or [])
-                     if c.get("enabled", True) and c.get("required_view"))
+    required = tuple(required_views(cfg.get("cameras", default=[]) or []))
     overview = fetch_vision_overview(
         status_path,
         str(cfg.get("process", "db_path", default="data/events/process.db")),

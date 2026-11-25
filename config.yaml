@@ -70,6 +70,14 @@ telemetry:
   port: 502
   unit_id: 1
   heartbeat_s: 1.0
+  # A verdict older than this is never written: its part has left. Keep it below the travel
+  # time from the cameras to the rejector.
+  max_verdict_age_s: 3.0
+  # Each verdict stays in the registers at least this long; use two PLC scan times or more.
+  min_verdict_hold_s: 0.1
+  # Set true once the PLC program copies the sequence register to the ack register: then no
+  # verdict is overwritten before the PLC has taken it.
+  require_ack: false
   register_map: null
 
 hardware_acceleration:
@@ -283,6 +291,10 @@ inspection:
     every_n: 5
     max_items: 3000
     max_score: 0.8
+    # Every n-th part, whatever it scored, sets the threshold of a retrained model. Uncertain
+    # ones go to the review queue and must be labelled before retraining.
+    calibration_every_n: 20
+    calibration_max_items: 2000
   # Borderline parts (normalized score in band) are saved for operator review. Label them in
   # Label Studio / CVAT via src.inference.labeling (export -> import), then ingest the reviewed
   # items with src.inference.anomaly.monitoring.ingest_reviews (audits + typing crops).
@@ -305,13 +317,15 @@ vibration_analysis:
 
 # ✅ BLENDER RTSP STREAM ROUTING (TOP, BOTTOM, FRONT, BACK)
 # Per camera, optionally: `recipe: <name>` (which recipe's models judge its parts) and
-# `required_view: true` (a part is only fully inspected once this view has seen it; the
+# `required_view: true` (with several cameras and none marked, all are required;
+# `required_view: false` cameras can reject a part but never pass one. A part is only fully inspected once this view has seen it; the
 # dashboard reports parts missing a required view as incomplete). A multi-view verdict
 # also needs a `process_link` on every view, so each one resolves the same physical part.
 # config.360.yaml runs a simulated six-view station.
 cameras:
   - id: "cam_0"
     enabled: true
+    required_view: false
     source: "rtsp://127.0.0.1:8554/cam_0"
     mock_inference: false
     independent_logs: true
@@ -324,6 +338,7 @@ cameras:
 
   - id: "cam_1"
     enabled: true
+    required_view: false
     source: "rtsp://127.0.0.1:8554/cam_1"
     mock_inference: false
     independent_logs: true
@@ -336,6 +351,7 @@ cameras:
 
   - id: "cam_2"
     enabled: true
+    required_view: false
     source: "rtsp://127.0.0.1:8554/cam_2"
     mock_inference: false
     independent_logs: true
@@ -348,6 +364,7 @@ cameras:
 
   - id: "cam_3"
     enabled: true
+    required_view: false
     source: "rtsp://127.0.0.1:8554/cam_3"
     mock_inference: false
     independent_logs: true
@@ -362,6 +379,7 @@ cameras:
   # simulated process actually produced (development scene for the process <-> vision loop).
   - id: "cam_process"
     enabled: true
+    required_view: true
     source: "synthetic://cam_process"
     mock_inference: true
     synthetic_scene: "process"

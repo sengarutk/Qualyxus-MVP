@@ -202,6 +202,10 @@ class StackProvider:
             return active, shadow
         # No registry entry: explicit paths from the config (single, unversioned stack).
         recipes_cfg = (self.cfg.get("recipes") or {}).get(recipe) or {}
+        if not recipes_cfg and recipe != self.default_recipe:
+            # Another product's model must not judge this one: an empty stack is "not inspected".
+            logger.error("[Inspection] No model for recipe '%s': its parts are recorded as not inspected.", recipe)
+            return InspectionStack(recipe), None
         src = recipes_cfg if recipes_cfg else self.cfg
         active = InspectionStack(recipe, anomaly_path=src.get("anomaly_model"),
                                  segmentation_path=src.get("segmentation_model"),

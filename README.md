@@ -61,14 +61,24 @@ python -m src.operations.auth add <name> --role QA
 | Register | Meaning |
 |---|---|
 | 100 | Part verdict: 0 pass, 1-3 reject by severity, 4 could not be inspected (also set on a clean stop) |
-| 101 | Machine cycle counter of that part (changes with every verdict; written with 100 in one frame) |
+| 101 | Machine cycle counter of that part, written with 100 in one frame; 0 if no machine cycle matched |
 | 102 | Heartbeat counter: stops when a camera goes silent, a view cannot inspect, or a verdict fails to arrive (held at least 10 s), so treat parts as not inspected |
 | 103 | Machine-level alert (geometry, vibration) that belongs to no single part |
+| 104 | Sequence, 1 to 65535: **act when this changes.** It changes with every verdict and is written last. Register 101 can repeat |
+| 105 | Acknowledge, written by the PLC: copy 104 here once the verdict is taken (needed with `telemetry.require_ack`) |
+| 106 | Cavity of that part, on multi-cavity stations only |
+
+A verdict stays at least `min_verdict_hold_s` (or, with `require_ack`, until acknowledged) and is
+never written later than `max_verdict_age_s`; one that could not be delivered stops the heartbeat
+and is recorded in the audit trail. A reject found after the part's verdict was sent is sent
+again under the same part number. On shutdown every part already seen gets its verdict first.
+Simulated images cannot drive a real PLC unless `telemetry.bench_test: true`.
 
 Each physical part gets one verdict. On a multi-camera station a part passes only when every
-`required_view` has passed it; a view missing after `inspection.view_timeout_s` gives flag 4.
+`required_view` has passed it (with none marked, every camera is required); other cameras can
+reject a part but never pass it. A view missing after `inspection.view_timeout_s` gives flag 4.
 A machine cycle whose part no camera reported also gives flag 4 (`time`-linked stations, see
-`inspection.expect_part_per_cycle`). A multi-cavity shot uses a running count in register 101.
+`inspection.expect_part_per_cycle`).
 
 **Operations console.** A read-only page for the line: live views of every face, a trace from a
 rejected part to its machine cycle and the signals that moved, control charts, machine health
@@ -151,7 +161,7 @@ python -m src.inference.defect_typing --crops data/labels/defect_crops --out mod
 | Versions & rollback | Each recipe/role has immutable versions, an active one and a full who/when/why history; promote and rollback are picked up by the running line within seconds | `python -m src.inference.model_registry register / list / promote / rollback` |
 | Shadow mode | A candidate judges every live part next to the active model without affecting verdicts; the report compares reject rates and accuracy/escapes on human-reviewed parts | `... model_registry shadow-report --recipe <r>` |
 | Recipes | Models are loaded per recipe: per camera (`recipe:`) or from the producing cycle's machine data (`inspection.recipe_from_scalar`, e.g. the mold id) | `config.yaml` → `inspection` |
-| Drift → retraining | Score drift files a retraining request; a human approves it; the model is trained on the pooled good parts captured after the change and registered as shadow | `... model_registry requests / approve / retrain` |
+| Drift → retraining | Score drift files a retraining request; a human approves it; the model is trained on the pooled good parts, its threshold is set on an unbiased sample whose uncertain parts a person has labelled, views and alignment are inherited from the current model, and it is registered as shadow | `... model_registry requests / approve / retrain` |
 | Labelling | Review items are exported most-uncertain first with model pre-annotations (Label Studio or COCO/CVAT); polygons come back as a YOLO-seg dataset and as review verdicts | `python -m src.inference.labeling export / import` |
 | Audit trail | Every verdict with image SHA-256, model versions/digests and threshold, hash-chained so edits or deletions are detectable | `python -m src.inference.audit_log verify data/audit` |
 | Multi-view parts | A part fails if any view fails it; parts missing a `required_view: true` camera are reported as incomplete | dashboard → Vision Models |

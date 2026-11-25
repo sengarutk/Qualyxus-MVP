@@ -336,8 +336,35 @@ def _review_labels(review_dir: str | Path) -> dict[str, str]:
 
 # ----------------------------------------------------------------------- CLI
 
+def _retrain_settings(reg: VisionModelRegistry, recipe: str, args) -> dict[str, Any]:
+    """Views, false-reject target and part alignment: the model being replaced decides.
+
+    Anything given on the command line wins. With neither, refuse: guessing one view brings
+    back six chances to falsely reject every part.
+    """
+    path = Path(args.base_model) if args.base_model else reg.resolve(recipe, "anomaly")["active"]
+    calibration: dict[str, Any] = {}
+    register, tiles = False, None
+    if path is not None:
+        from src.inference.anomaly.registry import load_detector
+
+        base = load_detector(path, device="cpu")
+        calibration = base.calibration or {}
+        register, tiles = bool(base.preprocessor.register), base.preprocessor.tiles
+    views = args.views or calibration.get("n_views")
+    if not views:
+        raise ValueError("how many cameras judge each part? Give --views (the current model does not record it)")
+    if args.tiles:
+        tiles = tuple(int(v) for v in args.tiles.lower().split("x"))
+    return {"views": int(views), "part_frr": float(args.part_frr or calibration.get("part_frr_target") or 0.01),
+            "register": register if args.register is None else bool(args.register),
+            "tiles": tuple(tiles) if tiles else None}
+
+
 def _retrain(reg: VisionModelRegistry, request_id: str, args) -> dict[str, Any]:
     """Train a candidate on the recipe's good-part pool and register it as the shadow model."""
+    from src.inference.anomaly.calibration import min_holdout
+    from src.inference.anomaly.recalibrate import recalibrate
     from src.inference.anomaly.registry import create_candidate
     from src.inference.good_pool import GoodPartPool
 
@@ -346,21 +373,38 @@ def _retrain(reg: VisionModelRegistry, request_id: str, args) -> dict[str, Any]:
         raise KeyError(request_id)
     if req["status"] != "approved":
         raise ValueError(f"request {request_id} is {req['status']}; it must be approved first")
+    settings = _retrain_settings(reg, req["recipe"], args)
     pool = GoodPartPool(args.pool_dir, req["recipe"])
     images = pool.load(since_ts=req["since_ts"] if args.since_request else None, limit=args.limit)
     if len(images) < args.min_images:
         raise ValueError(f"only {len(images)} pooled good images for {req['recipe']} (need {args.min_images}); "
                          "let the line run longer after the change, or lower --min-images")
-    tiles = tuple(int(v) for v in args.tiles.lower().split("x")) if args.tiles else None
-    detector, spec = create_candidate(args.candidate, register=args.register, tiles=tiles)
+    # The pool holds easy parts only (it is cut at max_score), so a threshold set on it rejects far
+    # more good parts than promised. The threshold comes from the unbiased calibration sample.
+    target = settings["part_frr"] / settings["views"]
+    since = req["since_ts"] if args.since_request else None
+    calibration_images, waiting = pool.calibration_set(_review_labels(args.review_dir), since_ts=since)
+    if waiting:
+        raise ValueError(f"{waiting} sampled {req['recipe']} parts still need a person's pass/fail in the review "
+                         "queue; calibrating without them would leave out the hardest good parts")
+    needed = min_holdout(target, args.confidence)
+    if len(calibration_images) < needed:
+        raise ValueError(f"only {len(calibration_images)} calibration images; {needed} are needed for "
+                         f"{settings['part_frr']:.2%} false rejects per part over {settings['views']} view(s)")
+    detector, spec = create_candidate(args.candidate, register=settings["register"], tiles=settings["tiles"])
     extra = {"iterations": args.iterations} if spec["method"] in ("dinomaly", "ensemble") else {}
-    calibration = detector.fit(images, confidence=args.confidence, **extra)
+    detector.fit(images, **extra)
+    trained = dict(detector.calibration)
+    calibration = recalibrate(detector, calibration_images, part_frr=settings["part_frr"], n_views=settings["views"],
+                              confidence=args.confidence)
+    detector.calibration.update({k: v for k, v in trained.items() if k not in detector.calibration})
     out = Path(args.work_dir) / f"{req['recipe']}_{request_id}.pt"
     detector.save(out)
     version = reg.register(req["recipe"], "anomaly", out, metrics={"calibration": calibration}, shadow=True,
                            by=req["decided_by"] or "system", source=f"retrain:{request_id}",
                            notes=f"retrained on {len(images)} pooled good parts ({args.candidate})")
-    result = {"version": version, "images": len(images), "candidate": args.candidate}
+    result = {"version": version, "images": len(images), "calibration_images": len(calibration_images),
+              "candidate": args.candidate, **settings}
     reg.complete_request(request_id, result)
     return result
 
@@ -413,7 +457,12 @@ def main(argv=None) -> Any:
     p.add_argument("--min-images", type=int, default=150)
     p.add_argument("--confidence", type=float, default=0.9)
     p.add_argument("--iterations", type=int, default=3000)
-    p.add_argument("--register", action="store_true")
+    p.add_argument("--views", type=int, default=None, help="Cameras that judge each part (default: as the current model)")
+    p.add_argument("--part-frr", type=float, default=None, help="False rejects per part (default: as the current model)")
+    p.add_argument("--base-model", default=None, help="Model being replaced, if it is not in the registry")
+    p.add_argument("--review-dir", default="data/review")
+    p.add_argument("--register", action=argparse.BooleanOptionalAction, default=None,
+                   help="Part alignment (default: as the current model)")
     p.add_argument("--tiles", default=None)
     p.add_argument("--work-dir", default="models/anomaly/retrained")
     args = parser.parse_args(argv)

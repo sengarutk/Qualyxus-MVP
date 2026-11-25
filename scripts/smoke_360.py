@@ -67,9 +67,12 @@ def main() -> int:
         records = [json.loads(line) for f in glob.glob(f"{work}/data/audit/*.jsonl")
                    for line in open(f, encoding="utf-8")]
         verdicts = [r for r in records if r.get("record") == "part_verdict"]
+        # Parts cut short by the stop are reported as not inspected, which is what we want.
+        stopped = [r for r in verdicts if r.get("shutdown") and r["verdict"] == "not_inspected"]
+        verdicts = [r for r in verdicts if r not in stopped]
         counts = collections.Counter(r["verdict"] for r in verdicts)
         repeats = [p for p, n in collections.Counter(r["part"] for r in verdicts).items() if n > 1]
-        print(f"parts: {len(verdicts)}  verdicts: {dict(counts)}")
+        print(f"parts: {len(verdicts)}  verdicts: {dict(counts)}  cut short by the stop: {len(stopped)}")
         if not verdicts:
             problems.append("no part verdicts were produced")
         if repeats:

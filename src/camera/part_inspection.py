@@ -49,8 +49,12 @@ def part_pose(frame: np.ndarray) -> tuple[float, float, float] | None:
     return round(float(cx), 2), round(float(cy), 2), round(float(angle), 2)
 
 
+def _is_reject(flag: int) -> bool:
+    return flag not in (PLC_PASS, PLC_FLAG_NOT_INSPECTED)
+
+
 def _verdict_of(flags: list[int], complete: bool) -> tuple[str, int]:
-    rejects = [f for f in flags if f != PLC_PASS and f != PLC_FLAG_NOT_INSPECTED]
+    rejects = [f for f in flags if _is_reject(f)]
     if rejects:
         return "fail", max(rejects)
     if not complete or PLC_FLAG_NOT_INSPECTED in flags:
@@ -61,7 +65,7 @@ def _verdict_of(flags: list[int], complete: bool) -> tuple[str, int]:
 def _worst(a: int, b: int) -> int:
     """Two results for one view of one part: a reject beats not inspected, which beats a pass."""
     def rank(flag: int) -> tuple[bool, bool, int]:
-        return flag not in (PLC_PASS, PLC_FLAG_NOT_INSPECTED), flag == PLC_FLAG_NOT_INSPECTED, flag
+        return _is_reject(flag), flag == PLC_FLAG_NOT_INSPECTED, flag
     return max(a, b, key=rank)
 
 
@@ -69,9 +73,13 @@ class PartVerdictFuser:
     """One verdict per physical part, however many cameras judge it.
 
     A part passes only when every required view has passed it. A failure on any view fails
-    the part. A required view that never reports within ``timeout_s`` makes the part
+    the part, including one from a camera that is not required (whose passes count for
+    nothing). A required view that never reports within ``timeout_s`` makes the part
     not_inspected, so a dead camera can never let a part through as a pass. Without required
     views each camera's verdict is the part's verdict (a single-camera station).
+
+    A reject that arrives after the part's verdict was published is published again as an
+    update (``"update": True``): a late reject must still reach the PLC.
 
     With no cycle to match on (the process feed is down), views are grouped as they arrive, so
     one part stays one verdict. Nothing proves they saw the same part, so such a group can
@@ -82,7 +90,8 @@ class PartVerdictFuser:
         self.required = frozenset(required_views)
         self.timeout_s = float(timeout_s)
         self._open: dict[str, dict[str, Any]] = {}
-        self._closed: collections.OrderedDict[str, frozenset[str]] = collections.OrderedDict()
+        # key -> {"views": {camera: flag}, "flag": published flag, "matched": bool}
+        self._closed: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
         self._seen: collections.deque[str] = collections.deque(maxlen=4096)
         self._unmatched: str | None = None
         self._unmatched_count = 0
@@ -90,17 +99,17 @@ class PartVerdictFuser:
 
     def add(self, cycle_id: str | None, camera_id: str, flag: int, now: float) -> dict[str, Any] | None:
         """Record one view's flag; returns the part's verdict once it is decided."""
-        if cycle_id is not None:
-            with self._lock:
-                self._seen.append(cycle_id)
-        if not self.required or camera_id not in self.required:
-            verdict, value = _verdict_of([flag], True)
-            return {"cycle_id": cycle_id, "verdict": verdict, "flag": value, "views": {camera_id: flag}, "missing": []}
         with self._lock:
+            if cycle_id is not None:
+                self._seen.append(cycle_id)
+            if not self.required:
+                return self._add_single(cycle_id, camera_id, flag)
+            if camera_id not in self.required and not _is_reject(flag):
+                return None
             key = self._unmatched_group(camera_id) if cycle_id is None else cycle_id
             if key in self._closed:
-                if camera_id not in self._closed[key]:
-                    return None  # a late view of a part that already timed out
+                if camera_id not in self._closed[key]["views"]:
+                    return self._late(key, camera_id, flag)
                 # This camera already judged that part, so this is another one with no cycle of
                 # its own (lost machine data, a repeated id). It may fail; it can never pass.
                 cycle_id = None
@@ -111,6 +120,28 @@ class PartVerdictFuser:
             if self.required - set(part["views"]):
                 return None
             return self._close(key)
+
+    def _add_single(self, cycle_id: str | None, camera_id: str, flag: int) -> dict[str, Any] | None:
+        if cycle_id in self._closed and camera_id not in self._closed[cycle_id]["views"]:
+            return self._late(cycle_id, camera_id, flag)
+        if cycle_id is not None:
+            self._remember(cycle_id, {camera_id: flag}, flag, True)
+        verdict, value = _verdict_of([flag], True)
+        return {"cycle_id": cycle_id, "verdict": verdict, "flag": value, "views": {camera_id: flag}, "missing": []}
+
+    def _late(self, key: str, camera_id: str, flag: int) -> dict[str, Any] | None:
+        """A view of a part whose verdict is out. Only a result that makes it worse is news."""
+        part = self._closed[key]
+        part["views"][camera_id] = flag
+        worse = _worst(part["flag"], flag)
+        # A published "not inspected" already covers a late pass; a published pass does not
+        # cover a camera that then could not see the part.
+        if worse == part["flag"]:
+            return None
+        part["flag"] = worse
+        missing = sorted(self.required - set(part["views"]))
+        return {"cycle_id": key if part["matched"] else None, "verdict": _verdict_of([worse], True)[0], "flag": worse,
+                "views": dict(part["views"]), "missing": missing, "update": True}
 
     def _unmatched_group(self, camera_id: str) -> str:
         group = self._open.get(self._unmatched or "")
@@ -126,7 +157,7 @@ class PartVerdictFuser:
             for key in part_keys:
                 if key not in self._seen:
                     self._seen.append(key)
-                    self._remember(key, frozenset())   # a very late view must not reopen it
+                    self._remember(key, {}, PLC_FLAG_NOT_INSPECTED, True)   # a very late pass must not reopen it
                     out.append({"cycle_id": key, "verdict": "not_inspected", "flag": PLC_FLAG_NOT_INSPECTED,
                                 "views": {}, "missing": sorted(self.required) or ["station"]})
         return out
@@ -137,17 +168,17 @@ class PartVerdictFuser:
             late = [c for c, part in self._open.items() if part["deadline"] <= now]
             return [self._close(c) for c in late]
 
-    def _remember(self, key: str, cameras: frozenset[str]) -> None:
-        self._closed[key] = cameras
+    def _remember(self, key: str, views: dict[str, int], flag: int, matched: bool) -> None:
+        self._closed[key] = {"views": dict(views), "flag": flag, "matched": matched}
         while len(self._closed) > 512:
             self._closed.popitem(last=False)
 
-    def _close(self, cycle_id: str) -> dict[str, Any]:
-        part = self._open.pop(cycle_id)
-        self._remember(cycle_id, frozenset(part["views"]))
+    def _close(self, key: str) -> dict[str, Any]:
+        part = self._open.pop(key)
         missing = sorted(self.required - set(part["views"]))
         verdict, value = _verdict_of(list(part["views"].values()), part["matched"] and not missing)
-        return {"cycle_id": cycle_id if part["matched"] else None, "verdict": verdict, "flag": value,
+        self._remember(key, part["views"], value, part["matched"])
+        return {"cycle_id": key if part["matched"] else None, "verdict": verdict, "flag": value,
                 "views": part["views"], "missing": missing}
 
 
@@ -201,6 +232,10 @@ class PartPresenceTracker:
             self._await_removal = True
             return self._close()
         return None
+
+    @property
+    def part_in_view(self) -> bool:
+        return self._visit is not None
 
     def _close(self) -> CompletedPart | None:
         visit, self._visit = self._visit, None
