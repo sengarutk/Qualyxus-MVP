@@ -149,7 +149,7 @@ A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to cop
 ## Found while fixing stage 2
 
 - **Setting corrections alone can raise scrap.** With B24 fixed for single settings only and repair requests ignored, simulated scrap rose on 2 of 3 seeds (12.4% to 19.8%, 5.2% to 15.4%). Now no correction is suggested while any component is drifting; with requests ignored, scrap then equals the untouched machine.
-- **The earlier simulated scrap reduction (79% to 93% on the same 3 seeds) came mostly from settings that hid wear.** With repairs done 50 cycles after a request: 68%, 75% and 49%. Repairs do most of it. Simulation only, ideal vision (`--vision oracle`); rerun: `python scripts/simulate_closed_loop.py --vision oracle --seed 11`.
+- **The earlier simulated scrap reduction (79% to 93% on the same 3 seeds) came mostly from settings that hid wear.** With repairs done 50 cycles after a request: 68%, 75% and 49%. Repairs do most of it. Simulation only, ideal vision (`--vision oracle`); rerun: `python scripts/simulate_closed_loop.py --vision oracle --seed 11`. With rendered camera images and PatchCore, as in the README: 50%, 63% and 52% (seeds 11, 23, 37), and early warning in 32 of 244 episodes.
 - A baseline assumes the first 100 cycles after a reset are healthy. After a repair someone must reset it (`python -m src.process.baseline`), or the repair request comes back.
 - A Modbus or OPC UA source that stays down produces no cycle, so its lost cycles are recorded only when it returns.
 

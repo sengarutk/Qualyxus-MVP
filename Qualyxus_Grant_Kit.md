@@ -59,9 +59,9 @@ Qualyxus: AI that catches bad parts on the factory floor and tells the plant why
 | Defect types caught | All 4 | Simulation |
 | Part alignment | False rejects 100% → 0% at 8° rotation; 15% at 15° | Simulation |
 | Defect outlining | Mask IoU 0.83; 16.5 ms per image on a laptop GPU | Simulation |
-| Scrap reduction from approved setting changes | 79% | Simulation |
-| Early warning of defects | 16 of 60 episodes (weak; don't claim prediction) | Simulation |
-| Automated tests | 169 passing, including deliberate failures | Measured |
+| Scrap reduction, if requested repairs are done and setting changes approved | 50–63%, three runs | Simulation |
+| Early warning of defects | 32 of 244 episodes (weak; don't claim prediction) | Simulation |
+| Automated tests | 278 passing, including deliberate failures | Measured |
 | Price | ₹2–2.5L setup + ₹20k / month per line | Plan |
 | Value per line | ₹6–15L a year; payback 4–10 months | Projection |
 | Market | TAM $45B; SAM $590M; SOM $5.5M | Estimate |

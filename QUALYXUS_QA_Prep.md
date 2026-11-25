@@ -220,10 +220,13 @@ If you only have an hour, do these. Full answers are in the parts below.
 > On a multi-camera station, a part with no matching cycle can fail but never pass. And on time-linked stations, if the machine finished a cycle and no camera reported its part, that part is flagged not inspected. Part IDs are the most reliable link where a plant has them.
 
 **★ Can you predict defects before they happen?**
-> Not reliably yet, and I won't claim it. In simulation, the model warned before only 16 of 60 defect episodes. The stronger result is approval-gated setpoint fixes, which cut scrap 79% in simulation. Early warning needs real data.
+> Not reliably yet, and I won't claim it. In simulation, the model warned before only 32 of 244 defect episodes. The stronger result is asking for the right repair: with repairs and approved setting changes, scrap fell 50–63% in three simulated runs. Early warning needs real data.
 
-**⚠ 79% scrap reduction? Really?**
-> In my own simulator only. It shows the closed loop works, not what a plant will see. Real pilots will give the real number.
+**⚠ 50–63% scrap reduction? Really?**
+> In my own simulator only, and only when the requested repairs are done. With no action on the requests, it is zero. It shows the closed loop works, not what a plant will see. Real pilots will give the real number.
+
+**⚠ Your earlier deck said 79%. What changed?**
+> My own audit found that the old system raised settings such as hold pressure while a part was worn, which cut simulated scrap but hid the wear. Now it asks for the repair first and suggests no settings until that is done. The lower number is the honest one.
 
 ### Software quality
 
@@ -546,7 +549,7 @@ Ask one or two if invited:
 | "It's validated." | "It works on benchmarks and in simulation." |
 | "It predicts defects before they happen." | "It traces defects to their cause. Early warning needs real data." |
 | "It catches 100% of defects." | "On simulated parts it caught all four types; on VisA it ranged from 35% to 90%." |
-| "It cuts scrap by 79%." | "In my simulator, approval-gated fixes cut scrap 79%." |
+| "It cuts scrap by 79%." | "In my simulator, requested repairs plus approved setting changes cut scrap 50–63%." |
 | "It's production-ready." | "It's a working prototype that hasn't run in production." |
 | "It runs on Jetson." | "Jetson is the target; benchmarks are the month-3 milestone." |
 | "Nobody else does this." | "Others link quality and process data. Ours is on-premise, at retrofit cost." |
@@ -566,9 +569,9 @@ Ask one or two if invited:
 | Segmentation | Mask IoU 0.83; 16.5 ms per image | Simulation |
 | Anomaly speed | 28 ms per image; ~170 ms per six-view part; ~75 ms audit | Laptop GPU |
 | Model promotion | ~4 s; 98.5% shadow agreement | Simulation |
-| Scrap reduction | 79% | Simulation |
-| Early warning | 16 of 60 episodes | Simulation |
-| Automated tests | 166 passing | Measured |
+| Scrap reduction, if requested repairs are done | 50–63%, three runs | Simulation |
+| Early warning | 32 of 244 episodes | Simulation |
+| Automated tests | 278 passing | Measured |
 | Price | ₹2–2.5L setup + ₹20k / month; 360° station ₹5–7L | Plan |
 | Hardware cost | ₹1.5–1.8L; 20–30% margin | Estimate |
 | Value per line | ₹6–15L a year; payback 4–10 months | Projection |
