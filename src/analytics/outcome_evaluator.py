@@ -378,7 +378,7 @@ class OutcomeEvaluator:
                 """
                 SELECT action_id
                 FROM tracked_actions
-                WHERE status = 'closed'
+                WHERE status = 'closed' AND COALESCE(verification_status, '') != 'WITHDRAWN'
                 ORDER BY datetime(updated_at) DESC
                 LIMIT ?
                 """,

@@ -5,8 +5,9 @@ new light, a dirty lens or a new material lot shifts every score; the line keeps
 while the model silently drifts into rejecting good parts or missing bad ones. Two signals
 catch this without any labels:
 
-* score drift - the median normalized score of recently *passed* parts versus the median
-  seen on held-out good parts at calibration time;
+* score drift, both ways - the median normalized score of recently *passed* parts versus the
+  level seen on held-out good parts at calibration time. Too high means imaging changed; too
+  low means the model may no longer be seeing the part, and would pass anything;
 * reject-rate excess - the observed reject rate versus what the process normally produces,
   tested with a one-sided binomial test so a single bad hour is not an alarm.
 
@@ -73,6 +74,11 @@ class ModelHealthMonitor:
                 status["alerts"].append(
                     f"Passed-part scores are {ratio:.2f}x the calibration level: imaging conditions changed "
                     "(camera position, lighting, lens, material). Re-validate or recalibrate the model.")
+            elif ratio < 1.0 / self.drift_ratio:
+                status["alerts"].append(
+                    f"Passed-part scores are only {ratio:.2f}x the calibration level: the model may be blind "
+                    "(blurred, covered or frozen image, wrong lighting). Check the camera, and prove with a known bad "
+                    "part that it still rejects.")
         if n >= 50:
             p_value = _binomial_sf(rejects, n, self.expected_reject_rate)
             status["reject_rate_p_value"] = round(p_value, 6)

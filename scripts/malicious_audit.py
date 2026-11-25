@@ -170,6 +170,7 @@ def test_governor_thermal_jump_and_hysteresis() -> None:
                 "warning_cooldown_seconds": 5,
                 "critical_cooldown_seconds": 5,
                 "emergency_temp_c": 90,
+                "emergency_hold_seconds": 0,
             }
         }
     )

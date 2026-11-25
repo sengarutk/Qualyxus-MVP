@@ -85,8 +85,8 @@ def create_app(cfg: dict[str, Any], data: ConsoleData | None = None) -> FastAPI:
         return found(data.part_detail(cycle_id, cavity))
 
     @app.get("/api/spc", dependencies=api)
-    def spc(signal: str = "hold_pressure.active_median"):
-        return found(data.spc(signal))
+    def spc(signal: str = "hold_pressure.active_median", machine: str | None = None):
+        return found(data.spc(signal, machine=machine))
 
     @app.get("/api/risk", dependencies=api)
     def risk():

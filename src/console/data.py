@@ -21,6 +21,7 @@ from src.process.store import ProcessStore
 
 BASELINE_CYCLES = 100
 STATUS_STALE_S = 20.0
+VERIFY_WAIT_S = 2.0
 
 # feature -> (label, unit, setpoint it should follow)
 SIGNALS: dict[str, tuple[str, str, str | None]] = {
@@ -77,12 +78,16 @@ class ConsoleData:
         cameras = [c for c in cfg.get("cameras") or [] if c.get("enabled", True)]
         self.cameras = [str(c["id"]) for c in cameras]
         self.required = required_views(cameras) or self.cameras
+        machines = [str(m["machine_id"]) for m in process.get("machines") or []]
+        self.machines = machines or [str(process.get("machine_id", "imm_1"))]
         self.simulated = str(process.get("source", "simulated")) == "simulated"
         self.time_scale = float((process.get("simulator") or {}).get("time_scale", 1.0)) if self.simulated else 1.0
         self._store: ProcessStore | None = None
         self._lock = threading.RLock()
+        self._verifying: threading.Thread | None = None
         self._audit_cache: tuple[float, dict[str, Any]] = (0.0, {})
         self._model_cache: dict[str, Any] | None = None
+        self._healthy: dict[tuple[str, float], dict[str, Any]] = {}
 
     @property
     def store(self) -> ProcessStore | None:
@@ -91,15 +96,13 @@ class ConsoleData:
                 self._store = ProcessStore(self.db_path)
             return self._store
 
-    def _cycles(self, limit: int, newest: bool = True) -> list[dict[str, Any]]:
+    def _cycles(self, limit: int, newest: bool = True, machine: str | None = None) -> list[dict[str, Any]]:
+        """Complete cycles of one machine since its baseline was last reset."""
         if self.store is None:
             return []
-        order = "DESC" if newest else "ASC"
-        rows = self.store._query(
-            f"SELECT cycle_id, sequence, end_ts, features FROM process_cycles ORDER BY end_ts {order} LIMIT ?", (limit,))
-        out = [{"cycle_id": r["cycle_id"], "sequence": r["sequence"], "ts": float(r["end_ts"]),
-                "features": json.loads(r["features"])} for r in rows]
-        return out[::-1] if newest else out
+        machine = machine or self.machines[0]
+        return self.store.cycle_rows(limit=limit, newest=newest, machine_id=machine,
+                                     since_ts=self.store.baseline_start(machine))
 
     # -------------------------------------------------------------------------------- parts
 
@@ -168,12 +171,14 @@ class ConsoleData:
             "link_confidence": round(float(np.mean(confidences)), 3) if confidences else None,
             "setpoints": cycle.setpoints, "scalars": cycle.scalars,
             "risk": dict(prediction[0]) if prediction else None,
-            "deviations": self._deviations(features), "curves": self._curves(cycle),
+            "deviations": self._deviations(features, cycle) if cycle.complete else [], "curves": self._curves(cycle),
             "audit": self._audit_for(cycle_id),
         }
 
-    def _deviations(self, features: dict[str, float]) -> list[dict[str, Any]]:
-        baseline = [c["features"] for c in self._cycles(BASELINE_CYCLES, newest=False)]
+    def _deviations(self, features: dict[str, float], cycle) -> list[dict[str, Any]]:
+        if cycle.end_ts < self.store.baseline_start(cycle.machine_id):
+            return []       # made before the baseline was reset: today's baseline says nothing about it
+        baseline = [c["features"] for c in self._cycles(BASELINE_CYCLES, newest=False, machine=cycle.machine_id)]
         out = []
         for name, (label, unit, setpoint) in SIGNALS.items():
             values = np.array([r[name] - (r.get(setpoint, 0.0) if setpoint else 0.0) for r in baseline if name in r])
@@ -190,7 +195,7 @@ class ConsoleData:
         return sorted(out, key=lambda d: -abs(d["z"]))
 
     def _curves(self, cycle) -> list[dict[str, Any]]:
-        healthy = self._healthy_curves()
+        healthy = self._healthy_curves(cycle.machine_id)
         out = []
         for name, (label, unit) in CURVES.items():
             values = cycle.curves.get(name)
@@ -202,11 +207,12 @@ class ConsoleData:
                         "values": [round(float(v), 2) for v in line], **healthy.get(name, {})})
         return out
 
-    def _healthy_curves(self) -> dict[str, dict[str, list[float]]]:
-        """Median and 1-99% band of the baseline cycles, cached: the baseline does not move."""
-        if getattr(self, "_healthy", None) is not None:
-            return self._healthy
-        ids = [c["cycle_id"] for c in self._cycles(BASELINE_CYCLES, newest=False)]
+    def _healthy_curves(self, machine: str) -> dict[str, dict[str, list[float]]]:
+        """Median and 1-99% band of the baseline cycles, cached until the baseline is reset."""
+        key = (machine, self.store.baseline_start(machine))
+        if key in self._healthy:
+            return self._healthy[key]
+        ids = [c["cycle_id"] for c in self._cycles(BASELINE_CYCLES, newest=False, machine=machine)]
         stacks: dict[str, list[np.ndarray]] = {}
         x = np.linspace(0, 1, CURVE_POINTS)
         for cycle_id in ids:
@@ -220,16 +226,17 @@ class ConsoleData:
             lo, mid, hi = np.percentile(m, [1, 50, 99], axis=0)
             out[name] = {"lo": np.round(lo, 2).tolist(), "mid": np.round(mid, 2).tolist(), "hi": np.round(hi, 2).tolist()}
         if len(ids) >= BASELINE_CYCLES:
-            self._healthy = out
+            self._healthy[key] = out
         return out
 
     # ------------------------------------------------------------------------------- process
 
-    def spc(self, signal: str, limit: int = 240) -> dict[str, Any] | None:
+    def spc(self, signal: str, limit: int = 240, machine: str | None = None) -> dict[str, Any] | None:
         if signal not in SIGNALS:
             return None
+        machine = machine if machine in self.machines else self.machines[0]
         label, unit, setpoint = SIGNALS[signal]
-        base = [c["features"] for c in self._cycles(BASELINE_CYCLES, newest=False)]
+        base = [c["features"] for c in self._cycles(BASELINE_CYCLES, newest=False, machine=machine)]
         base_values = np.array([r[signal] for r in base if signal in r])
         if base_values.size < 20:
             return {"signal": signal, "label": label, "unit": unit, "points": [], "learning": int(base_values.size)}
@@ -237,7 +244,7 @@ class ConsoleData:
         ucl, lcl = center + 3 * sigma, center - 3 * sigma
         failed = self._failed_cycles()
         points, run_side, run = [], 0, 0
-        for c in self._cycles(limit):
+        for c in self._cycles(limit, machine=machine):
             v = c["features"].get(signal)
             if v is None:
                 continue
@@ -264,14 +271,17 @@ class ConsoleData:
         return {r["cycle_id"] for r in rows if r["cycle_id"]}
 
     def health(self) -> list[dict[str, Any]]:
-        base = [c["features"] for c in self._cycles(BASELINE_CYCLES, newest=False)]
-        rows = [c["features"] for c in self._cycles(600)]
+        if self.store is None:
+            return []
+        found = [(m, c) for m in self.machines for c in assess_machine(
+            *self.store.health_rows(m, baseline=BASELINE_CYCLES), self.components)]
         out = []
-        for c in assess_machine(base, rows, self.components):
+        for machine, c in found:
             h = c.history
             step = max(1, len(h) // 160)
             label = SIGNALS.get(c.signal, (c.signal, "", None))[0]
-            out.append({"component": c.component, "signal": label, "wear": c.wear_index, "health": c.health,
+            name = c.component if len(self.machines) == 1 else f"{machine}: {c.component}"
+            out.append({"machine": machine, "component": name, "signal": label, "wear": c.wear_index, "health": c.health,
                         "status": c.status, "cycles_to_act": c.cycles_to_act, "history": h[::step],
                         "watch": WATCH_Z, "act": ACT_Z})
         return out
@@ -371,18 +381,33 @@ class ConsoleData:
         stamp, cached = self._audit_cache
         if cached and time.monotonic() - stamp < max_age_s:
             return cached
-        from src.inference.audit_log import verify_chain
-
-        result: dict[str, Any] = {"ok": None, "records": 0}
-        for _attempt in range(3):  # the runtime may be between its two writes
-            if Path(self.audit_dir).exists():
-                result = verify_chain(self.audit_dir, self.audit_key)
-            if result.get("ok") is not False:
-                break
-            time.sleep(0.15)
-        result = {**result, "checked": time.time()}
-        self._audit_cache = (time.monotonic(), result)
+        if not Path(self.audit_dir).exists():
+            return {"ok": None, "records": 0, "checked": time.time()}
+        with self._lock:
+            if self._verifying is None or not self._verifying.is_alive():
+                self._verifying = threading.Thread(target=self._verify_now, name="audit-verify", daemon=True)
+                self._verifying.start()
+            worker = self._verifying
+        # The first check reads the whole history; it must not hold up the page.
+        worker.join(VERIFY_WAIT_S)
+        result = self._audit_cache[1]
+        if worker.is_alive():
+            result = {**(result or {"ok": None, "records": 0}), "checking": True}
         return result
+
+    def _verify_now(self) -> None:
+        from src.inference.audit_log import verify_incremental
+
+        result: dict[str, Any] = {}
+        try:
+            for _attempt in range(3):  # the runtime may be between its two writes
+                result = verify_incremental(self.audit_dir, self.audit_key)
+                if result.get("ok") is not False:
+                    break
+                time.sleep(0.15)
+        except Exception as e:      # a check that cannot run must not look like an intact trail
+            result = {"ok": False, "records": 0, "error": f"the audit trail could not be checked: {e}"}
+        self._audit_cache = (time.monotonic(), {**result, "checked": time.time()})
 
     # ------------------------------------------------------------------------------- overview
 
@@ -394,7 +419,7 @@ class ConsoleData:
         out = []
         for action in ActionTracker(sqlite_path=self.actions_db).list_actions(status="open", limit=20):
             payload = action.get("action_payload") or {}
-            if payload.get("action_type") == "process_prescription":
+            if payload.get("action_type") in ("process_prescription", "process_maintenance"):
                 out.append({"id": action["action_id"], "text": payload.get("explanation"), "issued": action.get("timestamp")})
         return out
 
@@ -411,6 +436,7 @@ class ConsoleData:
         recent = [p for p in parts if now - p["ts"] < 600]
         health = self.health()
         chain = self.verify()
+        gaps = self.store.gaps_between(now - 8 * 3600.0, now + 60.0) if self.store is not None else []
         cameras = [{"id": c, "online": bool(online and c in workers and not workers[c].get("failed")
                                             and workers[c].get("capture_alive")),
                     "parts": (workers.get(c) or {}).get("parts_inspected"),
@@ -419,14 +445,15 @@ class ConsoleData:
         latest = next((p for p in reversed(parts) if p["cycle_id"]), None)
         return {
             "now": now, "online": online, "simulated": self.simulated, "time_scale": self.time_scale,
-            "machine": (self.cfg.get("process") or {}).get("machine_id", "imm_1"),
+            "machine": ", ".join(self.machines), "machines": self.machines,
             "line": (self.cfg.get("process") or {}).get("line_id", "line"),
             "kpi": {"parts": len(parts), **counts, "yield": counts["pass"] / judged if judged else None,
                     "recent_yield": self._recent_yield(parts, 30), "rate_per_min": len(recent) / 10.0 if recent else 0.0,
                     "linked": len(links) / len(parts) if parts else None},
             "cameras": cameras, "health": health, "audit": chain, "model": self.model(),
             "plc": {**plc, "online": online}, "latest": self._key(latest) if latest else None,
-            "alarms": self._alarms(online, age, plc, cameras, health, chain, parts),
+            "lost_cycles": sum(g["missed"] for g in gaps),
+            "alarms": self._alarms(online, age, plc, cameras, health, chain, parts, gaps, workers),
         }
 
     @staticmethod
@@ -434,7 +461,7 @@ class ConsoleData:
         judged = [p for p in parts if p["verdict"] in ("pass", "fail")][-n:]
         return sum(p["verdict"] == "pass" for p in judged) / len(judged) if len(judged) >= n else None
 
-    def _alarms(self, online, age, plc, cameras, health, chain, parts) -> list[dict[str, str]]:
+    def _alarms(self, online, age, plc, cameras, health, chain, parts, gaps, workers) -> list[dict[str, str]]:
         out = []
         if not online:
             out.append({"level": "critical", "title": "Inspection runtime is offline",
@@ -447,6 +474,14 @@ class ConsoleData:
                 out.append({"level": "critical", "title": "Camera not delivering", "text": ", ".join(down)})
         if chain.get("ok") is False:
             out.append({"level": "critical", "title": "Audit trail broken", "text": str(chain.get("error"))})
+        recent_gaps = [g for g in gaps if time.time() - g["ts"] < 3600]
+        if recent_gaps:
+            out.append({"level": "warning", "title": "Machine cycles lost",
+                        "text": f"{sum(g['missed'] for g in recent_gaps)} cycles in the last hour have no machine data."})
+        if online:
+            for camera in self.cameras:
+                for text in ((workers.get(camera) or {}).get("model_health") or {}).get("alerts") or []:
+                    out.append({"level": "warning", "title": f"Vision model check: {camera}", "text": str(text)})
         for c in health:
             if c["status"] != "OK":
                 eta = f" About {c['cycles_to_act']} cycles to the act level at this rate." if c["cycles_to_act"] else ""

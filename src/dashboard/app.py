@@ -344,6 +344,7 @@ def _render_process_section(cfg, actions_db_path: str) -> None:
     st.subheader("⚙️ Process ↔ Quality Intelligence")
     overview = fetch_process_overview(
         str(cfg.get("process", "db_path", default="data/events/process.db")), actions_db_path,
+        required_cameras=tuple(required_views(cfg.get("cameras", default=[]) or [])),
     )
     if not overview:
         st.info("No process cycles recorded yet. Start the runtime with process.enabled: true.")
@@ -357,7 +358,9 @@ def _render_process_section(cfg, actions_db_path: str) -> None:
         return "n/a" if value is None else f"{100 * value:.1f}%"
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Parts inspected (8h)", k.get("parts_inspected", 0))
+    c1.metric("Parts judged (8h)", k.get("parts_inspected", 0),
+              help=f"{k.get('parts_not_inspected', 0)} more could not be fully inspected and are not in the scrap rate; "
+                   f"{k.get('machine_cycles_lost', 0)} machine cycles have no data")
     c2.metric("Scrap rate", _pct(k.get("scrap_rate")))
     c3.metric("Risk model", f"{model.get('kind', 'none')}", help=str(model.get("version", "")))
     c4.metric("Validation AUC", f"{validation['roc_auc']:.2f}" if "roc_auc" in validation else "n/a")
@@ -398,10 +401,17 @@ def _render_process_section(cfg, actions_db_path: str) -> None:
 
 def _render_machine_health(cfg) -> None:
     st.markdown("**Machine health by component**")
-    health = fetch_machine_health(
-        str(cfg.get("process", "db_path", default="data/events/process.db")),
-        cfg.get("process", "components", default=None),
-    )
+    process = cfg.get("process", default={}) or {}
+    machines = [str(m["machine_id"]) for m in process.get("machines") or []] or [str(process.get("machine_id", "imm_1"))]
+    for machine in machines:
+        _render_one_machine(process, machine, len(machines) > 1)
+
+
+def _render_one_machine(process: dict, machine: str, titled: bool) -> None:
+    if titled:
+        st.caption(f"Machine {machine}")
+    health = fetch_machine_health(str(process.get("db_path", "data/events/process.db")), process.get("components"),
+                                  machine_id=machine)
     if not health:
         st.caption("Machine health needs at least 20 baseline cycles.")
         return
@@ -417,7 +427,7 @@ def _render_machine_health(cfg) -> None:
     trend = pd.DataFrame({h["component"]: pd.Series(h["history"]) for h in health})
     fig = px.line(trend, labels={"index": "cycle", "value": "wear index", "variable": "component"},
                   title="Wear index per component (higher is worse)")
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, width="stretch", key=f"wear-{machine}")
     st.caption("cycles_to_act is a straight-line estimate from the recent trend, not a remaining-life prediction.")
 
 

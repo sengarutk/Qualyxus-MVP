@@ -1,4 +1,6 @@
 import asyncio
+import dataclasses
+import functools
 import sqlite3
 import logging
 import json
@@ -21,6 +23,7 @@ logger = logging.getLogger("QualyxusEventLogger")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Large per-pixel arrays are persisted elsewhere and must never be pushed to SSE clients.
+EVACUATE_S = 8.0
 _BROADCAST_EXCLUDED_KEYS = {"mask", "frame_data"}
 
 
@@ -100,6 +103,7 @@ class EventLogger:
         self.worker_task = None
         self._starting = False
         self._db_conn = None
+        self._write = None
         self._initialized = True
 
         # Synchronously initialize DB schema and tables on boot
@@ -600,10 +604,13 @@ class EventLogger:
                 self.broadcast_to_subscribers(payload)
             self._sync_execute_transaction(payloads)
 
-    def _sync_execute_transaction(self, batch: list):
+    def _sync_execute_transaction(self, batch: list, keep_on_failure: bool = True):
         """
         Executes atomic WAL commits synchronously inside the background thread executor.
         Maintains a persistent connection to eradicate I/O overhead from continuous file operations.
+
+        On failure nothing of the batch is in the database, and the error is raised. Unless the
+        caller will retry (``keep_on_failure=False``), the batch goes to the fallback files first.
         """
         if not batch:
             return
@@ -616,6 +623,8 @@ class EventLogger:
 
         for item in batch:
             try:
+                if isinstance(item, DefectEvent):
+                    item = {k: v for k, v in dataclasses.asdict(item).items() if k != "frame_data"}
                 # If it's a geometry event payload
                 if self._is_geometry_event_payload(item):
                     db_rows_geometry.append((
@@ -751,10 +760,6 @@ class EventLogger:
                         ))
                         csv_defects.append(DefectEvent(**defect_item))
                         
-                elif isinstance(item, DefectEvent):
-                    # Handle raw DefectEvent objects passed inside lists
-                    self.log_event(item)
-
             except Exception as parse_err:
                 logger.error("[EventLogger] Failed to parse corrupted payload for insertion: %s", parse_err)
                 continue
@@ -805,10 +810,12 @@ class EventLogger:
                         logger.error("[EventLogger] Transaction ROLLBACK failed: %s", rollback_err)
                     self._db_conn = None
                 
-                for dev in csv_defects:
-                    self._write_csv_row_sync(dev)
-                for ge in csv_geometry:
-                    self._write_geometry_csv_row_sync(ge)
+                if keep_on_failure:
+                    for dev in csv_defects:
+                        self._write_csv_row_sync(dev)
+                    for ge in csv_geometry:
+                        self._write_geometry_csv_row_sync(ge)
+                    self._write_unsaved(batch)
                 raise
         
         for dev in csv_defects:
@@ -816,75 +823,125 @@ class EventLogger:
         for ge in csv_geometry:
             self._write_geometry_csv_row_sync(ge)
 
-    async def _database_worker_loop(self):
+    @property
+    def unsaved_path(self) -> str:
+        """Events the database would not take, one JSON object per line, kept for recovery by hand."""
+        return f"{self.db_path}.unsaved.jsonl"
+
+    def _write_unsaved(self, batch: list) -> None:
+        try:
+            with open(self.unsaved_path, "a", encoding="utf-8") as fh:
+                for item in batch:
+                    if isinstance(item, DefectEvent):
+                        item = dataclasses.asdict(item)
+                    fh.write(json.dumps(_to_json_safe(item), default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            logger.critical("[EventLogger] %d events are not in the database; kept in %s", len(batch), self.unsaved_path)
+        except Exception as e:
+            logger.critical("[EventLogger] %d events lost: the fallback file failed too: %s", len(batch), e)
+
+    def _save_one_by_one(self, batch: list) -> None:
+        """One bad record must not cost the others: save each alone, set the bad ones aside."""
+        for item in batch:
+            try:
+                self._sync_execute_transaction([item], keep_on_failure=True)
+            except Exception as e:
+                logger.error("[EventLogger] Record set aside: %s", e)
+
+    async def _save_batch(self, batch: list) -> None:
+        """Save a batch, however long the database is locked or the disk is away.
+
+        Until it succeeds new events wait in the queue, which drops (and counts) only when full.
         """
-        Isolated Single-Worker Execution Loop.
-        Dynamic Transaction Batcher managing extraction limits and timeout thresholds.
-        """
-        logger.info("[EventLogger] Database worker loop activated.")
         loop = asyncio.get_running_loop()
-        
+        wait = 0.25
+        while True:
+            self._write = loop.run_in_executor(
+                self.db_executor, functools.partial(self._sync_execute_transaction, batch, keep_on_failure=False))
+            try:
+                # Shielded: a cancelled worker must still learn whether this write went through.
+                await asyncio.shield(self._write)
+                return
+            except asyncio.CancelledError:
+                raise
+            except sqlite3.OperationalError as e:
+                logger.error("[EventLogger] %d events wait, retrying in %.1f s: %s", len(batch), wait, e)
+                await asyncio.sleep(wait)
+                wait = min(wait * 2.0, 5.0)
+            except Exception as e:
+                logger.error("[EventLogger] Batch refused, saving its records one by one: %s", e)
+                self._write = loop.run_in_executor(self.db_executor, self._save_one_by_one, batch)
+                await asyncio.shield(self._write)
+                return
+
+    async def _database_worker_loop(self):
+        """Single writer: collects events into batches and saves each before taking more."""
+        logger.info("[EventLogger] Database worker loop activated.")
+        batch: list = []
+        self._write = None
         try:
             while True:
-                batch = []
-                first_item = await self.queue.get()
-                batch.append(first_item)
-                start_time = time.perf_counter()
-                
-                while len(batch) < self.batch_size:
-                    elapsed = time.perf_counter() - start_time
-                    rem_time = self.timeout_sec - elapsed
-                    
-                    if rem_time <= 0:
-                        break
-                        
-                    try:
-                        item = await asyncio.wait_for(self.queue.get(), timeout=rem_time)
-                        batch.append(item)
-                    except asyncio.TimeoutError:
-                        break
-                
-                if batch:
-                    try:
-                        await loop.run_in_executor(self.db_executor, self._sync_execute_transaction, batch)
-                    finally:
-                        for _ in range(len(batch)):
-                            self.queue.task_done()
-                        
-        except asyncio.CancelledError:
-            logger.warning("[EventLogger] Process termination detected. Commencing emergency queue evacuation sequence...")
-            evacuation_batch = []
-            while not self.queue.empty():
-                try:
-                    item = self.queue.get_nowait()
-                    evacuation_batch.append(item)
+                batch.append(await self.queue.get())
+                if self.queue.qsize() + 1 < self.batch_size:
+                    await asyncio.sleep(self.timeout_sec)
+                while len(batch) < self.batch_size and not self.queue.empty():
+                    batch.append(self.queue.get_nowait())
+                await self._save_batch(batch)
+                for _ in batch:
                     self.queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
-            
-            def safe_shutdown(batch_to_evac):
-                if batch_to_evac:
-                    logger.info("[EventLogger] Flashing %d records to disk before shutdown.", len(batch_to_evac))
-                    self._sync_execute_transaction(batch_to_evac)
+                batch, self._write = [], None
+        except asyncio.CancelledError:
+            await self._evacuate(batch)
+            raise
+
+    async def _evacuate(self, batch: list) -> None:
+        """Shutting down: whatever is in hand or still queued reaches the database or the fallback file."""
+        loop = asyncio.get_running_loop()
+        deadline = time.monotonic() + EVACUATE_S
+        if self._write is not None and batch:
+            done, _ = await asyncio.wait({self._write}, timeout=EVACUATE_S / 2)
+            if done and not self._write.cancelled() and self._write.exception() is None:
+                batch = []
+        batch = list(batch)
+        while not self.queue.empty():
+            batch.append(self.queue.get_nowait())
+            self.queue.task_done()
+        finished = threading.Event()
+
+        def save_and_close():
+            try:
+                if batch:
+                    logger.info("[EventLogger] Saving %d events before shutdown.", len(batch))
+                    try:
+                        self._sync_execute_transaction(batch, keep_on_failure=False)
+                    except sqlite3.OperationalError as e:
+                        logger.error("[EventLogger] Shutdown save failed: %s", e)
+                        self._write_unsaved(batch)
+                    except Exception:
+                        self._save_one_by_one(batch)
+            finally:
+                finished.set()
                 if self._db_conn:
                     try:
                         self._db_conn.close()
                     except Exception:
                         pass
                     self._db_conn = None
-                    
-            if evacuation_batch or self._db_conn:
-                try:
-                    await asyncio.wait_for(
-                        loop.run_in_executor(self.db_executor, safe_shutdown, evacuation_batch),
-                        timeout=1.5
-                    )
-                except asyncio.TimeoutError:
-                    logger.critical("[EventLogger] Disk subsystem stalled during shutdown. Truncating evacuation.")
-                    self.db_executor.shutdown(wait=False)
-            
-            logger.info("[EventLogger] Queue evacuation finalized cleanly. Database connection severed.")
-            raise
+
+        try:
+            job = loop.run_in_executor(self.db_executor, save_and_close)
+        except RuntimeError:            # the executor is already closed
+            if batch:
+                self._write_unsaved(batch)
+            return
+        await asyncio.wait({job}, timeout=max(0.5, deadline - time.monotonic()))
+        if not finished.is_set():
+            # The disk hangs. A copy here may be a duplicate if the write lands after all; never a loss.
+            if batch:
+                self._write_unsaved(batch)
+            self.db_executor.shutdown(wait=False)
+        logger.info("[EventLogger] Event writer stopped.")
 
     def close(self) -> None:
         """Best-effort release of DB resources for this logger instance."""

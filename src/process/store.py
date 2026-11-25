@@ -6,6 +6,7 @@ high-rate cycle ingestion never contends with the defect-event audit log.
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import sqlite3
 import threading
@@ -16,7 +17,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from src.process.models import FAIL, InspectionRecord, ProcessCycle, RiskAssessment
+from src.process.models import FAIL, PASS, InspectionRecord, ProcessCycle, RiskAssessment
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS process_cycles (
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS process_cycles (
     curves      BLOB,
     sample_rate_hz REAL,
     source      TEXT,
-    created_ts  REAL NOT NULL
+    created_ts  REAL NOT NULL,
+    complete    INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_machine_end ON process_cycles(machine_id, end_ts);
 
@@ -76,9 +78,33 @@ CREATE TABLE IF NOT EXISTS model_registry (
     n_samples   INTEGER NOT NULL,
     n_positive  INTEGER NOT NULL,
     metrics     TEXT NOT NULL,
-    active      INTEGER NOT NULL DEFAULT 0
+    active      INTEGER NOT NULL DEFAULT 0,
+    machine_id  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS cycle_gaps (
+    machine_id  TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    first_sequence INTEGER NOT NULL,
+    last_sequence  INTEGER NOT NULL,
+    missed      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gaps_machine_ts ON cycle_gaps(machine_id, ts);
+
+CREATE TABLE IF NOT EXISTS baseline_resets (
+    machine_id  TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    kind        TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    by_whom     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resets_machine_ts ON baseline_resets(machine_id, ts);
 """
+
+# What a baseline reset covers: a repair makes the machine healthy again; a new mould or
+# material also changes what a good cycle looks like, so the learned models start again.
+MAINTENANCE, PROCESS_CHANGE = "maintenance", "process_change"
+UNLINKED_GROUP_S = 5.0
 
 
 def _encode_curves(curves: dict[str, np.ndarray]) -> bytes | None:
@@ -109,13 +135,20 @@ class ProcessStore:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._conn.executescript(_SCHEMA)
-        columns = {r[1] for r in self._conn.execute("PRAGMA table_info(inspections)")}
-        for column in ("pos_x", "pos_y", "pos_angle"):
-            if column not in columns:
-                self._conn.execute(f"ALTER TABLE inspections ADD COLUMN {column} REAL")
-        if "cavity" not in columns:
-            self._conn.execute("ALTER TABLE inspections ADD COLUMN cavity INTEGER NOT NULL DEFAULT 0")
+        for column in ("pos_x REAL", "pos_y REAL", "pos_angle REAL", "cavity INTEGER NOT NULL DEFAULT 0"):
+            self._add_column("inspections", column)
+        self._add_column("process_cycles", "complete INTEGER NOT NULL DEFAULT 1")
+        self._add_column("model_registry", "machine_id TEXT")
         self._conn.commit()
+
+    def _add_column(self, table: str, definition: str) -> None:
+        if definition.split()[0] in {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}:
+            return
+        try:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):   # the console and the runtime may upgrade at once
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -141,8 +174,8 @@ class ProcessStore:
             """
             INSERT OR REPLACE INTO process_cycles (
                 cycle_id, machine_id, line_id, sequence, start_ts, end_ts, setpoints, scalars,
-                features, curves, sample_rate_hz, source, created_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                features, curves, sample_rate_hz, source, created_ts, complete
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cycle.cycle_id, cycle.machine_id, cycle.line_id, int(cycle.sequence),
@@ -150,7 +183,7 @@ class ProcessStore:
                 json.dumps(cycle.setpoints), json.dumps(cycle.scalars, default=str),
                 json.dumps(features),
                 _encode_curves(cycle.curves) if self.store_curves else None,
-                float(cycle.sample_rate_hz), cycle.source, time.time(),
+                float(cycle.sample_rate_hz), cycle.source, time.time(), int(cycle.complete),
             ),
         )
 
@@ -168,6 +201,7 @@ class ProcessStore:
             curves=_decode_curves(row["curves"]) if with_curves else {},
             sample_rate_hz=float(row["sample_rate_hz"] or 50.0),
             source=row["source"] or "unknown",
+            complete=bool(row["complete"]),
         )
 
     def get_cycle(self, cycle_id: str, *, with_curves: bool = False) -> ProcessCycle | None:
@@ -192,22 +226,60 @@ class ProcessStore:
         )
         return [(r["cycle_id"], float(r["end_ts"])) for r in rows]
 
-    def recent_cycles(self, limit: int = 200, *, with_curves: bool = False) -> list[ProcessCycle]:
-        rows = self._query("SELECT * FROM process_cycles ORDER BY end_ts DESC LIMIT ?", (int(limit),))
+    def recent_cycles(self, limit: int = 200, *, with_curves: bool = False,
+                      machine_id: str | None = None) -> list[ProcessCycle]:
+        rows = self._query("SELECT * FROM process_cycles WHERE (? IS NULL OR machine_id = ?) "
+                           "ORDER BY end_ts DESC LIMIT ?", (machine_id, machine_id, int(limit)))
         return [self._row_to_cycle(r, with_curves) for r in rows]
 
-    def good_cycles(self, limit: int = 200, *, with_curves: bool = True) -> list[ProcessCycle]:
-        """Cycles whose linked inspections all passed (most recent first)."""
+    def good_cycles(self, limit: int = 200, *, with_curves: bool = True, machine_id: str | None = None,
+                    since_ts: float = 0.0, min_views: int = 1) -> list[ProcessCycle]:
+        """Fully sampled cycles whose every inspection passed (most recent first)."""
         rows = self._query(
             """
             SELECT c.* FROM process_cycles c
-            WHERE EXISTS (SELECT 1 FROM inspections i WHERE i.cycle_id = c.cycle_id)
-              AND NOT EXISTS (SELECT 1 FROM inspections i WHERE i.cycle_id = c.cycle_id AND i.verdict = ?)
+            WHERE c.complete = 1 AND c.end_ts >= ? AND (? IS NULL OR c.machine_id = ?)
+              AND (SELECT COUNT(DISTINCT i.camera_id) FROM inspections i
+                   WHERE i.cycle_id = c.cycle_id AND i.verdict = ?) >= ?
+              AND NOT EXISTS (SELECT 1 FROM inspections i WHERE i.cycle_id = c.cycle_id AND i.verdict != ?)
             ORDER BY c.end_ts DESC LIMIT ?
             """,
-            (FAIL, int(limit)),
+            (float(since_ts), machine_id, machine_id, PASS, max(1, int(min_views)), PASS, int(limit)),
         )
         return [self._row_to_cycle(r, with_curves) for r in rows]
+
+    def last_sequence(self, machine_id: str) -> int | None:
+        rows = self._query("SELECT sequence FROM process_cycles WHERE machine_id = ? ORDER BY end_ts DESC LIMIT 1",
+                           (machine_id,))
+        return int(rows[0]["sequence"]) if rows else None
+
+    def machines(self) -> list[str]:
+        return [r["machine_id"] for r in self._query("SELECT DISTINCT machine_id FROM process_cycles ORDER BY machine_id")]
+
+    # ------------------------------------------------- lost cycles and baseline resets
+
+    def save_gap(self, machine_id: str, ts: float, first_sequence: int, last_sequence: int) -> None:
+        self._execute("INSERT INTO cycle_gaps VALUES (?, ?, ?, ?, ?)",
+                      (machine_id, float(ts), int(first_sequence), int(last_sequence),
+                       int(last_sequence) - int(first_sequence) + 1))
+
+    def gaps_between(self, ts_from: float, ts_to: float) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._query("SELECT * FROM cycle_gaps WHERE ts BETWEEN ? AND ? ORDER BY ts",
+                                             (ts_from, ts_to))]
+
+    def reset_baseline(self, machine_id: str, *, kind: str = MAINTENANCE, reason: str, by: str,
+                       ts: float | None = None) -> float:
+        if kind not in (MAINTENANCE, PROCESS_CHANGE):
+            raise ValueError(f"kind must be '{MAINTENANCE}' or '{PROCESS_CHANGE}', got {kind!r}")
+        ts = time.time() if ts is None else float(ts)
+        self._execute("INSERT INTO baseline_resets VALUES (?, ?, ?, ?, ?)", (machine_id, ts, kind, reason, by))
+        return ts
+
+    def baseline_start(self, machine_id: str | None, kind: str | None = None) -> float:
+        """When this machine's current baseline began (0 = it was never reset)."""
+        rows = self._query("SELECT MAX(ts) AS ts FROM baseline_resets WHERE (? IS NULL OR machine_id = ?) "
+                           "AND (? IS NULL OR kind = ?)", (machine_id, machine_id, kind, kind))
+        return float(rows[0]["ts"] or 0.0)
 
     def count_cycles(self) -> int:
         return int(self._query("SELECT COUNT(*) AS n FROM process_cycles")[0]["n"])
@@ -246,40 +318,57 @@ class ProcessStore:
         )
         return {r["cycle_id"]: int(r["n"]) for r in rows}
 
-    def labelled_dataset(self, limit: int | None = None, *, min_confidence: float = 0.0) -> list[dict[str, Any]]:
-        """One row per cycle with features and a quality label from its inspections.
+    def labelled_dataset(self, limit: int | None = None, *, min_confidence: float = 0.0,
+                         machine_id: str | None = None, since_ts: float = 0.0,
+                         required_cameras: Iterable[str] = ()) -> list[dict[str, Any]]:
+        """One row per cycle with features and a quality label, for the newest ``limit`` cycles.
 
-        A cycle is labelled FAIL if any linked vision inspection or audit failed. Audits
-        override vision verdicts for the same cycle (they are the ground truth). A vision
-        result linked below ``min_confidence`` may belong to another cycle, so it is left
-        out rather than teaching the risk model a wrong label.
+        FAIL if any part of the cycle failed. GOOD only if every part of it was really
+        inspected: a view that could not judge, a required view that is missing, or a failure
+        that may belong to another cycle (linked below ``min_confidence``) leaves the cycle
+        without a label. Audits are ground truth: they decide, whatever vision said. Cycles
+        that were not fully sampled are left out.
         """
-        sql = """
-            SELECT c.cycle_id, c.end_ts, c.features,
-                   MAX(CASE WHEN i.source = 'audit' THEN 1 ELSE 0 END) AS has_audit,
-                   MAX(CASE WHEN i.source = 'audit' AND i.verdict = 'fail' THEN 1 ELSE 0 END) AS audit_fail,
-                   MAX(CASE WHEN i.source = 'vision' AND i.verdict = 'fail' THEN 1 ELSE 0 END) AS vision_fail,
-                   GROUP_CONCAT(CASE WHEN i.verdict = 'fail' THEN i.defect_type END) AS defect_types
-            FROM process_cycles c JOIN inspections i ON i.cycle_id = c.cycle_id
-                 AND i.verdict IN ('pass', 'fail')
-                 AND (i.source = 'audit' OR i.alignment_confidence IS NULL OR i.alignment_confidence >= ?)
-            GROUP BY c.cycle_id
-            ORDER BY c.end_ts
-        """
-        if limit:
-            sql += f" LIMIT {int(limit)}"
+        required = set(required_cameras)
+        rows = self._query(
+            """
+            SELECT c.cycle_id, c.end_ts, c.features, i.camera_id, i.verdict, i.source, i.cavity, i.defect_type,
+                   i.alignment_confidence AS conf
+            FROM (SELECT cycle_id, end_ts, features FROM process_cycles p
+                  WHERE complete = 1 AND end_ts >= ? AND (? IS NULL OR machine_id = ?)
+                    AND EXISTS (SELECT 1 FROM inspections x WHERE x.cycle_id = p.cycle_id)
+                  ORDER BY end_ts DESC LIMIT ?) c
+            JOIN inspections i ON i.cycle_id = c.cycle_id
+            ORDER BY c.end_ts, c.cycle_id
+            """,
+            (float(since_ts), machine_id, machine_id, int(limit) if limit else -1),
+        )
         out = []
-        for r in self._query(sql, (float(min_confidence),)):
-            label = int(r["audit_fail"]) if int(r["has_audit"]) else int(r["vision_fail"])
-            types = [t for t in (r["defect_types"] or "").split(",") if t]
-            out.append({
-                "cycle_id": r["cycle_id"],
-                "end_ts": float(r["end_ts"]),
-                "features": json.loads(r["features"]),
-                "label": label,
-                "defect_type": types[0] if (label and types) else None,
-            })
+        for cycle_id, group in itertools.groupby(rows, key=lambda r: r["cycle_id"]):
+            views = list(group)
+            label = self._cycle_label(views, float(min_confidence), required)
+            if label is None:
+                continue
+            types = [r["defect_type"] for r in views if r["verdict"] == FAIL and r["defect_type"]]
+            out.append({"cycle_id": cycle_id, "end_ts": float(views[0]["end_ts"]),
+                        "features": json.loads(views[0]["features"]), "label": label,
+                        "defect_type": types[0] if (label and types) else None})
         return out
+
+    @staticmethod
+    def _cycle_label(views: list[sqlite3.Row], min_confidence: float, required: set[str]) -> int | None:
+        audits = [r["verdict"] for r in views if r["source"] == "audit" and r["verdict"] in (PASS, FAIL)]
+        if audits:
+            return int(FAIL in audits)
+        sure = [r for r in views if r["source"] != "audit" and (r["conf"] is None or r["conf"] >= min_confidence)]
+        if any(r["verdict"] == FAIL for r in sure):
+            return 1
+        if any(r["verdict"] != PASS for r in views if r["source"] != "audit") or not sure:
+            return None
+        seen: dict[int, set[str]] = {}
+        for r in sure:
+            seen.setdefault(r["cavity"], set()).add(r["camera_id"])
+        return None if any(required - cameras for cameras in seen.values()) else 0
 
     def part_verdicts(self, ts_from: float, ts_to: float, *,
                       required_cameras: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -287,24 +376,39 @@ class ProcessStore:
 
         A part fails if any view (or an audit) failed it; an audit overrides vision. With
         ``required_cameras`` a part not yet seen by every required view is ``incomplete``:
-        a passed part with a missing view has not actually been fully inspected. An
-        inspection with no linked cycle is still a part, so a failure can never disappear.
+        a passed part with a missing view has not actually been fully inspected. Views with no
+        linked cycle that arrive together from different required cameras are one part. They
+        can fail, so a failure never disappears, but nothing proves they saw the same part, so
+        several cameras cannot pass it (the same rule the live verdict follows).
         """
         required = sorted(set(required_cameras or []))
         rows = self._query(
-            "SELECT inspection_id, cycle_id, cavity, camera_id, verdict, defect_type, source, ts FROM inspections "
-            "WHERE ts BETWEEN ? AND ? ORDER BY ts", (ts_from, ts_to))
+            "SELECT i.inspection_id, i.cycle_id, i.cavity, i.camera_id, i.verdict, i.defect_type, i.source, i.ts, "
+            "i.alignment_confidence, c.machine_id FROM inspections i "
+            "LEFT JOIN process_cycles c ON c.cycle_id = i.cycle_id WHERE i.ts BETWEEN ? AND ? ORDER BY i.ts",
+            (ts_from, ts_to))
         parts: dict[Any, dict[str, Any]] = {}
+        loose: dict[str, Any] | None = None     # the unlinked part still being grouped
         for r in rows:
-            key = (r["cycle_id"], r["cavity"]) if r["cycle_id"] else (r["inspection_id"], None)
-            p = parts.setdefault(key, {"cycle_id": r["cycle_id"], "cavity": r["cavity"], "ts": float(r["ts"]),
-                                       "views": {}, "audit": None, "defect_types": []})
+            blank = {"cycle_id": r["cycle_id"], "cavity": r["cavity"], "ts": float(r["ts"]), "machine_id": r["machine_id"],
+                     "views": {}, "audit": None, "defect_types": [], "confidences": []}
+            if r["cycle_id"]:
+                p = parts.setdefault((r["cycle_id"], r["cavity"]), blank)
+            elif (len(required) > 1 and r["camera_id"] in required and loose is not None
+                  and r["camera_id"] not in loose["views"] and float(r["ts"]) - loose["ts"] <= UNLINKED_GROUP_S):
+                p = loose
+            else:
+                p = parts.setdefault((r["inspection_id"], None), blank)
+                if r["camera_id"] in required:
+                    loose = p
             if r["source"] == "audit":
                 p["audit"] = r["verdict"]
             else:
                 prev = p["views"].get(r["camera_id"])
                 worst = [v for v in ("fail", "not_inspected", "pass") if v in (prev, r["verdict"])]
                 p["views"][r["camera_id"]] = worst[0] if worst else r["verdict"]
+                if r["alignment_confidence"] is not None:
+                    p["confidences"].append(float(r["alignment_confidence"]))
             if r["verdict"] == "fail" and r["defect_type"]:
                 p["defect_types"].append(r["defect_type"])
         out = []
@@ -312,13 +416,30 @@ class ProcessStore:
             missing = [c for c in required if c not in p["views"]]
             seen = set(p["views"].values())
             vision = "fail" if "fail" in seen else ("not_inspected" if "not_inspected" in seen else "pass")
-            verdict = p["audit"] or vision
-            if verdict == "pass" and missing and p["audit"] is None:
-                verdict = "incomplete"
-            out.append({"cycle_id": p["cycle_id"], "cavity": p["cavity"], "ts": p["ts"], "verdict": verdict,
-                        "views": p["views"],
-                        "missing_views": missing, "audited": p["audit"] is not None,
+            if not p["views"]:
+                vision = None               # an audit of a part inspected outside this window
+            elif vision == "pass" and missing:
+                vision = "incomplete"
+            elif vision == "pass" and not p["cycle_id"] and len(required) > 1:
+                vision = "not_inspected"
+            out.append({"cycle_id": p["cycle_id"], "cavity": p["cavity"], "ts": p["ts"], "verdict": p["audit"] or vision,
+                        "vision": vision, "views": p["views"], "machine_id": p["machine_id"],
+                        "missing_views": missing, "audited": p["audit"] is not None, "confidences": p["confidences"],
                         "defect_types": sorted(set(p["defect_types"]))})
+        return out
+
+    def vision_verdicts(self, cycle_ids: Iterable[str], *,
+                        required_cameras: Iterable[str] = ()) -> dict[tuple[str, int], str]:
+        """What the cameras alone decided for every part of these cycles."""
+        out: dict[tuple[str, int], str] = {}
+        for cycle_id in cycle_ids:
+            span = self._query("SELECT MIN(ts) AS a, MAX(ts) AS b FROM inspections WHERE cycle_id = ? "
+                               "AND source != 'audit'", (cycle_id,))[0]
+            if span["a"] is None:
+                continue
+            for p in self.part_verdicts(span["a"], span["b"], required_cameras=required_cameras):
+                if p["cycle_id"] == cycle_id and p["vision"]:
+                    out[(cycle_id, p["cavity"])] = p["vision"]
         return out
 
     def part_positions(self, limit: int = 600) -> list[sqlite3.Row]:
@@ -328,12 +449,29 @@ class ProcessStore:
             "WHERE pos_x IS NOT NULL ORDER BY ts DESC LIMIT ?", (int(limit),))
         return list(reversed(rows))
 
-    def cycle_features(self, *, limit: int, newest: bool) -> list[dict[str, float]]:
-        """Feature rows of the first or latest ``limit`` cycles, oldest first."""
+    def cycle_features(self, *, limit: int, newest: bool, machine_id: str | None = None,
+                       since_ts: float = 0.0) -> list[dict[str, float]]:
+        """Feature rows of the first or latest ``limit`` complete cycles, oldest first."""
+        return [r["features"] for r in self.cycle_rows(limit=limit, newest=newest, machine_id=machine_id,
+                                                       since_ts=since_ts)]
+
+    def cycle_rows(self, *, limit: int, newest: bool, machine_id: str | None = None,
+                   since_ts: float = 0.0) -> list[dict[str, Any]]:
         order = "DESC" if newest else "ASC"
-        rows = self._query(f"SELECT features FROM process_cycles ORDER BY end_ts {order} LIMIT ?", (int(limit),))
-        out = [json.loads(r["features"]) for r in rows]
+        rows = self._query(
+            "SELECT cycle_id, sequence, end_ts, features FROM process_cycles WHERE complete = 1 AND end_ts >= ? "
+            f"AND (? IS NULL OR machine_id = ?) ORDER BY end_ts {order} LIMIT ?",
+            (float(since_ts), machine_id, machine_id, int(limit)))
+        out = [{"cycle_id": r["cycle_id"], "sequence": r["sequence"], "ts": float(r["end_ts"]),
+                "features": json.loads(r["features"])} for r in rows]
         return list(reversed(out)) if newest else out
+
+    def health_rows(self, machine_id: str, *, baseline: int = 100, recent: int = 600
+                    ) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
+        """(baseline, recent) cycles of one machine since its baseline was last reset."""
+        start = self.baseline_start(machine_id)
+        return (self.cycle_features(limit=baseline, newest=False, machine_id=machine_id, since_ts=start),
+                self.cycle_features(limit=recent, newest=True, machine_id=machine_id, since_ts=start))
 
     def inspections_between(self, ts_from: float, ts_to: float) -> list[sqlite3.Row]:
         return self._query("SELECT * FROM inspections WHERE ts BETWEEN ? AND ? ORDER BY ts", (ts_from, ts_to))
@@ -362,23 +500,27 @@ class ProcessStore:
     # ---------------------------------------------------------------- models
 
     def register_model(self, version: str, kind: str, path: str, n_samples: int, n_positive: int,
-                       metrics: dict[str, Any], activate: bool) -> None:
+                       metrics: dict[str, Any], activate: bool, machine_id: str | None = None) -> None:
         with self._lock:
             if activate:
-                self._conn.execute("UPDATE model_registry SET active = 0")
+                self._conn.execute("UPDATE model_registry SET active = 0 WHERE machine_id IS ? OR machine_id IS NULL",
+                                   (machine_id,))
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO model_registry
-                    (version, created_ts, kind, path, n_samples, n_positive, metrics, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (version, created_ts, kind, path, n_samples, n_positive, metrics, active, machine_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (version, time.time(), kind, path, int(n_samples), int(n_positive),
-                 json.dumps(metrics), 1 if activate else 0),
+                 json.dumps(metrics), 1 if activate else 0, machine_id),
             )
             self._conn.commit()
 
-    def active_model(self) -> dict[str, Any] | None:
-        rows = self._query("SELECT * FROM model_registry WHERE active = 1 ORDER BY created_ts DESC LIMIT 1")
+    def active_model(self, machine_id: str | None = None, *, any_machine: bool = True) -> dict[str, Any] | None:
+        """The machine's active model. ``any_machine`` also accepts one saved before models were per machine."""
+        rows = self._query(
+            "SELECT * FROM model_registry WHERE active = 1 AND (? IS NULL OR machine_id = ? OR (? AND machine_id IS NULL)) "
+            "ORDER BY machine_id IS NULL, created_ts DESC LIMIT 1", (machine_id, machine_id, int(any_machine)))
         if not rows:
             return None
         row = dict(rows[0])

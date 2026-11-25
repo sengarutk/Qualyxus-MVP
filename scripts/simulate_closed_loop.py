@@ -11,7 +11,8 @@ What it does, cycle by cycle, against the injection-molding simulator:
    jitter), becoming a training label.
 4. After a learning phase the supervised risk model is trained; during the evaluation
    phase high-risk cycles produce setpoint prescriptions which a simulated operator applies
-   after a short delay.
+   after a short delay. Repair requests for worn components are carried out ``--repair-delay``
+   cycles later, and the baseline is reset, as it would be on a machine.
 5. A twin simulator with the *identical* disturbance history runs without any intervention:
    scrap reduction is measured against that true counterfactual, not against a guess.
 
@@ -45,6 +46,11 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %
 logger = logging.getLogger("ClosedLoop")
 
 
+# What a repair puts right in the simulator.
+REPAIRS = {"Heater bands": ("heater_offset", "heater_rate"), "Check ring": ("check_ring_wear",),
+           "Mould cooling": ("cooling_fouling",), "Material dryer": ("dryer_fault",)}
+
+
 def _rate(n: int, d: int) -> float | None:
     return round(n / d, 5) if d else None
 
@@ -58,6 +64,9 @@ def main(argv=None) -> dict:
     parser.add_argument("--transport-delay", type=float, default=4.0)
     parser.add_argument("--jitter", type=float, default=0.3, help="Std-dev of transport time jitter (s)")
     parser.add_argument("--operator-delay", type=int, default=5, help="Cycles before a prescription is applied")
+    parser.add_argument("--repair-delay", type=int, default=50,
+                        help="Cycles before a requested repair is done (0 = requests are ignored)")
+    parser.add_argument("--no-corrections", action="store_true", help="Ignore setpoint prescriptions (repairs only)")
     parser.add_argument("--retrain-every", type=int, default=500)
     parser.add_argument("--out", type=str, default="reports/closed_loop_report.json")
     parser.add_argument("--keep-workdir", action="store_true")
@@ -94,6 +103,9 @@ def main(argv=None) -> dict:
     pending: list[tuple[int, object]] = []
     applied: collections.Counter = collections.Counter()
 
+    repairs_due: dict[str, tuple[int, str]] = {}      # component -> (cycle, action id)
+    repaired: collections.Counter = collections.Counter()
+
     stats = {phase: collections.Counter() for phase in ("learn", "evaluate")}
     eval_risk: list[tuple[float, int]] = []
     defect_mix = {phase: collections.Counter() for phase in ("controlled", "baseline")}
@@ -117,13 +129,29 @@ def main(argv=None) -> dict:
             for presc in due:
                 controlled.apply_setpoints({presc.setpoint: presc.recommended})
                 applied[presc.setpoint] += 1
+            for component, (when, action_id) in list(repairs_due.items()):
+                if when <= i:
+                    for attribute in REPAIRS[component]:
+                        setattr(controlled, attribute, 0.0)
+                    service.store.reset_baseline("imm_1", reason=f"repaired {component}", by="simulation",
+                                                 ts=controlled.clock)
+                    service.tracker.update_action(action_id, status="in_progress", acknowledged_at="sim", changed_by="sim")
+                    service.tracker.update_action(action_id, status="closed", changed_by="sim")
+                    repaired[component] += 1
+                    del repairs_due[component]
 
         cycle, outcome = controlled.next_cycle()
         base_cycle, base_outcome = baseline.next_cycle()
         n_before = len(issued)
         assessment = service.on_cycle(cycle)
         if phase == "evaluate":
-            pending.extend((i + args.operator_delay, p) for p in issued[n_before:])
+            if not args.no_corrections:
+                pending.extend((i + args.operator_delay, p) for p in issued[n_before:])
+            if args.repair_delay and assessment is not None and assessment.decision == "high":
+                for action in service.tracker.list_actions(status="open", limit=100):
+                    payload = action["action_payload"]
+                    if payload.get("action_type") == "process_maintenance":
+                        repairs_due.setdefault(payload["component"], (i + args.repair_delay, action["action_id"]))
             if assessment is not None:
                 eval_risk.append((assessment.risk, int(outcome.is_defective)))
             defect_mix["controlled"][outcome.defect_type or "none"] += 1
@@ -195,7 +223,7 @@ def main(argv=None) -> dict:
             "closed_loop_good_parts_per_hour": round(
                 (ev["parts"] - ev["true_defects"]) / (ev["cycle_time_controlled"] / 3600.0), 2) if ev["parts"] else None,
         },
-        "prescriptions": {"issued": len(issued), "applied": dict(applied)},
+        "prescriptions": {"issued": len(issued), "applied": dict(applied), "repairs": dict(repaired)},
         "retrains": [{k: v for k, v in r.items() if k != "candidate"} for r in retrain_reports],
         "runtime_s": round(time.time() - t0, 1),
     }

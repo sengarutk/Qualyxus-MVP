@@ -59,8 +59,9 @@ class ResourceManagementConfig:
     critical_hold_seconds: float = 300.0
     warning_cooldown_seconds: float = 300.0
     critical_cooldown_seconds: float = 900.0
-    # Emergency (immediate) latch threshold
     emergency_temp_c: float = 90.0
+    emergency_hold_seconds: float = 5.0        # this long above it, so one bad reading stops nothing
+    emergency_cooldown_seconds: float = 60.0   # this long below critical before cameras run again
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,8 @@ class Config:
             warning_cooldown_seconds=_num(rm, "warning_cooldown_seconds", 300.0),
             critical_cooldown_seconds=_num(rm, "critical_cooldown_seconds", 900.0),
             emergency_temp_c=_num(rm, "emergency_temp_c", 90.0),
+            emergency_hold_seconds=_num(rm, "emergency_hold_seconds", 5.0),
+            emergency_cooldown_seconds=_num(rm, "emergency_cooldown_seconds", 60.0),
         )
 
 

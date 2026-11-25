@@ -93,6 +93,16 @@ def _set_aside_torn_line(path: Path) -> bool:
     return True
 
 
+def _count_records(path: Path) -> tuple[int, bytes]:
+    """(records, last record). Nothing is parsed, so a year of logs does not hold up the start."""
+    count, last = 0, b""
+    with open(path, "rb") as fh:
+        for line in fh:
+            if line.strip():
+                count, last = count + 1, line
+    return count, last
+
+
 def anchor_path(directory: str | Path) -> Path:
     path = Path(directory)
     return path.with_name(path.name + ".anchor.json")
@@ -132,10 +142,10 @@ class InspectionAuditLog:
         if files and _set_aside_torn_line(files[-1]):
             logger.warning("[Audit] Last line of %s was cut off mid-write; kept in its .torn file.", files[-1].name)
         for f in files:
-            lines = [ln for ln in f.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
-            if lines:
-                self._records += len(lines)
-                self._last_hash = json.loads(lines[-1])["hash"]
+            count, last = _count_records(f)
+            if count:
+                self._records += count
+                self._last_hash = json.loads(last)["hash"]
                 self._last_file = f.stem
         problem = _anchor_problem(self._records, self._last_hash, self.anchor, key)
         if problem:
@@ -179,50 +189,113 @@ class InspectionAuditLog:
             return self._write(record, key)
 
 
-def verify_chain(directory: str | Path, key_file: str | Path | None = None) -> dict[str, Any]:
-    """Check every record's hash and link, then the record count against the anchor."""
+def _read_key(directory: str | Path, key_file: str | Path | None, has_log: bool) -> tuple[bytes | None, dict | None]:
+    """(key, None), or (None, the verification result when there is no usable key)."""
     key_path = _key_path(directory, key_file)
-    anchor_file = anchor_path(directory)
-    files = sorted(Path(directory).glob("*.jsonl"))
     if not key_path.exists():
-        if files or anchor_file.exists():
-            return {"ok": False, "records": 0, "error": f"audit key not found: {key_path}"}
-        return {"ok": True, "records": 0, "head": GENESIS}
+        if has_log or anchor_path(directory).exists():
+            return None, {"ok": False, "records": 0, "error": f"audit key not found: {key_path}"}
+        return None, {"ok": True, "records": 0, "head": GENESIS}
     try:
-        key = bytes.fromhex(key_path.read_text(encoding="utf-8").strip())
+        return bytes.fromhex(key_path.read_text(encoding="utf-8").strip()), None
     except ValueError:
-        return {"ok": False, "records": 0, "error": f"audit key is unreadable: {key_path}"}
-    prev = GENESIS
-    n = 0
-    gaps: list[str] = []
-    torn = False
-    for f in files:
-        text = f.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
-        for lineno, line in enumerate(lines, 1):
+        return None, {"ok": False, "records": 0, "error": f"audit key is unreadable: {key_path}"}
+
+
+def _check_file(path: Path, prev: str, key: bytes, newest: bool) -> dict[str, Any]:
+    """Every record of one daily file: {"records", "head", "gaps", "torn"}, plus "error" at the first fault."""
+    out: dict[str, Any] = {"records": 0, "head": prev, "gaps": [], "torn": False}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for lineno, line in enumerate(fh, 1):
             if not line.strip():
                 continue
             try:
                 rec = json.loads(line)
-            except ValueError:
-                if f == files[-1] and lineno == len(lines) and not text.endswith("\n"):
-                    torn = True  # cut off mid-write: the next start sets it aside
-                    continue
-                return {"ok": False, "records": n, "error": f"{f.name}:{lineno} is not a valid record"}
-            if rec.get("prev_hash") != prev:
-                return {"ok": False, "records": n, "error": f"{f.name}:{lineno} broken link (record removed or edited before it)"}
-            if not hmac.compare_digest(_record_hash(rec, key), str(rec.get("hash"))):
-                return {"ok": False, "records": n, "error": f"{f.name}:{lineno} content does not match its hash"}
-            prev = rec["hash"]
-            n += 1
+                prev_hash, stated = rec.get("prev_hash"), str(rec.get("hash"))
+            except (ValueError, AttributeError):
+                if newest and not line.endswith("\n"):
+                    out["torn"] = True  # cut off mid-write: the next start sets it aside
+                    return out
+                return {**out, "error": f"{path.name}:{lineno} is not a valid record"}
+            if prev_hash != out["head"]:
+                return {**out, "error": f"{path.name}:{lineno} broken link (record removed or edited before it)"}
+            if not hmac.compare_digest(_record_hash(rec, key), stated):
+                return {**out, "error": f"{path.name}:{lineno} content does not match its hash"}
+            out["head"] = stated
+            out["records"] += 1
             if rec.get("record") == AUDIT_GAP:
-                gaps.append(f"{f.name}:{lineno} {rec.get('problem')}")
-    problem = _anchor_problem(n, prev, anchor_file, key)
-    if problem:
-        return {"ok": False, "records": n, "error": problem}
-    if gaps:
-        return {"ok": False, "records": n, "error": f"logging restarted after a gap: {'; '.join(gaps)}"}
-    return {"ok": True, "records": n, "head": prev, **({"torn_tail": True} if torn else {})}
+                out["gaps"].append(f"{path.name}:{lineno} {rec.get('problem')}")
+    return out
+
+
+class ChainVerifier:
+    """Checks the chain again and again without rereading days that cannot have changed.
+
+    The newest file is read in full each time. An older file is read again only when its
+    size, times or identity changed (the change time, unlike the modified time, cannot be
+    set back with ordinary tools), and everything is reread every ``full_every_s`` in case a
+    disk or an administrator changed bytes underneath. ``verify_chain`` always reads it all.
+    """
+
+    def __init__(self, directory: str | Path, key_file: str | Path | None = None, *, full_every_s: float = 86400.0):
+        self.dir, self.key_file, self.full_every_s = Path(directory), key_file, float(full_every_s)
+        self._known: dict[str, tuple[tuple, dict[str, Any]]] = {}
+        self._full_at: float | None = None
+        self._lock = threading.Lock()
+        self.files_read = 0
+
+    def check(self, full: bool = False) -> dict[str, Any]:
+        with self._lock:
+            files = sorted(self.dir.glob("*.jsonl"))
+            key, result = _read_key(self.dir, self.key_file, bool(files))
+            if key is None:
+                return result
+            now = time.monotonic()
+            if full or self._full_at is None or now - self._full_at > self.full_every_s:
+                self._known, self._full_at = {}, now
+            prev, records, gaps, torn = GENESIS, 0, [], False
+            self.files_read = 0
+            for path in files:
+                stat = path.stat()
+                stamp = (prev, hashlib.sha256(key).digest(), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+                known = self._known.get(path.name)
+                newest = path == files[-1]
+                if known is not None and known[0] == stamp and not newest:
+                    part = known[1]
+                else:
+                    part = _check_file(path, prev, key, newest)
+                    self.files_read += 1
+                    if "error" in part:
+                        self._known.pop(path.name, None)
+                        return {"ok": False, "records": records + part["records"], "error": part["error"]}
+                    if not part["torn"]:
+                        self._known[path.name] = (stamp, part)
+                prev, records = part["head"], records + part["records"]
+                gaps += part["gaps"]
+                torn = torn or part["torn"]
+            problem = _anchor_problem(records, prev, anchor_path(self.dir), key)
+        if problem:
+            return {"ok": False, "records": records, "error": problem}
+        if gaps:
+            return {"ok": False, "records": records, "error": f"logging restarted after a gap: {'; '.join(gaps)}"}
+        return {"ok": True, "records": records, "head": prev, **({"torn_tail": True} if torn else {})}
+
+
+def verify_chain(directory: str | Path, key_file: str | Path | None = None) -> dict[str, Any]:
+    """Check every record's hash and link, then the record count against the anchor."""
+    return ChainVerifier(directory, key_file).check(full=True)
+
+
+_verifiers: dict[tuple[str, str], ChainVerifier] = {}
+_verifiers_lock = threading.Lock()
+
+
+def verify_incremental(directory: str | Path, key_file: str | Path | None = None) -> dict[str, Any]:
+    """:func:`verify_chain` for screens that check every few seconds (see :class:`ChainVerifier`)."""
+    with _verifiers_lock:
+        verifier = _verifiers.setdefault((str(Path(directory).resolve()), str(key_file)),
+                                         ChainVerifier(directory, key_file))
+    return verifier.check()
 
 
 def main(argv=None) -> dict[str, Any]:

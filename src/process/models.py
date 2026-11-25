@@ -31,6 +31,7 @@ class ProcessCycle:
     sample_rate_hz: float = 50.0
     line_id: str | None = None
     source: str = "unknown"
+    complete: bool = True     # False: part of the cycle was never sampled. It links parts, and teaches nothing
 
     @property
     def duration_s(self) -> float:

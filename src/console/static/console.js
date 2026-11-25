@@ -90,7 +90,7 @@ function liveView() {
       <div class="row"><span>Cameras</span><span>${s.cameras.filter((c) => c.online).length} of ${s.cameras.length} delivering</span></div>
       <div class="row"><span>PLC output</span><span>${!s.plc.online ? "–" : s.plc.hold_reason ? "Heartbeat held" : s.plc.simulated ? "Heartbeat running (simulated PLC)" : "Heartbeat running"}</span></div>
       <div class="row"><span>Last verdict sent</span><span>${s.plc.last_verdict ? `part ${s.plc.last_verdict.part}, flag ${s.plc.last_verdict.flag}` : "–"}</span></div>
-      <div class="row"><span>Audit trail</span><span>${s.audit.ok === null ? "–" : s.audit.ok ? `Intact, ${num(s.audit.records, 0)} records` : "Broken"}</span></div>
+      <div class="row"><span>Audit trail</span><span>${s.audit.ok === null ? (s.audit.checking ? "Checking…" : "–") : s.audit.ok ? `Intact, ${num(s.audit.records, 0)} records` : "Broken"}</span></div>
       <div class="row"><span>False-reject limit</span><span>${model.part_frr_target ? `${pct(model.part_frr_target, 0)} per part across ${model.n_views} views${model.guaranteed ? "" : " (not guaranteed)"}` : "–"}</span></div>
       <div class="row"><span>Model</span><span class="mono">${esc(model.digest || "–")}</span></div></div></section>
   </div>
@@ -120,13 +120,14 @@ function traceView() {
 }
 
 async function processView() {
-  const [spc, risk, rx] = await Promise.all([api("spc?signal=" + encodeURIComponent(S.signal)), api("risk"), api("prescriptions")]);
+  const [spc, risk, rx] = await Promise.all([api("spc?signal=" + encodeURIComponent(S.signal) + (S.machine ? "&machine=" + encodeURIComponent(S.machine) : "")), api("risk"), api("prescriptions")]);
   const sup = risk.length && risk[risk.length - 1].kind === "supervised";
   const p = spc.points, open = (i) => p[i] && select(p[i].cycle_id + "#0", "trace");
   const refs = [{ v: spc.ucl, label: "upper limit", cls: "limit" }, { v: spc.center, label: "centre" }, { v: spc.lcl, label: "lower limit", cls: "limit" }];
   const ticks = (a) => [0, .25, .5, .75, 1].map((f) => Math.round(f * (a.length - 1))).filter((i) => a[i]).map((i) => [i, a[i].n]);
-  return `<div class="grid"><section class="card c12"><h2>Control chart <span class="end">3σ limits from the first ${spc.baseline || 0} healthy cycles</span></h2>
+  return `<div class="grid"><section class="card c12"><h2>Control chart <span class="end">3σ limits from the first ${spc.baseline || 0} cycles since the last baseline reset</span></h2>
    <div class="seg" style="margin-bottom:10px">${(spc.signals || []).map((x) => `<button data-signal="${esc(x.id)}" aria-pressed="${x.id === S.signal}">${esc(x.label)}</button>`).join("")}</div>
+   ${S.state.machines.length > 1 ? `<div class="seg" style="margin-bottom:10px">${S.state.machines.map((m) => `<button data-machine="${esc(m)}" aria-pressed="${m === (S.machine || S.state.machines[0])}">${esc(m)}</button>`).join("")}</div>` : ""}
    ${p.length ? line({ y: p.map((x) => x.v), h: 300, w: 1500, refs, marks: p.map((x, i) => (x.failed ? i : -1)).filter((i) => i >= 0), x: ticks(p), aria: spc.label + " control chart", pick: open, tip: (i) => `<b>Cycle ${p[i].n}</b>${num(p[i].v, 2)} ${esc(spc.unit)}${p[i].rule ? "<br>" + esc(p[i].rule) : ""}${p[i].failed ? "<br>Part rejected" : ""}<br><span class="muted">Click to trace</span>` }) : '<div class="empty">Learning: the baseline needs 20 cycles.</div>'}
    <div class="key" style="margin-top:8px"><span><i style="background:var(--s1)"></i>${esc(spc.label)} (${esc(spc.unit)})</span><span><i style="background:var(--crit);border-radius:50%"></i>Cycle whose part was rejected</span><span>${num(spc.violations, 0)} of ${p.length} cycles break a control rule</span>${spc.cpk !== null && spc.cpk !== undefined ? `<span>Cpk ${num(spc.cpk, 2)} against the process window</span>` : ""}</div></section>
    <section class="card c8"><h2>${sup ? "Defect risk" : "Process deviation"} per cycle, scored before the camera sees the part <span class="end">${sup ? "learned from labelled parts" : "0% = like a healthy cycle. Becomes defect risk once enough rejects exist"}</span></h2>${risk.length ? line({ y: risk.map((x) => x.risk), h: 240, w: 1000, min: 0, max: 1, fmt: (v) => Math.round(v * 100) + "%", right: 20, marks: risk.map((x, i) => (x.failed ? i : -1)).filter((i) => i >= 0), x: ticks(risk), aria: "Process score per cycle", pick: (i) => select(risk[i].cycle_id + "#0", "trace"), tip: (i) => `<b>Cycle ${risk[i].n}</b>${sup ? "Risk" : "Deviation"} ${pct(risk[i].risk, 0)}${risk[i].likely ? "<br>Likely " + esc(words(risk[i].likely)) : ""}${risk[i].failed ? "<br>Part rejected" : ""}` }) : '<div class="empty">No risk model yet.</div>'}<div class="key" style="margin-top:8px"><span><i style="background:var(--s1)"></i>${sup ? "Risk" : "Deviation"}</span><span><i style="background:var(--crit);border-radius:50%"></i>Cycle whose part was rejected</span></div></section>
@@ -148,7 +149,7 @@ async function qualityView() {
 
 async function auditView() {
   const a = await api("audit"), ok = a.chain.ok;
-  return `<div class="grid"><section class="card c12"><h2>Tamper-evident record of every verdict <span class="end"><button class="btn" id="csv">Export these records</button></span></h2><div class="verdict"><span class="big ${ok ? "pass" : ok === false ? "fail" : "other"}">${ok ? "INTACT" : ok === false ? "BROKEN" : "NO RECORDS"}</span><span>${ok ? `${num(a.chain.records, 0)} records checked, every link and signature valid` : esc(a.chain.error || "")}</span><span class="muted">${a.chain.checked ? "checked " + clock(a.chain.checked) : ""}</span></div>
+  return `<div class="grid"><section class="card c12"><h2>Tamper-evident record of every verdict <span class="end"><button class="btn" id="csv">Export these records</button></span></h2><div class="verdict"><span class="big ${ok ? "pass" : ok === false ? "fail" : "other"}">${ok ? "INTACT" : ok === false ? "BROKEN" : a.chain.checking ? "CHECKING" : "NO RECORDS"}</span><span>${ok ? `${num(a.chain.records, 0)} records checked, every link and signature valid` : esc(a.chain.error || "")}</span><span class="muted">${a.chain.checked ? "checked " + clock(a.chain.checked) : ""}</span></div>
    <div class="scroll"><table><thead><tr><th>Time</th><th>Record</th><th>Cycle</th><th>View</th><th>Verdict</th><th class="n" style="padding-right:26px">Score</th><th>Image SHA-256</th><th>Model</th><th>Hash</th><th>Chained to</th></tr></thead><tbody>${a.records.map((r) => `<tr class="${r.cycle_id ? "click" : ""}" ${r.cycle_id ? `data-part="${esc(r.cycle_id)}#0" tabindex="0"` : ""}><td>${r.ts ? clock(r.ts) : "–"}</td><td>${r.record === "part_verdict" ? "Part verdict" : r.record === "view" ? "View" : esc(words(r.record))}</td><td>${esc(r.cycle_id || "–")}</td><td>${r.camera ? esc(words(r.camera)) : "All"}</td><td>${esc(words(r.verdict || "–"))}</td><td class="n" style="padding-right:26px">${num(r.score, 2)}</td><td class="mono">${esc(r.image || "–")}</td><td class="mono">${esc(r.model || "–")}</td><td class="mono">${esc(r.hash)}</td><td class="mono muted">${esc(r.prev)}</td></tr>`).join("")}</tbody></table></div></section></div>`;
 }
 
@@ -186,12 +187,13 @@ async function tick() {
   S.busy = false; chrome(); draw();
 }
 document.addEventListener("click", (e) => {
-  const t = e.target.closest("[data-tab],[data-part],[data-heat],[data-only],[data-signal],#theme,#csv"); if (!t) return;
+  const t = e.target.closest("[data-tab],[data-part],[data-heat],[data-only],[data-signal],[data-machine],#theme,#csv"); if (!t) return;
   if (t.dataset.tab) { S.tab = t.dataset.tab; history.replaceState(null, "", "#" + S.tab); lastHtml = ""; if (S.tab === "trace") { const f = S.parts.filter((p) => p.verdict === "fail" && p.key).pop(); if (f) return select(f.key); } chrome(); draw(); }
   else if (t.dataset.part !== undefined) { if (t.dataset.part) select(t.dataset.part, "trace"); }
   else if (t.dataset.heat) { S.heat = t.dataset.heat === "1"; draw(); }
   else if (t.dataset.only) { S.failedOnly = t.dataset.only === "1"; draw(); }
   else if (t.dataset.signal) { S.signal = t.dataset.signal; draw(); }
+  else if (t.dataset.machine) { S.machine = t.dataset.machine; draw(); }
   else if (t.id === "theme") { const r = document.documentElement; r.dataset.theme = r.dataset.theme === "dark" ? "light" : "dark"; }
   else if (t.id === "csv") { const rows = [...document.querySelectorAll("#view table tr")].map((r) => [...r.children].map((c) => '"' + c.textContent.replace(/"/g, '""') + '"').join(",")); const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([rows.join("\n")], { type: "text/csv" })); a.download = "qualyxus-audit.csv"; a.click(); }
 });

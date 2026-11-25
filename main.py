@@ -13,7 +13,7 @@ from src.camera.camera_manager import CameraManager
 from src.analytics.vlm_narrator import VLMNarrator
 from src.fleet.historian import PredictiveHistorian
 from src.process.service import ProcessIntelligenceService
-from src.process.sources import build_cycle_source
+from src.process.sources import build_cycle_sources
 
 logger = logging.getLogger("QualyxusCore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -79,7 +79,8 @@ class CoreOrchestrator:
             self.process_service = ProcessIntelligenceService(
                 process_cfg, cameras_cfg=self.config.get("cameras", default=[]) or [],
             )
-            self.process_service.attach_source(build_cycle_source(process_cfg))
+            for source in build_cycle_sources(process_cfg):
+                self.process_service.attach_source(source)
             self.process_service.add_alert_callback(self._on_process_alert)
             self.manager.register_instance("ProcessIntelligence", self.process_service)
             self.camera_manager.attach_process_service(self.process_service)

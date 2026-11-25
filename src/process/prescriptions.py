@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from src.process.models import RiskAssessment
 from src.process.risk_model import DefectRiskModel, DeviationReference
@@ -174,3 +174,48 @@ class PrescriptionEngine:
             target_value=float(prescription.recommended),
             changed_by="system:process_intelligence",
         )
+
+    @staticmethod
+    def issue_maintenance(tracker, *, machine_id: str, component: str, cycle_id: str, status: str,
+                          wear: float) -> dict[str, Any] | None:
+        """Ask for the worn part to be checked; None when that request is already open."""
+        for action in open_actions(tracker, machine_id, "process_maintenance"):
+            if action["action_payload"].get("component") == component:
+                return None
+        return tracker.issue_action(
+            rca_reference=f"cycle:{cycle_id}",
+            assigned_role="maintenance",
+            action_payload={
+                "title": f"Check {component} on {machine_id}", "action_type": "process_maintenance",
+                "classification_6m": "Machine", "target_system": "machine", "machine_id": machine_id,
+                "component": component, "cycle_id": cycle_id,
+                "explanation": f"Check the {component.lower()} on {machine_id}: its signal has moved {wear:.1f}\u03c3 from "
+                               f"the healthy baseline ({status.lower()}). No settings are suggested until then: they "
+                               "would hide the wear. After the repair, reset this machine's baseline.",
+            },
+            approval_required=False,
+            changed_by="system:process_intelligence",
+        )
+
+
+def open_actions(tracker, machine_id: str, action_type: str, statuses: Iterable[str] = ("open", "in_progress")
+                 ) -> list[dict[str, Any]]:
+    found = [a for s in statuses for a in tracker.list_actions(status=s, limit=1000)]
+    return [a for a in found if (a.get("action_payload") or {}).get("action_type") == action_type
+            and a["action_payload"].get("machine_id") == machine_id]
+
+
+def withdraw(tracker, machine_id: str, reason: str, *, setpoints: Iterable[str] | None = None) -> int:
+    """Close this machine's untouched suggestions (one a person has started stays theirs).
+
+    ``setpoints`` limits it to those settings.
+    """
+    wanted = None if setpoints is None else set(setpoints)
+    n = 0
+    for action in open_actions(tracker, machine_id, "process_prescription", statuses=("open",)):
+        payload = action["action_payload"]
+        if action.get("acknowledged_at") or (wanted is not None and payload.get("setpoint") not in wanted):
+            continue
+        tracker.withdraw_action(action["action_id"], reason=reason, by="system:process_intelligence")
+        n += 1
+    return n

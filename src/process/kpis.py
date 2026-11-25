@@ -1,6 +1,6 @@
 """Business KPIs that a quality buyer actually pays for.
 
-* scrap rate                 - share of inspected parts that failed
+* scrap rate                 - share of judged parts that failed
 * prediction quality         - how well per-cycle risk separated failing from good cycles
 * early-warning lead time    - how far ahead of a defect episode the risk was raised
 * false reject / escape rate - only computable against audits (manual re-inspection,
@@ -9,11 +9,11 @@
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
-from src.process.models import FAIL
+from src.process.models import FAIL, PASS
 from src.process.store import ProcessStore
 
 
@@ -22,35 +22,35 @@ def compute_kpis(
     ts_from: float,
     ts_to: float,
     *,
+    required_cameras: Iterable[str] = (),
     min_quiet_parts: int = 10,
 ) -> dict[str, Any]:
-    inspections = [dict(r) for r in store.inspections_between(ts_from, ts_to)]
-    vision = [r for r in inspections if r["source"] == "vision"]
-    audits = [r for r in inspections if r["source"] == "audit"]
-
-    n_parts = len(vision)
-    n_fail = sum(1 for r in vision if r["verdict"] == FAIL)
-    linked = [r for r in vision if r["cycle_id"]]
+    """Everything counts physical parts, however many cameras saw each one."""
+    parts = [p for p in store.part_verdicts(ts_from, ts_to, required_cameras=required_cameras) if p["vision"]]
+    judged = [p for p in parts if p["verdict"] in (PASS, FAIL)]
+    linked = [p for p in parts if p["cycle_id"]]
+    confidences = [c for p in linked for c in p["confidences"]]
+    n_fail = sum(p["verdict"] == FAIL for p in judged)
+    gaps = store.gaps_between(ts_from, ts_to)
 
     kpis: dict[str, Any] = {
         "window": {"from": ts_from, "to": ts_to},
-        "parts_inspected": n_parts,
+        "parts_inspected": len(judged),
+        "parts_not_inspected": len(parts) - len(judged),   # never counted as good
         "parts_failed": n_fail,
-        "scrap_rate": round(n_fail / n_parts, 5) if n_parts else None,
-        "alignment_coverage": round(len(linked) / n_parts, 5) if n_parts else None,
-        "mean_alignment_confidence": (
-            round(float(np.mean([r["alignment_confidence"] or 0.0 for r in linked])), 4) if linked else None
-        ),
+        "scrap_rate": round(n_fail / len(judged), 5) if judged else None,
+        "alignment_coverage": round(len(linked) / len(parts), 5) if parts else None,
+        "mean_alignment_confidence": round(float(np.mean(confidences)), 4) if confidences else None,
+        "machine_cycles_lost": sum(g["missed"] for g in gaps),
     }
 
     # --- audits: false rejects & escapes ------------------------------------------
-    vision_by_cycle: dict[str, str] = {}
-    for r in linked:
-        if r["verdict"] == FAIL or r["cycle_id"] not in vision_by_cycle:
-            vision_by_cycle[r["cycle_id"]] = r["verdict"]
-    audited = [(vision_by_cycle.get(a["cycle_id"]), a["verdict"]) for a in audits if a["cycle_id"] in vision_by_cycle]
+    audits = [dict(r) for r in store.inspections_between(ts_from, ts_to) if r["source"] == "audit"]
+    vision = store.vision_verdicts({a["cycle_id"] for a in audits if a["cycle_id"]}, required_cameras=required_cameras)
+    latest = {(a["cycle_id"], a["cavity"]): a["verdict"] for a in audits}      # a corrected audit replaces the first
+    audited = [(vision.get(key), verdict) for key, verdict in latest.items()]
     vision_fail_audited = [a for v, a in audited if v == FAIL]
-    vision_pass_audited = [a for v, a in audited if v != FAIL]
+    vision_pass_audited = [a for v, a in audited if v == PASS]
     kpis["audits"] = len(audits)
     kpis["false_reject_rate"] = (
         round(sum(1 for a in vision_fail_audited if a != FAIL) / len(vision_fail_audited), 5)
@@ -60,6 +60,16 @@ def compute_kpis(
         round(sum(1 for a in vision_pass_audited if a == FAIL) / len(vision_pass_audited), 5)
         if vision_pass_audited else None
     )
+
+    # One outcome per machine cycle: it failed if any of its parts failed.
+    cycles: dict[str, dict[str, Any]] = {}
+    for p in sorted(judged, key=lambda p: p["ts"]):
+        if p["cycle_id"]:
+            c = cycles.setdefault(p["cycle_id"], {"cycle_id": p["cycle_id"], "ts": p["ts"], "verdict": PASS,
+                                                  "machine_id": p["machine_id"]})
+            if p["verdict"] == FAIL:
+                c["verdict"] = FAIL
+    vision_by_cycle = {c: v["verdict"] for c, v in cycles.items()}
 
     # --- prediction quality on cycles with both a prediction and a vision label -------
     predictions = {r["cycle_id"]: dict(r) for r in store.predictions_between(ts_from - 86400.0, ts_to)}
@@ -88,27 +98,28 @@ def compute_kpis(
     # --- early warning lead time ----------------------------------------------------
     # For every defect episode (a failure after >= min_quiet_parts good parts), count how
     # many consecutive cycles immediately before it were already flagged (watch/high).
-    ordered = sorted(linked, key=lambda r: r["ts"])
     leads_cycles: list[int] = []
     leads_seconds: list[float] = []
-    quiet = 0
-    for idx, r in enumerate(ordered):
-        if r["verdict"] != FAIL:
-            quiet += 1
-            continue
-        if quiet >= min_quiet_parts:
-            lead = 0
-            first_flag_ts = None
-            for prev in reversed(ordered[:idx + 1]):
-                pred = predictions.get(prev["cycle_id"])
-                if not pred or pred["decision"] == "ok":
-                    break
-                lead += 1
-                first_flag_ts = pred["ts"]
-            leads_cycles.append(max(0, lead - 1))  # cycles of warning before the failing one
-            if first_flag_ts is not None:
-                leads_seconds.append(max(0.0, float(r["ts"]) - float(first_flag_ts)))
+    for machine in {c["machine_id"] for c in cycles.values()}:
+        ordered = sorted((c for c in cycles.values() if c["machine_id"] == machine), key=lambda c: c["ts"])
         quiet = 0
+        for idx, r in enumerate(ordered):
+            if r["verdict"] != FAIL:
+                quiet += 1
+                continue
+            if quiet >= min_quiet_parts:
+                lead = 0
+                first_flag_ts = None
+                for prev in reversed(ordered[:idx + 1]):
+                    pred = predictions.get(prev["cycle_id"])
+                    if not pred or pred["decision"] == "ok":
+                        break
+                    lead += 1
+                    first_flag_ts = pred["ts"]
+                leads_cycles.append(max(0, lead - 1))  # cycles of warning before the failing one
+                if first_flag_ts is not None:
+                    leads_seconds.append(max(0.0, float(r["ts"]) - float(first_flag_ts)))
+            quiet = 0
     kpis["defect_episodes"] = len(leads_cycles)
     kpis["episodes_with_warning"] = sum(1 for c in leads_cycles if c > 0)
     kpis["median_warning_cycles"] = float(np.median(leads_cycles)) if leads_cycles else None

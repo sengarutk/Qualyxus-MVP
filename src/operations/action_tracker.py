@@ -476,6 +476,12 @@ class ActionTracker:
             return None
         return self._row_to_action_dict(row)
 
+    def withdraw_action(self, action_id: str, *, reason: str, by: str) -> dict[str, Any]:
+        """Close a suggestion nobody acted on because it no longer holds. Never counts as done."""
+        return self.update_action(action_id, status="closed", acknowledged_at=_utc_now(), approval_required=False,
+                                  resolved_by=by, closure_notes=f"Withdrawn: {reason}",
+                                  verification_status="WITHDRAWN", changed_by=by, change_reason="withdrawn")
+
     def list_actions(
         self,
         *,

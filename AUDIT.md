@@ -1,7 +1,8 @@
 # Qualyxus MVP: full audit, 2026-11-24
 
 Commit `0d06b82`. Nothing was changed during this audit. Stage 1 (marked fixed) was done on 2026-11-25; its tests are in `tests/test_safe_verdicts.py`.
-Probes 06, 17 and 23 in `scripts/audit_probes.py` still fail: they check the old text or method, not the fixed behaviour.
+Stage 2 (also marked fixed) was done on 2026-11-25; its tests are in `tests/test_true_numbers.py`.
+Probes 06, 16, 17, 20 and 23 in `scripts/audit_probes.py` still fail: they check the old text or method, not the fixed behaviour.
 A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to copy the sequence register to the acknowledge register.
 
 **Evidence labels**
@@ -39,30 +40,30 @@ A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to cop
 
 | # | Fault | Evidence | Where | Effort |
 |---|---|---|---|---|
-| B1 | **Dashboard counts camera views as parts.** 10 parts with 1 reject shows as 60 parts, 1.7% scrap (true: 10%). Affects the old dashboard, not the new console. Early-warning lead times are inflated the same way on multi-view stations. | P | `process/kpis.py` | S |
-| B2 | Parts that could not be inspected count as good in the scrap rate. | P | `kpis.py` | S |
-| B3 | A part with an uninspected view trains the risk model as "good". | P | `store.labelled_dataset` | S |
-| B4 | Each six-view part counts as 6 labels: retrains every 42 parts, not 250. | P | `service.record_inspection` | S |
-| B5 | Retraining reloads all history every time: about 147 s of preparation after 30 days, repeated every 13 minutes. | P | `service.retrain` | M |
-| B6 | **Lost machine cycles leave no record.** A counter jump of 5 gives 1 cycle. | P | `CycleAssembler.feed` | S |
-| B7 | **A network outage is merged into one cycle:** a 59 s gap became a 61 s "cycle" that feeds health and training. | P | `CycleAssembler` | S |
-| B8 | Health baseline is the first 100 cycles ever, for life. Maintenance, a new mould or material never resets it. | C | `machine_health`, `console/data` | M |
-| B9 | Health mixes all machines, and the runtime supports one machine source only. | C | `store.cycle_features`, `main.py` | M |
+| ~~B1~~ fixed | **Dashboard counts camera views as parts.** 10 parts with 1 reject shows as 60 parts, 1.7% scrap (true: 10%). Affects the old dashboard, not the new console. Early-warning lead times are inflated the same way on multi-view stations. | P | `process/kpis.py` | S |
+| ~~B2~~ fixed | Parts that could not be inspected count as good in the scrap rate. | P | `kpis.py` | S |
+| ~~B3~~ fixed | A part with an uninspected view trains the risk model as "good". | P | `store.labelled_dataset` | S |
+| ~~B4~~ fixed | Each six-view part counts as 6 labels: retrains every 42 parts, not 250. | P | `service.record_inspection` | S |
+| ~~B5~~ fixed | Retraining reloads all history every time: about 147 s of preparation after 30 days, repeated every 13 minutes. | P | `service.retrain` | M |
+| ~~B6~~ fixed | **Lost machine cycles leave no record.** A counter jump of 5 gives 1 cycle. | P | `CycleAssembler.feed` | S |
+| ~~B7~~ fixed | **A network outage is merged into one cycle:** a 59 s gap became a 61 s "cycle" that feeds health and training. | P | `CycleAssembler` | S |
+| ~~B8~~ fixed | Health baseline is the first 100 cycles ever, for life. Maintenance, a new mould or material never resets it. | C | `machine_health`, `console/data` | M |
+| ~~B9~~ fixed | Health mixes all machines, and the runtime supports one machine source only. | C | `store.cycle_features`, `main.py` | M |
 | B10 | **Lighting faults are treated as bad parts.** Uneven light, shadow, reflection, JPEG compression, textured belt and half-in-frame each rejected 20 of 20 good parts. Half-covered, glare, darker and brighter frames pass the image check. No exposure or framing check. | P | `image_quality.py` | M |
-| B11 | **Model-blind drift raises no alarm.** Scores falling to a tenth of normal pass silently; only upward drift alerts. | P | `monitoring.py` | S |
-| B12 | **Second rollback returns to the bad model** (v3, then v2, then v3 again). | P | `model_registry.rollback` | S |
-| B13 | Model file digest is recorded but never checked at load (vision models; joblib ones are signed). | C | `inspection_stack` | S |
+| ~~B11~~ fixed | **Model-blind drift raises no alarm.** Scores falling to a tenth of normal pass silently; only upward drift alerts. | P | `monitoring.py` | S |
+| ~~B12~~ fixed | **Second rollback returns to the bad model** (v3, then v2, then v3 again). | P | `model_registry.rollback` | S |
+| ~~B13~~ fixed | Model file digest is recorded but never checked at load (vision models; joblib ones are signed). | C | `inspection_stack` | S |
 | B14 | **4.6 GB RAM per 12 MP camera** for the frame buffer, 28 GB for six. | P | `_POOL_SLOTS` | S |
 | B15 | **5 fps limit at 12 MP** from presence, sharpness and copying on full frames. | P | `part_inspection`, `camera_manager` | M |
 | B16 | Storage at 12 MP: up to 69 GB per recipe (good pool) and 115 GB per camera (review). Neither obeys the disk monitor. | P | `good_pool`, `monitoring` | S |
 | B17 | No retention for cycles, inspections, events or audit: about 82 MB a day in `process.db` per line. | P | `store.py` | M |
-| B18 | Audit check reads the whole log every 10 s: 11 s long after 30 days, 129 s after a year. Needs checkpoints. | P | `console`, `audit_log` | M |
-| B19 | **Event writer dies on one database error** ("database is locked"), and tracking events in that batch are lost. It restarts only on the next event. | P | `event_logger` | S |
-| B20 | Events already taken from the queue are lost at shutdown. | P | `event_logger` | S |
-| B21 | **Random telemetry is written into event records** in default mode: made-up temperature, vibration, lot and shift, then hashed as evidence. | P | `plc_adapter.read_context` | S |
-| B22 | **Language-model errors are saved as the defect's root cause.** It is on by default and sends every defect to a local server that may not exist. | P | `vlm_gateway` | S |
-| B23 | One 95 °C reading latches EMERGENCY: all cameras stop until restart. No confirmation, no recovery. | P | `resource_monitor` | S |
-| B24 | Corrections advise raising hold pressure when the alarm says the check ring is worn, which hides the wear. Old suggestions stay open and contradict newer ones. | C | `prescriptions.py` | M |
+| ~~B18~~ fixed | Audit check reads the whole log every 10 s: 11 s long after 30 days, 129 s after a year. Needs checkpoints. | P | `console`, `audit_log` | M |
+| ~~B19~~ fixed | **Event writer dies on one database error** ("database is locked"), and tracking events in that batch are lost. It restarts only on the next event. | P | `event_logger` | S |
+| ~~B20~~ fixed | Events already taken from the queue are lost at shutdown. | P | `event_logger` | S |
+| ~~B21~~ fixed | **Random telemetry is written into event records** in default mode: made-up temperature, vibration, lot and shift, then hashed as evidence. | P | `plc_adapter.read_context` | S |
+| ~~B22~~ fixed | **Language-model errors are saved as the defect's root cause.** It is on by default and sends every defect to a local server that may not exist. | P | `vlm_gateway` | S |
+| ~~B23~~ fixed | One 95 °C reading latches EMERGENCY: all cameras stop until restart. No confirmation, no recovery. | P | `resource_monitor` | S |
+| ~~B24~~ fixed | Corrections advise raising hold pressure when the alarm says the check ring is worn, which hides the wear. Old suggestions stay open and contradict newer ones. | C | `prescriptions.py` | M |
 | B25 | Modbus reads one signal per request (10 round trips per sample); 20 Hz needs under 5 ms each. Use block reads. One failed register drops the whole sample and reconnects. | C | `ModbusCycleSource` | M |
 | B26 | **Docker image cannot run on a Jetson:** x86 CUDA wheels on an x86-style base. The image has never been built to completion. | C | `Dockerfile`, `requirements.txt` | L |
 | B27 | Python 3.10 reached end of life in October 2026. 48 advisories in pillow (42), tornado (4) and filelock (2); this scan could not check the CUDA builds of torch, where about 20 were found earlier. | P | `requirements.txt` | L |
@@ -144,6 +145,13 @@ A1 and A8 are planned for stage 3. A11 also needs the plant's PLC program to cop
 | F10 | No type checking; GitHub CI result unknown; tests need downloaded models. | C | M |
 | F11 | Misleading names and claims in comments ("Guarantees 100% transaction compliance", "opcua_compatible: True" from a placeholder). | C | S |
 | F12 | Two dashboards overlap; the old one has the wrong KPIs (B1). Move approvals into the console and retire it. | J | L |
+
+## Found while fixing stage 2
+
+- **Setting corrections alone can raise scrap.** With B24 fixed for single settings only and repair requests ignored, simulated scrap rose on 2 of 3 seeds (12.4% to 19.8%, 5.2% to 15.4%). Now no correction is suggested while any component is drifting; with requests ignored, scrap then equals the untouched machine.
+- **The earlier simulated scrap reduction (79% to 93% on the same 3 seeds) came mostly from settings that hid wear.** With repairs done 50 cycles after a request: 68%, 75% and 49%. Repairs do most of it. Simulation only, ideal vision (`--vision oracle`); rerun: `python scripts/simulate_closed_loop.py --vision oracle --seed 11`.
+- A baseline assumes the first 100 cycles after a reset are healthy. After a repair someone must reset it (`python -m src.process.baseline`), or the repair request comes back.
+- A Modbus or OPC UA source that stays down produces no cycle, so its lost cycles are recorded only when it returns.
 
 ## What held up
 

@@ -101,12 +101,16 @@ def _version_of(path: str | Path | None, registry_version: str | None) -> dict[s
 
 class InspectionStack:
     def __init__(self, recipe: str, *, anomaly_path=None, segmentation_path=None, typing_path=None,
-                 versions: dict[str, str | None] | None = None):
+                 versions: dict[str, str | None] | None = None, refused: set[tuple[str, str]] = frozenset()):
         self.recipe = recipe
         versions = versions or {}
-        self.anomaly = _load_anomaly(anomaly_path)
-        self.segmenter = _load_segmenter(segmentation_path)
-        self.typer = _load_typer(typing_path)
+
+        def usable(role, path):
+            return None if (role, versions.get(role)) in refused else path
+
+        self.anomaly = _load_anomaly(usable("anomaly", anomaly_path))
+        self.segmenter = _load_segmenter(usable("segmentation", segmentation_path))
+        self.typer = _load_typer(usable("typing", typing_path))
         self.model_missing = bool((anomaly_path and self.anomaly is None)
                                   or (segmentation_path and self.segmenter is None))
         self.versions = {
@@ -182,20 +186,28 @@ class StackProvider:
     def _build(self, recipe: str, key: tuple) -> tuple[InspectionStack, InspectionStack | None]:
         reg = {role: (active, shadow) for role, active, shadow in key}
         if self.registry is not None and any(a for a, _ in reg.values()):
+            refused: set[tuple[str, str]] = set()
+
             def path(role, which):
                 version = reg.get(role, (None, None))[0 if which == "active" else 1]
+                if version:
+                    problem = self.registry.verify(recipe, role, version)
+                    if problem:     # the stack then counts as incomplete, so its parts are not inspected
+                        logger.critical("[Inspection] Model refused: %s", problem)
+                        refused.add((role, version))
                 return self.registry.path_of(recipe, role, version), version
 
             (ap, av), (sp, sv), (tp, tv) = path("anomaly", "active"), path("segmentation", "active"), path("typing", "active")
             active = InspectionStack(recipe, anomaly_path=ap, segmentation_path=sp, typing_path=tp,
-                                     versions={"anomaly": av, "segmentation": sv, "typing": tv})
+                                     versions={"anomaly": av, "segmentation": sv, "typing": tv}, refused=refused)
             shadow = None
             if any(s for _, s in reg.values()):
                 (ap2, av2), (sp2, sv2), (tp2, tv2) = path("anomaly", "shadow"), path("segmentation", "shadow"), path("typing", "shadow")
                 # A role without a shadow version uses the active model, so only the challenger differs.
                 shadow = InspectionStack(recipe, anomaly_path=ap2 or ap, segmentation_path=sp2 or sp,
                                          typing_path=tp2 or tp,
-                                         versions={"anomaly": av2 or av, "segmentation": sv2 or sv, "typing": tv2 or tv})
+                                         versions={"anomaly": av2 or av, "segmentation": sv2 or sv, "typing": tv2 or tv},
+                                         refused=refused)
             logger.info("[Inspection] Recipe '%s': active %s%s", recipe,
                         {r: v["version"] for r, v in active.versions.items()},
                         f", shadow {({r: v['version'] for r, v in shadow.versions.items()})}" if shadow else "")

@@ -361,7 +361,7 @@ class CameraManager:
         self.vibration_scale = float(scale) if scale else None
 
         vlm_cfg = self.raw_config.get("vlm_reasoning", {}) or {}
-        self.vlm_enabled = bool(vlm_cfg.get("enabled", True))
+        self.vlm_enabled = bool(vlm_cfg.get("enabled", False))
         self.vlm_max_pending = max(1, int(vlm_cfg.get("max_pending", 8)))
         self._vlm_pending = 0
         self._vlm_lock = threading.Lock()
@@ -543,8 +543,9 @@ class CameraManager:
     def attach_process_service(self, service) -> None:
         """Link inspections to machine cycles; render simulated parts for synthetic scenes."""
         self.process_service = service
-        source = getattr(service, "source", None)
-        if source is None or not hasattr(source, "outcomes_ended_between"):
+        sources = {s.simulator.machine_id: s for s in getattr(service, "sources", [])
+                   if hasattr(s, "outcomes_ended_between")}
+        if not sources:
             return
         from src.process.synthetic_parts import SyntheticPartFeed
 
@@ -553,6 +554,9 @@ class CameraManager:
                 continue
             link = service.aligner.link_for(str(cam.get("id")))
             delay = link.transport_delay_s if link else 4.0
+            source = sources.get(link.machine_id) if link else next(iter(sources.values()))
+            if source is None:
+                continue
             self._part_feeds[str(cam.get("id"))] = SyntheticPartFeed(
                 source, transport_delay_s=delay, dwell_s=float(cam.get("part_dwell_s", 0.6)),
                 view_index=int(cam.get("view_index", 0)), n_views=int(cam.get("n_views", 1)),

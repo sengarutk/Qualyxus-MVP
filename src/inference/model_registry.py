@@ -128,6 +128,8 @@ class VisionModelRegistry:
                 card = json.loads(card_path.read_text(encoding="utf-8"))
             m["versions"][version] = {
                 "entry": entry, "created_ts": time.time(), "digest": file_digest(target / entry),
+                # The whole version folder: a changed sidecar (an ONNX threshold, say) counts too.
+                "sha256": file_digest(target, 64),
                 "metrics": metrics or {}, "notes": notes, "source": source, "registered_by": by,
                 "card": {k: card.get(k) for k in ("kind", "arch", "backbone", "backbone_license", "license",
                                                     "threshold", "validation") if k in card},
@@ -163,13 +165,28 @@ class VisionModelRegistry:
         self.activate(recipe, role, version, by=by, reason=f"promoted from shadow: {reason}")
         return version
 
+    @staticmethod
+    def _before_current(m: dict[str, Any]) -> str | None:
+        """The version this one replaced. A version that was rolled back from is never returned to."""
+        line: list[str] = []
+        for h in m["history"]:
+            version = h["version"]
+            if h["action"] == "activate" and (not line or line[-1] != version):
+                line.append(version)
+            elif h["action"] == "rollback":
+                while line and line[-1] != version:
+                    line.pop()
+                if not line:
+                    line.append(version)
+        while line and line[-1] == m["active"]:
+            line.pop()
+        return line[-1] if line else None
+
     def rollback(self, recipe: str, role: str, *, by: str, reason: str) -> str:
         """Re-activate the version that was active before the current one."""
         with self._lock:
             m = self.manifest(recipe, role)
-            actives = [h["version"] for h in m["history"] if h["action"] in ("activate", "rollback")]
-            current = m["active"]
-            previous = next((v for v in reversed(actives) if v != current), None)
+            previous = self._before_current(m)
             if previous is None:
                 raise ValueError(f"{recipe}/{role}: no earlier active version to roll back to")
             m["active"] = previous
@@ -192,6 +209,21 @@ class VisionModelRegistry:
         m = self.manifest(recipe, role)
         info = m["versions"].get(version)
         return None if info is None else self._dir(recipe, role) / version / info["entry"]
+
+    def verify(self, recipe: str, role: str, version: str) -> str | None:
+        """Why this version must not be used, or None when its files are the registered ones."""
+        info = self.manifest(recipe, role)["versions"].get(version)
+        if info is None:
+            return f"{recipe}/{role} has no version {version}"
+        folder = self._dir(recipe, role) / version
+        try:
+            if info.get("sha256"):
+                same = file_digest(folder, 64) == info["sha256"]
+            else:       # registered before the whole folder was covered
+                same = file_digest(folder / info["entry"]) == info.get("digest")
+        except OSError as e:
+            return f"{recipe}/{role} {version} cannot be read: {e}"
+        return None if same else f"{recipe}/{role} {version} is not the model that was registered: its files changed"
 
     def resolve(self, recipe: str, role: str) -> dict[str, Any]:
         m = self.manifest(recipe, role)

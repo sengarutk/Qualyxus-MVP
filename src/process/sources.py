@@ -89,7 +89,10 @@ class CycleAssembler:
         self.nominal_sample_rate_hz = float(nominal_sample_rate_hz)
         self.max_cycle_s = float(max_cycle_s)
         self.min_samples = int(min_samples)
+        # Longer than this without a sample and the machine was not being watched.
+        self.max_gap_s = max(1.0, 5.0 / max(self.nominal_sample_rate_hz, 1e-6))
         self._counter: int | None = None
+        self._partial = True        # joined mid-cycle: the first cycle's start was never seen
         self._samples: list[tuple[float, dict[str, float]]] = []
         self._setpoints: dict[str, float] = {}
 
@@ -98,12 +101,21 @@ class CycleAssembler:
             if name in values and values[name] is not None:
                 self._setpoints[name] = float(values[name])
 
+        silent_s = float(ts) - self._samples[-1][0] if self._samples else 0.0
+        changed = counter is not None and self._counter is not None and int(counter) != self._counter
+        if silent_s > self.max_gap_s:
+            # What came before the silence is not joined to what comes after it.
+            logger.warning("[CycleAssembler] %s was not sampled for %.1f s.", self.machine_id, silent_s)
+            self._samples, self._partial = [], True
         completed = None
-        if counter is not None and self._counter is not None and int(counter) != self._counter:
+        if changed:
             if int(counter) < self._counter:
                 logger.warning("[CycleAssembler] %s cycle counter went backwards (%s -> %s); "
                                "assuming a controller reset.", self.machine_id, self._counter, counter)
-            completed = self._close(self._counter)
+            if silent_s <= self.max_gap_s:
+                completed = self._close(self._counter)
+                self._partial = False
+            # else the end of that cycle was not seen, so nothing can be linked to it by time
         if counter is not None:
             self._counter = int(counter)
 
@@ -112,6 +124,7 @@ class CycleAssembler:
         cutoff = float(ts) - self.max_cycle_s
         while self._samples and self._samples[0][0] < cutoff:
             self._samples.pop(0)
+            self._partial = True
         return completed
 
     def _close(self, counter: int) -> ProcessCycle | None:
@@ -143,6 +156,7 @@ class CycleAssembler:
             curves=curves,
             sample_rate_hz=float(rate),
             source=self.source,
+            complete=not self._partial,
         )
 
 
@@ -367,6 +381,12 @@ class OpcUaCycleSource(CycleSource):
                 if cycle is not None:
                     self._emit(cycle)
                 await asyncio.sleep(max(0.0, self.poll_interval - (time.monotonic() - tick)))
+
+
+def build_cycle_sources(process_cfg: dict[str, Any]) -> list[CycleSource]:
+    """One source per machine. ``process.machines`` entries override the ``process`` settings."""
+    machines = process_cfg.get("machines") or [{}]
+    return [build_cycle_source({**process_cfg, **machine}) for machine in machines]
 
 
 def build_cycle_source(process_cfg: dict[str, Any]) -> CycleSource:

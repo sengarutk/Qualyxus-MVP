@@ -56,13 +56,16 @@ SCHEMA: dict[str, Any] = {
     },
     "process": {
         **_keys("""enabled source machine_id line_id db_path models_dir store_curves curve_retention_days spec_limits
-                   components"""),
+                   components baseline_reset_on"""),
         "simulator": _keys("seed time_scale disturbance_scale scenario"),
         "model": _keys("""golden_warmup_cycles retrain_every_labels min_train_samples min_train_positives
-                          min_promotion_auc min_label_confidence regime_min_good_cycles hybrid_deviation"""),
+                          min_promotion_auc min_label_confidence regime_min_good_cycles hybrid_deviation
+                          max_train_cycles"""),
         "prescriptions": _keys("enabled limits knowledge max_step_fraction min_risk_drop cooldown_cycles"),
         "modbus": _CONNECTION,
         "opcua": _CONNECTION,
+        "machines": [{**_keys("machine_id line_id source"), "simulator": _keys("seed time_scale disturbance_scale scenario"),
+                      "modbus": _CONNECTION, "opcua": _CONNECTION}],
     },
     "cameras": [_CAMERA],
 }
@@ -128,6 +131,11 @@ def validate(raw: dict[str, Any]) -> None:
     enabled = [c for c in cameras if c.get("enabled", True)]
     if len(enabled) > 1 and not required_views(enabled):
         problems.append("no camera is required: with several cameras at least one needs required_view: true")
+    process = raw.get("process") if isinstance(raw.get("process"), dict) else {}
+    machines = [m for m in process.get("machines") or [] if isinstance(m, dict)]
+    names = [m.get("machine_id") for m in machines]
+    if None in names or len(set(names)) != len(names):
+        problems.append("every process.machines entry needs its own machine_id")
     telemetry = raw.get("telemetry") if isinstance(raw.get("telemetry"), dict) else {}
     if telemetry.get("mode") not in (None, "simulated", "plc"):
         problems.append(f"telemetry.mode must be 'simulated' or 'plc', got {telemetry.get('mode')!r}")

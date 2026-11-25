@@ -85,7 +85,8 @@ hardware_acceleration:
   precision: "fp16"
 
 vlm_reasoning:
-  enabled: true
+  # Needs a local model server. Its text is stored as an unverified suggestion, never a finding.
+  enabled: false
   model: "moondream2"
   local_api: "http://localhost:11434"
   timeout_seconds: 10
@@ -187,6 +188,13 @@ process:
   source: "simulated"
   machine_id: "imm_1"
   line_id: "line_A"
+  # Several machines: one entry each; anything not given comes from the settings around it.
+  # machines:
+  #   - {machine_id: "imm_1", source: "modbus", modbus: {host: "10.0.0.50", ...}}
+  #   - {machine_id: "imm_2", source: "opcua", opcua: {endpoint: "opc.tcp://10.0.0.51:4840", ...}}
+  # Machine values (mould id, recipe) whose change starts the baseline and risk model again.
+  # After a repair: python -m src.process.baseline reset --machine imm_1 --by NAME --reason "..."
+  baseline_reset_on: []
   db_path: "data/events/process.db"
   models_dir: "models/process"
   store_curves: true
@@ -199,6 +207,7 @@ process:
     retrain_every_labels: 250
     min_train_samples: 300
     min_train_positives: 20
+    max_train_cycles: 20000  # newest cycles used for retraining, so its cost stays flat
     min_promotion_auc: 0.65
     # Vision labels linked to a cycle less confidently than this do not train the risk model.
     min_label_confidence: 0.5

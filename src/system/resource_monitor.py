@@ -37,7 +37,10 @@ class ResourceGovernor:
         self._warning_hold_seconds = float(self.rm.warning_hold_seconds)
         self._critical_cooldown_seconds = float(self.rm.critical_cooldown_seconds)
         self._warning_cooldown_seconds = float(self.rm.warning_cooldown_seconds)
-        # Emergency threshold (immediate latch). Default chosen to match malicious-audit test.
+        self._emergency_since: float | None = None
+        self._cool_since: float | None = None
+        self._emergency_hold_seconds = float(self.rm.emergency_hold_seconds)
+        self._emergency_cooldown_seconds = float(self.rm.emergency_cooldown_seconds)
         self._emergency_temp_c = float(self.rm.emergency_temp_c)
 
         # External hook: caller may register a callback invoked on EMERGENCY latch.
@@ -161,8 +164,22 @@ class ResourceGovernor:
             candidate = SystemState.SAFE
 
         with self._lock:
+            if candidate != SystemState.EMERGENCY:
+                self._emergency_since = None
+            else:
+                self._emergency_since = self._emergency_since or now
+                if now - self._emergency_since < self._emergency_hold_seconds:
+                    candidate = SystemState.CRITICAL    # one hot reading is not yet an emergency
+            if self._last_state == SystemState.EMERGENCY:
+                # Cameras run again once it has stayed cool; a reading between the two levels restarts the wait.
+                self._cool_since = None if critical_hit or emergency_hit else (self._cool_since or now)
+                if self._cool_since is None or now - self._cool_since < self._emergency_cooldown_seconds:
+                    return self._last_state
+                LOGGER.warning("[ResourceMonitor] Temperature back to normal: leaving EMERGENCY.")
+                self._last_state, self._last_transition_ts, self._cool_since = SystemState.WARNING, now, None
+                return self._last_state
+
             if candidate == SystemState.EMERGENCY:
-                # Immediate latch; no hold-time. We do not auto-deescalate.
                 if self._last_state != SystemState.EMERGENCY:
                     self._last_state = SystemState.EMERGENCY
                     self._last_transition_ts = now
@@ -174,12 +191,12 @@ class ResourceGovernor:
                         LOGGER.error("[ResourceMonitor] Emergency callback failed: %s", e)
                 return self._last_state
 
-            if critical_hit:
+            if critical_hit or emergency_hit:
                 self._critical_since = self._critical_since or now
             else:
                 self._critical_since = None
 
-            if warning_hit:
+            if warning_hit or emergency_hit:
                 self._warning_since = self._warning_since or now
             else:
                 self._warning_since = None
@@ -211,10 +228,6 @@ class ResourceGovernor:
                     if (now - self._last_transition_ts) >= self._critical_cooldown_seconds:
                         self._last_state = SystemState.WARNING
                         self._last_transition_ts = now
-                return self._last_state
-
-            if current == SystemState.EMERGENCY:
-                # Emergency is latched until operator intervention / restart.
                 return self._last_state
 
             if candidate == SystemState.WARNING:

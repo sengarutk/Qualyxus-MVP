@@ -310,8 +310,8 @@ def fetch_system_health() -> dict:
 
 
 @st.cache_data(ttl=10)
-def fetch_machine_health(process_db_path: str, components: dict | None = None, *, baseline_cycles: int = 100,
-                         recent_cycles: int = 600) -> list[dict]:
+def fetch_machine_health(process_db_path: str, components: dict | None = None, *, machine_id: str = "imm_1",
+                         baseline_cycles: int = 100, recent_cycles: int = 600) -> list[dict]:
     """Per-component wear read from the machine cycles (see src.process.machine_health)."""
     if not Path(process_db_path).exists():
         return []
@@ -320,8 +320,7 @@ def fetch_machine_health(process_db_path: str, components: dict | None = None, *
 
     store = ProcessStore(process_db_path)
     try:
-        baseline = store.cycle_features(limit=baseline_cycles, newest=False)
-        recent = store.cycle_features(limit=recent_cycles, newest=True)
+        baseline, recent = store.health_rows(machine_id, baseline=baseline_cycles, recent=recent_cycles)
     finally:
         store.close()
     return [vars(c) for c in assess_machine(baseline, recent, components)]
@@ -359,7 +358,8 @@ def fetch_part_position(process_db_path: str, *, baseline_parts: int = 30, watch
     return {"series": pd.concat(series), "summary": summary}
 
 
-def fetch_process_overview(process_db_path: str, actions_db_path: str, window_hours: float = 8.0) -> dict:
+def fetch_process_overview(process_db_path: str, actions_db_path: str, window_hours: float = 8.0,
+                           required_cameras: tuple[str, ...] = ()) -> dict:
     """Process-quality loop: KPIs, risk timeline and pending prescriptions."""
     if not Path(process_db_path).exists():
         return {}
@@ -369,7 +369,7 @@ def fetch_process_overview(process_db_path: str, actions_db_path: str, window_ho
     store = ProcessStore(process_db_path)
     now = time.time()
     since = now - window_hours * 3600.0
-    kpis = compute_kpis(store, since, now)
+    kpis = compute_kpis(store, since, now, required_cameras=required_cameras)
     model = store.active_model()
 
     engine = create_engine(f"sqlite:///{process_db_path}", future=True)
@@ -484,7 +484,7 @@ def fetch_vision_overview(status_path: str, process_db_path: str, registry_dir: 
         finally:
             store.close()
     if Path(audit_dir).exists():
-        from src.inference.audit_log import verify_chain
+        from src.inference.audit_log import verify_incremental
 
-        out["audit"] = verify_chain(audit_dir, audit_key_file)
+        out["audit"] = verify_incremental(audit_dir, audit_key_file)
     return out

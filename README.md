@@ -178,6 +178,18 @@ python scripts/simulate_closed_loop.py --vision patchcore --learn 2500 --evaluat
 
 Simulation results are evidence that the mechanics work, not a forecast for a real line.
 
+The simulated operator does the requested repairs (`--repair-delay`) and applies the suggested
+settings. While a component is drifting the system asks for a repair and suggests no settings,
+because settings would hide the wear. After a repair, or a new mould or material:
+
+```bash
+python -m src.process.baseline reset --machine imm_1 --by NAME --reason "new check ring"
+python -m src.process.baseline reset --machine imm_1 --process-change --by NAME --reason "mould 12"
+```
+
+Machine values listed in `process.baseline_reset_on` (a mould id, say) do the second one by
+themselves. Several machines go under `process.machines`; each has its own baseline and model.
+
 ## Setup
 
 ```bash

@@ -1,5 +1,4 @@
 from __future__ import annotations
-import random
 import logging
 import threading
 import time
@@ -54,50 +53,11 @@ class PLCAdapter:
         return str(self.config.mode).lower() == "simulated"
 
     def read_context(self, camera_id: str) -> dict[str, Any]:
-        if self.is_simulated:
-            return self._simulated_context(camera_id)
-        return self._plc_placeholder_context(camera_id)
-
-    def _simulated_context(self, camera_id: str) -> dict[str, Any]:
-        base_temp = 75.0
-        base_vib = 0.3
-        base_speed = 1000.0
-        temperature = max(60.0, min(90.0, base_temp + random.uniform(-15, 15)))
-        vibration = max(0.1, min(0.5, base_vib + random.uniform(-0.2, 0.2)))
-        speed = max(800.0, min(1200.0, base_speed + random.uniform(-200, 200)))
-        suffix = camera_id.split("_")[-1]
-        return {
-            "machine_id": f"machine_{suffix}",
-            "line_id": "line_A",
-            "station_id": f"station_{suffix}",
-            "temperature": round(temperature, 1),
-            "vibration": round(vibration, 3),
-            "speed": round(speed, 1),
-            "lot_id": f"lot_{random.randint(1000, 9999)}",
-            "shift_id": "day" if random.random() > 0.5 else "night",
-            "telemetry_mode": "simulated",
-            "plc_protocol": self.config.protocol,
-        }
-
-    def _plc_placeholder_context(self, camera_id: str) -> dict[str, Any]:
-        suffix = camera_id.split("_")[-1]
-        return {
-            "machine_id": f"machine_{suffix}",
-            "line_id": "line_A",
-            "station_id": f"station_{suffix}",
-            "temperature": None,
-            "vibration": None,
-            "speed": None,
-            "lot_id": None,
-            "shift_id": None,
-            "telemetry_mode": "plc",
-            "plc_protocol": self.config.protocol,
-            "plc_ready": True,
-            "opcua_compatible": True,
-            "modbus_ready": True,
-            "endpoint": self.config.endpoint,
-            "unit_id": self.config.unit_id,
-        }
+        """What is known about the station. Nothing measured means None: a value is never made up."""
+        unknown = dict.fromkeys(("machine_id", "line_id", "station_id", "temperature", "vibration", "speed",
+                                 "lot_id", "shift_id"))
+        return {**unknown, "telemetry_mode": self.config.mode, "plc_protocol": self.config.protocol,
+                **({} if self.is_simulated else {"endpoint": self.config.endpoint, "unit_id": self.config.unit_id})}
 
     def _connect(self):
         if self._client is None:

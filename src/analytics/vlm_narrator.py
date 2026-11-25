@@ -15,7 +15,7 @@ class VLMNarrator:
 
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = config or {}
-        self.enabled = bool(self.config.get("enabled", True))
+        self.enabled = bool(self.config.get("enabled", False))
         self.model = str(self.config.get("model", "moondream2"))
         self.local_api = str(self.config.get("local_api", "http://localhost:11434"))
         self.timeout_seconds = float(self.config.get("timeout_seconds", 10.0))
