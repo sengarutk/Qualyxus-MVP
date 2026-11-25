@@ -128,23 +128,23 @@ def render_part(width: int, height: int, defect_type: str | None, seed: int, *, 
         # Dieseling at the end of fill: dark brown streaks.
         base_x = int(x2 - rng.uniform(0.08, 0.18) * g["w"])
         for _ in range(int(rng.integers(2, 4))):
-            pts = np.array([
+            streak = np.array([
                 (base_x + int(rng.uniform(-10, 10)), int(y1 + rng.uniform(0.1, 0.3) * g["h"])),
                 (base_x + int(rng.uniform(-14, 14)), int(g["cy"])),
                 (base_x + int(rng.uniform(-10, 10)), int(y2 - rng.uniform(0.1, 0.3) * g["h"])),
             ], dtype=np.int32)
             thickness = int(rng.integers(4, 7))
-            cv2.polylines(part, [pts], False, (25, 40, 70), thickness)
-            cv2.polylines(dmask, [pts], False, 1, thickness)
+            cv2.polylines(part, [streak], False, (25, 40, 70), thickness)
+            cv2.polylines(dmask, [streak], False, 1, thickness)
 
     # Nuisance variation: rotation, lighting and sensor noise.
     rot = cv2.getRotationMatrix2D((g["cx"], g["cy"]), g["angle"], 1.0)
-    part = cv2.warpAffine(part, rot, (width, height), borderValue=(BACKGROUND,) * 3)
-    part = np.clip(part.astype(np.float32) * g["gain"] + rng.normal(0.0, 2.0, part.shape), 0, 255)
+    turned = cv2.warpAffine(part, rot, (width, height), borderValue=(BACKGROUND,) * 3)
+    lit = np.clip(turned.astype(np.float32) * g["gain"] + rng.normal(0.0, 2.0, turned.shape), 0, 255)
     if return_mask:
-        dmask = cv2.warpAffine(dmask, rot, (width, height), flags=cv2.INTER_NEAREST, borderValue=0)
-        return part.astype(np.uint8), dmask
-    return part.astype(np.uint8)
+        mask = cv2.warpAffine(dmask, rot, (width, height), flags=cv2.INTER_NEAREST, borderValue=0)
+        return lit.astype(np.uint8), mask
+    return lit.astype(np.uint8)
 
 
 @dataclass

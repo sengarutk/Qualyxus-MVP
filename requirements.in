@@ -10,6 +10,7 @@ numpy
 nvidia-ml-py
 onnx
 onnxruntime
+onnxscript
 opencv-python-headless
 pillow
 psutil

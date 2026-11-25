@@ -448,7 +448,7 @@ def test_old_events_go_and_csv_files_turn_over(tmp_path, monkeypatch):
                 stamp = time.time() - age * 86400
                 conn.execute("INSERT INTO events (camera_id, timestamp) VALUES ('c', ?)", (stamp,))
                 conn.execute("INSERT INTO defect_events (event_id, timestamp, source, defect_type, confidence, severity, "
-                             "full_image_path) VALUES (?, ?, 'c', 'x', 1, 1, '')", (str(age), module.datetime.utcfromtimestamp(stamp).isoformat()))
+                             "full_image_path) VALUES (?, ?, 'c', 'x', 1, 1, '')", (str(age), module.utc_naive(stamp).isoformat()))
         assert RetentionWorker({}, event_logger=log).run_once() == {"defect_events": 1, "events": 2, "geometry_events": 0}
         assert RetentionWorker({"logging": {"retention_days": 0, "tracking_retention_days": 0}},
                                event_logger=log).run_once()["defect_events"] == 0

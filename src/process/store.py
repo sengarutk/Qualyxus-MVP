@@ -112,7 +112,8 @@ def _encode_curves(curves: dict[str, np.ndarray]) -> bytes | None:
     if not curves:
         return None
     buffer = io.BytesIO()
-    np.savez_compressed(buffer, **{k: np.asarray(v, dtype=np.float32) for k, v in curves.items()})
+    arrays: dict[str, Any] = {k: np.asarray(v, dtype=np.float32) for k, v in curves.items()}
+    np.savez_compressed(buffer, **arrays)
     return buffer.getvalue()
 
 

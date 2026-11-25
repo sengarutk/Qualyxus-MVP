@@ -1071,7 +1071,10 @@ ml-dtypes==0.7.0 \
     --hash=sha256:e621dfbc9bc7d75ded2782f58ff22f72eb9deb907e9f0fa09147eb3e6f4ae6aa \
     --hash=sha256:ef2c347e71f11625603983b426b42f5cf59c0e482d5fcb6e16a78d61e3ec9bd3 \
     --hash=sha256:f5472be87d269572fe6afe2daa46870ed86d1129270c52734fe8485b91b697b2
-    # via onnx
+    # via
+    #   onnx
+    #   onnx-ir
+    #   onnxscript
 mpmath==1.3.0 \
     --hash=sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f \
     --hash=sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c
@@ -1157,7 +1160,9 @@ numpy==2.5.5 \
     #   matplotlib
     #   ml-dtypes
     #   onnx
+    #   onnx-ir
     #   onnxruntime
+    #   onnxscript
     #   opencv-python-headless
     #   rfdetr
     #   scikit-learn
@@ -1289,7 +1294,14 @@ onnx==1.23.2 \
     --hash=sha256:f8b9a5e25a390cc291600e5fd619f4b79708287a6bbc41a37209f364e08a63da \
     --hash=sha256:fb3e892f19f3a793b9722587349941b074f74091ad33e794a7798fe03fdc0c9c \
     --hash=sha256:fcbbd53e3482434dbf2c27f4a8727ad4865e21bbc0b5530e7557669f8d8f587b
-    # via -r requirements.in
+    # via
+    #   -r requirements.in
+    #   onnx-ir
+    #   onnxscript
+onnx-ir==1.1.0 \
+    --hash=sha256:76cc313a788c073b75271c1b6abb172aaf90fcc6335ed40f9f3238b2064a2fa3 \
+    --hash=sha256:b72176de575d820ec26864d17270d58ef886a7cf64db7649d15fcc3d5ae2a8ee
+    # via onnxscript
 onnxruntime==1.32.0 \
     --hash=sha256:02ea12a28c069ea8510093d95a7f6ff8126bfd9fc5c0d3381c03b80fb2b424ba \
     --hash=sha256:2303372a85299b6757b0e11e1cbf13e410ddf7e10c37f4b37e99d1c90e7daf7c \
@@ -1316,6 +1328,10 @@ onnxruntime==1.32.0 \
     --hash=sha256:e36c187006e7a7c8b8d6d57f1a209dd63f52430dca6c282b177718ad6b841054 \
     --hash=sha256:efe7456952c243a05a53d5b8732953625144642c2f3989094277f6217f0c0c40
     # via -r requirements.in
+onnxscript==0.7.2 \
+    --hash=sha256:2c664f6383d10f332a4d47b2876dcab16dba84909fe703656b19abc281fda165 \
+    --hash=sha256:d0e7121c6a1eefd608058928e111cbdb76709f70d269ff0d07aee493bd1d13c9
+    # via -r requirements.in
 opencv-python-headless==5.1.0.95 \
     --hash=sha256:1193ffb8a60d0496dbac652f052791dc0f0da6a298e215c93d1d8c9dd67b89e9 \
     --hash=sha256:11d9753e15b8b3c56e6aa765139f722ca19ff26016d43bc81035f5d122731a81 \
@@ -1338,7 +1354,9 @@ packaging==26.4 \
     # via
     #   huggingface-hub
     #   matplotlib
+    #   onnx-ir
     #   onnxruntime
+    #   onnxscript
     #   transformers
 pillow==13.0.0 \
     --hash=sha256:02464da86f561f410e13b061ec37c3068a9cb557a095494157742d07b3c24a27 \
@@ -2009,7 +2027,9 @@ supervision==0.32.2 \
 sympy==1.14.0 \
     --hash=sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517 \
     --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5
-    # via torch
+    # via
+    #   onnx-ir
+    #   torch
 threadpoolctl==3.8.0 \
     --hash=sha256:01080674ad7ac6182429c918a79de92da789bb448acc02fc0b620b1abd6b6137 \
     --hash=sha256:f1b49c82704d50f13ffae019c727b0fa4f6791a58f48f06a09c45face1be66da
@@ -2149,6 +2169,8 @@ typing-extensions==4.16.0 \
     #   httpx2
     #   huggingface-hub
     #   onnx
+    #   onnx-ir
+    #   onnxscript
     #   opentelemetry-api
     #   pydantic
     #   pydantic-core
