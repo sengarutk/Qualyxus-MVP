@@ -35,7 +35,7 @@ Older decks and documents that stated projections as facts are kept off this rep
 
 ## Software status (branch `feat/process-quality-intelligence`)
 
-- 169 automated tests pass, and the end-to-end six-camera simulation passes: `python scripts/smoke_360.py`
+- 278 automated tests pass, and the end-to-end six-camera simulation passes: `python scripts/smoke_360.py`
 - **Recent fixes**, found by deliberately breaking the system:
   - The PLC heartbeat now stops if cameras die.
   - A verdict can't be lost to a full disk or an alert storm.

@@ -231,7 +231,7 @@ If you only have an hour, do these. Full answers are in the parts below.
 ### Software quality
 
 **Is it production-grade?**
-> Not yet. 166 automated tests pass, including forced failures like dead cameras, a PLC outage and power cuts. It has shadow mode, rollback and an audit log. But it hasn't run in production.
+> Not yet. 278 automated tests pass, including forced failures like dead cameras, a PLC outage and power cuts. It has shadow mode, rollback and an audit log. But it hasn't run in production.
 
 **⚠ How long has it run continuously?**
 > Only short runs so far. A long soak test is still to finish. Long-run stability is something the test rig will prove.
